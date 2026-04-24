@@ -22,13 +22,13 @@ pub(crate) struct Mempool {
 
 impl Mempool {
     /// Creates a new mbuf pool on socket_id
-    pub(crate) fn new(config: &MempoolConfig, socket_id: SocketId, mtu: usize) -> Result<Self> {
+    pub(crate) fn new(config: &MempoolConfig, socket_id: SocketId, mtu: usize, prefix: &str) -> Result<Self> {
         let data_room = crate::port::mtu_to_max_frame_len(mtu as u32);
         let data_room_aligned = round_up(data_room, RX_BUF_ALIGN);
         let mbuf_size = data_room_aligned + dpdk::RTE_PKTMBUF_HEADROOM;
         let mbuf_size = cmp::max(mbuf_size, dpdk::RTE_MBUF_DEFAULT_BUF_SIZE);
 
-        let name = format!("mempool_{}", socket_id);
+        let name = format!("mempool_{}_{}", prefix, socket_id);
         let cname = CString::new(name.clone()).expect("Invalid CString conversion");
         let mempool = unsafe {
             dpdk::rte_pktmbuf_pool_create(
@@ -99,4 +99,26 @@ pub(crate) enum MempoolError {
 
     #[error("Mbuf allocation failed: mempool exhausted.")]
     Exhausted,
+}
+
+/// A pair of mempools backing buffer-split RX queues.
+/// `header` receives the first `hdr_len` bytes of each packet.
+/// `remainder` receives the rest.
+pub(crate) struct SplitMempool {
+    pub(crate) header: Mempool,
+    pub(crate) remainder: Mempool,
+    pub(crate) hdr_len: u16,
+}
+
+impl SplitMempool {
+    pub(crate) fn new(
+        config: &MempoolConfig,
+        socket_id: SocketId,
+        hdr_len: u16,
+        mtu: usize,
+    ) -> Result<Self> {
+        let header = Mempool::new(&config, socket_id, hdr_len as usize, "split_header")?;
+        let remainder = Mempool::new(&config, socket_id, mtu - (hdr_len as usize), "split_remainder")?;
+        Ok(SplitMempool { header, remainder, hdr_len })
+    }
 }

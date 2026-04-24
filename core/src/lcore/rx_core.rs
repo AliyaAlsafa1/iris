@@ -74,10 +74,10 @@ where
 
     pub(crate) fn rx_loop(&self) {
         // TODO: need check to enforce that each core only has same queue types
-        if self.rxqueues[0].ty == RxQueueType::Receive {
-            self.rx_process();
-        } else {
+        if self.rxqueues[0].ty == RxQueueType::Sink {
             self.rx_sink();
+        } else {
+            self.rx_process();
         }
     }
 

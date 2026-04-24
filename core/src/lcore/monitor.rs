@@ -194,19 +194,24 @@ struct Display {
 impl Display {
     /// Display mempool usage
     fn mempool_usage(&self, ports: &BTreeMap<PortId, Vec<RxQueue>>) {
-        for name in ports.keys().map(|id| format!("mempool_{}", id.socket_id())) {
-            let cname = CString::new(name.clone()).expect("Invalid CString conversion");
-            let mempool_raw = unsafe { dpdk::rte_mempool_lookup(cname.as_ptr()) };
-            let avail_cnt = unsafe { dpdk::rte_mempool_avail_count(mempool_raw) };
-            let inuse_cnt = unsafe { dpdk::rte_mempool_in_use_count(mempool_raw) };
+        let sockets: BTreeSet<_> = ports.keys().map(|id| id.socket_id()).collect();
 
-            println!(
-                "{} avail: {}, in use: {} ({:.3}%)",
-                name,
-                avail_cnt,
-                inuse_cnt,
-                100.0 * inuse_cnt as f64 / (inuse_cnt + avail_cnt) as f64
-            );
+        for socket in sockets {
+            for prefix in ["standard", "split_header", "split_remainder"] {
+                let name = format!("mempool_{}_{}", prefix, socket);
+                let cname = CString::new(name.clone()).expect("Invalid CString conversion");
+                let mempool_raw = unsafe { dpdk::rte_mempool_lookup(cname.as_ptr()) };
+                let avail_cnt = unsafe { dpdk::rte_mempool_avail_count(mempool_raw) };
+                let inuse_cnt = unsafe { dpdk::rte_mempool_in_use_count(mempool_raw) };
+
+                println!(
+                    "{} avail: {}, in use: {} ({:.3}%)",
+                    name,
+                    avail_cnt,
+                    inuse_cnt,
+                    100.0 * inuse_cnt as f64 / (inuse_cnt + avail_cnt) as f64
+                );
+            }
         }
     }
 }
@@ -257,7 +262,7 @@ impl Logger {
                 }
                 Err(error) => log::error!("{}", error),
             }
-            let name = format!("mempool_{}", port_id.socket_id());
+            let name = format!("mempool_standard_{}", port_id.socket_id());
             let cname = CString::new(name.clone()).expect("Invalid CString conversion");
             let mempool_raw = unsafe { dpdk::rte_mempool_lookup(cname.as_ptr()) };
             let avail_cnt = unsafe { dpdk::rte_mempool_avail_count(mempool_raw) };

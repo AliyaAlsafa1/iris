@@ -12,7 +12,7 @@ use crate::config::*;
 use crate::dpdk;
 use crate::filter::FilterFactory;
 use crate::lcore::SocketId;
-use crate::memory::mempool::Mempool;
+use crate::memory::mempool::{Mempool, SplitMempool};
 use crate::subscription::*;
 
 use std::collections::BTreeMap;
@@ -20,6 +20,8 @@ use std::ffi::CString;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
+
+pub(crate) const SPLIT_HDR_SIZE: u16 = 64; 
 
 /// The Iris runtime.
 ///
@@ -30,7 +32,9 @@ where
     S: Subscribable,
 {
     #[allow(dead_code)]
-    mempools: BTreeMap<SocketId, Mempool>,
+    standard_mempools: BTreeMap<SocketId, Mempool>,
+    #[allow(dead_code)]
+    split_mempools: BTreeMap<SocketId, SplitMempool>,
     online: Option<OnlineRuntime<S>>,
     pub(crate) offline: Option<OfflineRuntime<S>>, // Public for testing only
     #[cfg(feature = "timing")]
@@ -77,7 +81,8 @@ where
         }
 
         log::info!("Initializing Mempools...");
-        let mut mempools = BTreeMap::new();
+        let mut standard_mempools: BTreeMap<SocketId, Mempool> = BTreeMap::new();
+        let mut split_mempools: BTreeMap<SocketId, SplitMempool> = BTreeMap::new();
         let socket_ids = config.get_all_socket_ids();
         let mtu = if let Some(online) = &config.online {
             online.mtu
@@ -88,8 +93,14 @@ where
         };
         for socket_id in socket_ids {
             log::debug!("Socket ID: {}", socket_id);
-            let mempool = Mempool::new(&config.mempool, socket_id, mtu)?;
-            mempools.insert(socket_id, mempool);
+            standard_mempools.insert(
+                socket_id,
+                Mempool::new(&config.mempool, socket_id, mtu, "standard")?,
+            );
+            split_mempools.insert(
+                socket_id,
+                SplitMempool::new(&config.mempool, socket_id, SPLIT_HDR_SIZE, mtu)?,
+            );
         }
 
         let online = config.online.as_ref().map(|cfg| {
@@ -101,7 +112,8 @@ where
             OnlineRuntime::new(
                 &config,
                 online_opts,
-                &mut mempools,
+                &mut standard_mempools,
+                &mut split_mempools,
                 filter_str.clone(),
                 Arc::clone(&subscription),
             )
@@ -113,12 +125,13 @@ where
                 offline: cfg.clone(),
                 conntrack: config.conntrack.clone(),
             };
-            OfflineRuntime::new(offline_opts, &mempools, Arc::clone(&subscription))
+            OfflineRuntime::new(offline_opts, &standard_mempools, Arc::clone(&subscription))
         });
 
         log::info!("Runtime ready.");
         Ok(Runtime {
-            mempools,
+            standard_mempools,
+            split_mempools,
             online,
             offline,
             #[cfg(feature = "timing")]

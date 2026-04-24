@@ -4,9 +4,10 @@ use crate::filter::Filter;
 use crate::lcore::monitor::Monitor;
 use crate::lcore::rx_core::RxCore;
 use crate::lcore::{CoreId, SocketId};
-use crate::memory::mempool::Mempool;
+use crate::memory::mempool::{Mempool, SplitMempool};
 use crate::port::*;
 use crate::subscription::*;
+use crate::runtime::SPLIT_HDR_SIZE;
 
 use std::collections::BTreeMap;
 use std::os::raw::{c_uint, c_void};
@@ -32,7 +33,8 @@ where
     pub(crate) fn new(
         config: &RuntimeConfig,
         options: OnlineOptions,
-        mempools: &mut BTreeMap<SocketId, Mempool>,
+        standard_mempools: &mut BTreeMap<SocketId, Mempool>,
+        split_mempools: &mut BTreeMap<SocketId, SplitMempool>,
         hw_filter_str: String,
         subscription: Arc<Subscription<S>>,
     ) -> Self {
@@ -50,19 +52,22 @@ where
         for port_map in options.online.ports.iter() {
             let port = Port::new(port_map);
             let socket_id = port.id.socket_id();
-            mempools.entry(socket_id).or_insert_with(|| {
-                // Create a local mempool if user is not polling the port
-                // from the same socket.
-                let mtu = if let Some(online) = &config.online {
-                    online.mtu
-                } else {
-                    Mempool::default_mtu()
-                };
-                Mempool::new(&config.mempool, socket_id, mtu)
-                    .expect("Unable to initialize local mempool")
+            let mtu = if let Some(online) = &config.online {
+                online.mtu
+            } else {
+                Mempool::default_mtu()
+            };
+            standard_mempools.entry(socket_id).or_insert_with(|| {
+                Mempool::new(&config.mempool, socket_id, mtu, "standard")
+                    .expect("Unable to initialize standard mempool")
+            });
+            split_mempools.entry(socket_id).or_insert_with(|| {
+                SplitMempool::new(&config.mempool, socket_id, SPLIT_HDR_SIZE, mtu)
+                    .expect("Unable to initialize split mempool")
             });
             port.init(
-                mempools,
+                standard_mempools,
+                split_mempools,
                 options.online.nb_rxd,
                 options.online.mtu,
                 options.online.promiscuous,
