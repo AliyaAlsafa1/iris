@@ -12,3 +12,11 @@ iris-compiler = { path = "../../compiler" }
 serde = "1.0.228"
 
 clap = { version = "4.5", features = ["derive"] }
+
+env_logger = "0.8.4"
+regex = "1.7.3"
+array-init = "2.1"
+csv = "1"
+dns-parser = "0.8"
+const_format = "0.2"
+lightgbm3 = "1"

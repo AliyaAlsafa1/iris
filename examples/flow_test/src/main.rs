@@ -23,6 +23,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod hash_utils;
+mod conn_features;
+mod model;
+
+use conn_features::ConnFeatures;
+
 #[derive(Clone, Copy)]
 struct FlowPtr(*mut rte_flow);
 unsafe impl Send for FlowPtr {}
@@ -104,6 +110,9 @@ struct Args {
 
     #[clap(long, action = ArgAction::SetTrue)]
     show_args: bool,
+
+    #[clap(long, value_parser, value_name = "FILE")]
+    model: PathBuf,
 }
 
 
@@ -134,20 +143,40 @@ fn expire_flows_now() {
 
 // Try for all TCP
 #[callback("tcp,level=InL4Conn")]
-fn tls_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> bool {
-    if pkts.total() < 10 { return true; }
-
-    let tuple = five_tuple.clone();
-
-    if let Some(dispatcher) = FLOW_DISPATCHER.get() {
-        let _ = dispatcher.dispatch(
-            FlowEvent::TlsSeen {
-                tuple,
-                rx_core: *rx_core,
-            },
-            Some(rx_core), // preserve affinity when in PerCore mode
-        );
+fn tls_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount, conn: &ConnRecord, iat: &InterArrivals) -> bool {
+    if pkts.total() != 20 {
+        return true;
     }
+ 
+    let is_elephant = ConnFeatures::from_conn(conn, iat)
+        .and_then(|features| {
+            let proba = model::predict(&features)?;
+            println!(
+                "[FLOW] src_subn={} dst_subn={} src_port={} dst_port={} proto={} p={:.4}",
+                features.src_ip_subn,
+                features.dst_ip_subn,
+                features.src_port,
+                features.dst_port,
+                features.protocol,
+                proba,
+            );
+            Some(proba >= 0.5)
+        })
+        .unwrap_or(false);
+ 
+    if is_elephant {
+        let tuple = five_tuple.clone();
+        if let Some(dispatcher) = FLOW_DISPATCHER.get() {
+            let _ = dispatcher.dispatch(
+                FlowEvent::TlsSeen {
+                    tuple,
+                    rx_core: *rx_core,
+                },
+                Some(rx_core), // preserve affinity when in PerCore mode
+            );
+        }
+    }
+ 
     true
 }
 
@@ -162,6 +191,10 @@ fn main() {
     if args.show_args {
         println!("{args:#?}");
     }
+
+    // Load the LightGBM model before starting the runtime.
+    model::load_model(args.model.to_str().expect("Invalid model path"));
+
     let config = if let Some(path) = args.config.clone() {
         load_config(path)
     } else {

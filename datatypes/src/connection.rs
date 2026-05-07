@@ -17,18 +17,20 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 
+pub const N_PACKETS: usize = 20;
+
 /// Pure SYN
-pub(crate) const HIST_SYN: u8 = b'S';
+pub const HIST_SYN: u8 = b'S';
 /// Pure SYNACK
-pub(crate) const HIST_SYNACK: u8 = b'H';
+pub const HIST_SYNACK: u8 = b'H';
 /// Pure ACK (no payload)
-pub(crate) const HIST_ACK: u8 = b'A';
+pub const HIST_ACK: u8 = b'A';
 /// Has non-zero payload length
-pub(crate) const HIST_DATA: u8 = b'D';
+pub const HIST_DATA: u8 = b'D';
 /// Has FIN set
-pub(crate) const HIST_FIN: u8 = b'F';
+pub const HIST_FIN: u8 = b'F';
 /// Has RST set
-pub(crate) const HIST_RST: u8 = b'R';
+pub const HIST_RST: u8 = b'R';
 
 impl ConnRecord {
     /// Returns the client (originator) socket address.
@@ -157,6 +159,19 @@ pub struct ConnRecord {
     pub orig: Flow,
     /// Responder flow.
     pub resp: Flow,
+
+    /// Snapshot of orig flow state at the Nth packet.
+    pub prefix_orig: Option<Flow>,
+    /// Snapshot of resp flow state at the Nth packet.
+    pub prefix_resp: Option<Flow>,
+    /// Snapshot of history at the Nth packet.
+    pub prefix_history: Option<Vec<u8>>,
+    /// Duration at the Nth packet.
+    pub prefix_duration: Option<Duration>,
+    /// Max inactivity at the Nth packet.
+    pub prefix_max_inactivity: Option<Duration>,
+    /// Time to second packet, snapshotted at the Nth packet.
+    pub prefix_time_to_second_pkt: Option<Duration>,
 }
 
 #[inline]
@@ -187,7 +202,7 @@ pub(crate) fn update_history(history: &mut Vec<u8>, segment: &L4Pdu, mask: u8) {
 
 impl ConnRecord {
     #[inline]
-    fn update_data(&mut self, segment: &L4Pdu) {
+    fn update_data(&mut self, segment: &L4Pdu, n_packets: u64) {
         let now = Instant::now();
         let inactivity = now - self.last_seen_ts;
         if inactivity > self.max_inactivity {
@@ -206,11 +221,20 @@ impl ConnRecord {
         if self.orig.nb_pkts + self.resp.nb_pkts == 2 {
             self.second_seen_ts = now;
         }
+
+        if self.orig.nb_pkts + self.resp.nb_pkts == n_packets {
+            self.prefix_orig = Some(self.orig.clone());
+            self.prefix_resp = Some(self.resp.clone());
+            self.prefix_history = Some(self.history.clone());
+            self.prefix_duration = Some(self.duration());
+            self.prefix_max_inactivity = Some(self.max_inactivity);
+            self.prefix_time_to_second_pkt = Some(self.time_to_second_packet());
+        }
     }
 
     #[cfg_attr(not(feature = "skip_expand"), datatype_fn("ConnRecord,level=InL4Conn"))]
     pub fn update(&mut self, pdu: &L4Pdu) {
-        self.update_data(pdu);
+        self.update_data(pdu, N_PACKETS as u64);
     }
 }
 
@@ -227,10 +251,15 @@ impl Tracked for ConnRecord {
             history: Vec::with_capacity(16),
             orig: Flow::new(),
             resp: Flow::new(),
+            prefix_orig: None,
+            prefix_resp: None,
+            prefix_history: None,
+            prefix_duration: None,
+            prefix_max_inactivity: None,
+            prefix_time_to_second_pkt: None,
         }
     }
 
-    // Clear the more memory-intensive data structures
     fn clear(&mut self) {
         self.orig.chunks = Vec::with_capacity(0);
         self.orig.gaps = HashMap::with_capacity(0);
