@@ -275,6 +275,24 @@ fn default_cache_size() -> usize {
 
 /* --------------------------------------------------------------------------------- */
 
+/// Controls which hardware flow rule action is applied to matched connections.
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum FlowMode {
+    /// No flow rules installed. Split queues are not configured.
+    Standard,
+    /// Drop matched flows in hardware. Split queues are not configured.
+    Drop,
+    /// Steer matched flows to per-core split queues.
+    Split,
+}
+
+fn default_flow_mode() -> FlowMode {
+    FlowMode::Standard
+}
+
+/* --------------------------------------------------------------------------------- */
+
 /// Live traffic analysis options.
 ///
 /// Online mode performs traffic analysis on a live network interface. Either
@@ -348,6 +366,11 @@ pub struct OnlineConfig {
     /// short-header packets (form=0, fixed=1) over UDP at port startup.
     #[serde(default = "default_drop_quic_raw")]
     pub drop_quic_raw: bool,
+    
+    /// Controls whether hardware flow rules are installed for matched connections.
+    /// Defaults to `standard` (no rules installed).
+    #[serde(default = "default_flow_mode")]
+    pub flow_mode: FlowMode,
 
     /// If set, will pass supplementary arguments to DPDK EAL (see DPDK
     /// configuration). For instance `--no-huge`.

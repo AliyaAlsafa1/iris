@@ -2,7 +2,7 @@
 mod info;
 pub(crate) mod statistics;
 
-use crate::config::PortMap;
+use crate::config::{FlowMode, PortMap};
 use crate::dpdk;
 use crate::lcore::{CoreId, SocketId};
 use crate::memory::mempool::{Mempool, SplitMempool};
@@ -110,7 +110,7 @@ pub(crate) struct Port {
 }
 
 impl Port {
-    pub(crate) fn new(port_map: &PortMap) -> Port {
+    pub(crate) fn new(port_map: &PortMap, flow_mode: FlowMode) -> Port {
         let port_id = PortId::new_from_device(port_map.device.clone());
 
         let mut queue_map: BTreeMap<RxQueue, CoreId> = BTreeMap::new();
@@ -139,11 +139,13 @@ impl Port {
                 CoreId(*core_id),
             );
             q += 1;
-            queue_map.insert(
-                RxQueue::new(port_id, RxQueueId(q), RxQueueType::Split),
-                CoreId(*core_id),
-            );
-            q += 1;
+            if flow_mode == FlowMode::Split {
+                queue_map.insert(
+                    RxQueue::new(port_id, RxQueueId(q), RxQueueType::Split),
+                    CoreId(*core_id),
+                );
+                q += 1;
+            }
         }
 
         if nb_buckets < rx_core_ids.len() {

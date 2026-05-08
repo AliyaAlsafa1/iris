@@ -4,18 +4,20 @@ use lazy_static::lazy_static;
 use serde::Serialize;
 
 use iris_core::{
-    CoreId, FiveTuple, Runtime,
-    config::{default_config, load_config},
-    filter::flow_drop::{install_drop_flow, uninstall_flow},
+    config::{default_config, load_config, FlowMode},
+    filter::flow_drop::{install_drop_flow, install_split_flow, uninstall_flow},
     multicore::{ChannelDispatcher, ChannelMode, SharedWorkerThreadSpawner},
     port::PortId,
+    CoreId,
+    FiveTuple,
+    Runtime,
 };
 
-use iris_compiler::{callback, input_files, iris_end_macros};
 use iris_core::dpdk::rte_flow;
+use iris_compiler::{callback, input_files, iris_end_macros};
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, BTreeSet, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock, RwLock},
     time::{Duration, Instant},
@@ -42,6 +44,8 @@ lazy_static! {
 
 // Dispatching
 static FLOW_DISPATCHER: OnceLock<Arc<ChannelDispatcher<FlowEvent>>> = OnceLock::new();
+static MODE: RwLock<FlowMode> = RwLock::new(FlowMode::Standard);
+static SPLIT_QUEUES: RwLock<Option<HashMap<CoreId, u16>>> = RwLock::new(None);
 
 #[derive(Clone, Serialize)]
 enum FlowEvent {
@@ -59,6 +63,7 @@ enum ChannelModeArg {
     PerCore,
     Shared,
 }
+
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -101,6 +106,8 @@ struct Args {
     show_args: bool,
 }
 
+
+
 // ===== Helpers =====
 
 /// Expire and uninstall any rules whose deadlines have passed.
@@ -116,7 +123,7 @@ fn expire_flows_now() {
         let expired = queue.pop_front().unwrap();
         let raw_ptrs: Vec<*mut rte_flow> = expired.flow_ptrs.iter().map(|fp| fp.0).collect();
         if let Err(e) = uninstall_flow(expired.ports.clone(), raw_ptrs) {
-            eprintln!("Failed to uninstall drop flow: {:?}", e);
+            eprintln!("Failed to uninstall flow: {:?}", e);
         }
         // Optionally also remove from TARGET_FLOWS when it expires:
         TARGET_FLOWS.lock().unwrap().remove(&expired.tuple);
@@ -128,9 +135,7 @@ fn expire_flows_now() {
 // Try for all TCP
 #[callback("tcp,level=InL4Conn")]
 fn tls_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> bool {
-    if pkts.total() < 10 {
-        return true;
-    }
+    if pkts.total() < 10 { return true; }
 
     let tuple = five_tuple.clone();
 
@@ -145,6 +150,7 @@ fn tls_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> bool {
     }
     true
 }
+
 
 // ===== Main =====
 
@@ -169,6 +175,37 @@ fn main() {
         ChannelModeArg::Shared => ChannelMode::Shared,
     };
 
+    let flow_mode = config.online.as_ref().map_or(FlowMode::Standard, |o| o.flow_mode);
+    *MODE.write().unwrap() = flow_mode;
+
+    // Initialize split queues if needed
+    if flow_mode == FlowMode::Split {
+        // Layout per port (no sink): q0=receive  q1=split    q2=receive  q3=split    ...
+        // Layout per port (sink):    q0=sink     q1=receive  q2=split    q3=receive  ...
+        let mut split_queues: HashMap<CoreId, u16> = HashMap::new();
+        if let Some(online) = &config.online {
+            for port_map in &online.ports {
+                let sink_offset = u16::from(port_map.sink.is_some());
+
+                for (i, core) in port_map
+                    .cores
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .enumerate()
+                {
+                    split_queues.insert(
+                        CoreId(core),
+                        sink_offset + (i as u16) * 2 + 1,
+                    );
+                }
+            }
+        }
+
+        *SPLIT_QUEUES.write().unwrap() = Some(split_queues);
+    }
+
     // Create and publish the dispatcher
     let flow_dispatcher = Arc::new(ChannelDispatcher::new(
         channel_mode.clone(),
@@ -192,7 +229,12 @@ fn main() {
             expire_flows_now();
 
             match event {
-                FlowEvent::TlsSeen { tuple, .. } => {
+                FlowEvent::TlsSeen { tuple, rx_core } => {
+                    let mode = *MODE.read().unwrap();
+                    if mode == FlowMode::Standard {
+                        return;
+                    }
+
                     // Respect NUM_FLOWS cap first
                     if NUM_FLOWS == 0 {
                         return;
@@ -208,10 +250,29 @@ fn main() {
                         targets.insert(tuple.clone(), Instant::now());
                     }
 
+                    let split_queue = if mode == FlowMode::Split {
+                        let queues = SPLIT_QUEUES.read().unwrap();
+                        match queues.as_ref().and_then(|m| m.get(&rx_core)).copied() {
+                            Some(q) => Some(q),
+                            None => {
+                                eprintln!("No split queue mapped for core {rx_core:?}");
+                                return;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
                     // Install, if we have ports
                     let maybe_ports = PORT_IDS.read().unwrap().clone();
                     if let Some(ports) = maybe_ports {
-                        match install_drop_flow(ports.clone(), &tuple) {
+                        let result = match mode {
+                            FlowMode::Drop => install_drop_flow(ports.clone(), &tuple),
+                            FlowMode::Split => install_split_flow(ports.clone(), &tuple, split_queue.unwrap()),
+                            FlowMode::Standard => return,
+                        };
+
+                        match result {
                             Ok(raw_flows) => {
                                 let entry = FlowEntry {
                                     tuple: tuple.clone(),
@@ -221,10 +282,10 @@ fn main() {
                                 };
                                 FLOW_QUEUE.lock().unwrap().push_back(entry);
                             }
-                            Err(e) => eprintln!("Failed to install drop flow: {:?}", e),
+                            Err(e) => eprintln!("install flow failed: {e:?}"),
                         }
                     } else {
-                        eprintln!("PORT_IDS is None when trying to install drop flow!");
+                        eprintln!("PORT_IDS is None when trying to install flow!");
                     }
                 }
             }

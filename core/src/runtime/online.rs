@@ -50,7 +50,7 @@ where
         log::info!("Initializing Ports...");
         let mut ports: BTreeMap<PortId, Port> = BTreeMap::new();
         for port_map in options.online.ports.iter() {
-            let port = Port::new(port_map);
+            let port = Port::new(port_map, options.online.flow_mode);
             let socket_id = port.id.socket_id();
             let mtu = if let Some(online) = &config.online {
                 online.mtu
