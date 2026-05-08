@@ -2,7 +2,7 @@ use crate::config::RuntimeConfig;
 use crate::dpdk;
 use crate::port::{statistics::PortStats, Port, PortId, RxQueue, RxQueueType};
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::CString;
 use std::fmt;
 use std::fs;

@@ -6,7 +6,7 @@ use serde::Serialize;
 use iris_core::{
     CoreId, FiveTuple, Runtime,
     config::{default_config, load_config},
-    filter::flow_drop::{install_drop_flow, uninstall_drop_flow},
+    filter::flow_drop::{install_drop_flow, uninstall_flow},
     multicore::{ChannelDispatcher, ChannelMode, SharedWorkerThreadSpawner},
     port::PortId,
 };
@@ -116,7 +116,7 @@ fn expire_flows_now() {
         // pop first (to drop the borrow) then uninstall
         let expired = queue.pop_front().unwrap();
         let raw_ptrs: Vec<*mut rte_flow> = expired.flow_ptrs.iter().map(|fp| fp.0).collect();
-        if let Err(e) = uninstall_drop_flow(expired.ports.clone(), raw_ptrs) {
+        if let Err(e) = uninstall_flow(expired.ports.clone(), raw_ptrs) {
             eprintln!("Failed to uninstall drop flow: {:?}", e);
         }
         // Also remove from the installed flows map
