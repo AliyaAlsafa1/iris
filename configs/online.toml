@@ -7,7 +7,7 @@ cache_size = 512
 
 [online]
 duration = 120
-nb_rxd = 32768
+nb_rxd = 16384
 promiscuous = true
 mtu = 1500
 hardware_assist = false
