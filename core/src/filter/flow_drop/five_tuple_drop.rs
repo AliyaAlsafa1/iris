@@ -11,8 +11,8 @@ use crate::protocols::packet::udp::UDP_PROTOCOL;
 
 use crate::dpdk;
 use crate::dpdk::{rte_flow, rte_flow_item, rte_flow_attr, rte_flow_error, rte_flow_create,
-    rte_flow_destroy, rte_flow_action, rte_flow_item_ipv4, rte_flow_item_ipv6,
-    rte_flow_item_tcp, rte_flow_item_udp, rte_flow_action_queue};
+    rte_flow_destroy, rte_flow_query, rte_flow_query_count, rte_flow_action, rte_flow_item_ipv4, rte_flow_item_ipv6,
+    rte_flow_item_tcp, rte_flow_item_udp, rte_flow_action_queue, rte_flow_action_count};
 
 const BASE_GROUP: u32 = 2;
 const LAST_GROUP: u32 = 2;
@@ -274,7 +274,12 @@ pub fn install_drop_flow(
     port_ids: Vec<PortId>,
     tuple:    &FiveTuple,
 ) -> Result<Vec<*mut rte_flow>> {
+    let count_conf = rte_flow_action_count { id: 0 };
     let actions = [
+        rte_flow_action {
+            type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_COUNT,
+            conf: &count_conf as *const _ as *const _,
+        },
         rte_flow_action {
             type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_DROP,
             conf: ptr::null(),
@@ -293,8 +298,13 @@ pub fn install_split_flow(
     tuple:    &FiveTuple,
     queue_id: u16,
 ) -> Result<Vec<*mut rte_flow>> {
+    let count_conf = rte_flow_action_count { id: 0 };
     let conf = rte_flow_action_queue { index: queue_id };
     let actions = [
+        rte_flow_action {
+            type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_COUNT,
+            conf: &count_conf as *const _ as *const _,
+        },
         rte_flow_action {
             type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_QUEUE,
             conf:  &conf as *const _ as *const _,
@@ -324,6 +334,17 @@ pub fn uninstall_flow(port_ids: Vec<PortId>, flows: Vec<*mut rte_flow>) -> Resul
             continue;
         }
 
+        match query_flow_stats(port_id.raw(), *flow) {
+            Ok((hits, bytes)) => println!(
+                "Port {} flow stats — packets: {}, bytes: {}",
+                port_id.raw(), hits, bytes
+            ),
+            Err(e) => println!(
+                "Port {} flow stats unavailable: {}",
+                port_id.raw(), e
+            ),
+        }
+
         let mut error: rte_flow_error = unsafe { mem::zeroed() };
         let start = unsafe { dpdk::rte_rdtsc() };
         let ret = unsafe { rte_flow_destroy(port_id.raw(), *flow, &mut error) };
@@ -345,4 +366,39 @@ pub fn uninstall_flow(port_ids: Vec<PortId>, flows: Vec<*mut rte_flow>) -> Resul
     }
 
     Ok(())
+}
+
+fn query_flow_stats(port_id: u16, flow: *mut rte_flow) -> Result<(u64, u64)> {
+    let count_conf = rte_flow_action_count { id: 0 };
+    let count_action = rte_flow_action {
+        type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_COUNT,
+        conf: &count_conf as *const _ as *const _,
+    };
+
+    let mut count_data: rte_flow_query_count = unsafe { mem::zeroed() };
+    count_data.set_reset(1);
+
+    let mut error: rte_flow_error = unsafe { mem::zeroed() };
+
+    let ret = unsafe {
+        rte_flow_query(
+            port_id,
+            flow,
+            &count_action,
+            &mut count_data as *mut _ as *mut _,
+            &mut error,
+        )
+    };
+
+    if ret != 0 {
+        let msg = unsafe {
+            CStr::from_ptr(error.message).to_string_lossy().into_owned()
+        };
+        bail!("rte_flow_query failed on port {}: {}", port_id, msg);
+    }
+
+    let hits  = if count_data.hits_set()  != 0 { count_data.hits  } else { 0 };
+    let bytes = if count_data.bytes_set() != 0 { count_data.bytes } else { 0 };
+
+    Ok((hits, bytes))
 }
