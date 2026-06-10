@@ -357,8 +357,9 @@ impl Port {
             port_conf.rxmode.offloads |= dpdk::DEV_RX_OFFLOAD_VLAN_STRIP as u64;
         }
 
-        // turns on buffer split if supported
-        if dev_info.rx_offload_capa & dpdk::RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT as u64 != 0 {
+        // turns on buffer split if supported and actually used
+        let has_split_queues = self.queue_map.keys().any(|rxq| rxq.ty == RxQueueType::Split);
+        if has_split_queues && dev_info.rx_offload_capa & dpdk::RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT as u64 != 0 {
             port_conf.rxmode.offloads |= dpdk::RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT as u64;
             port_conf.rxmode.offloads |= dpdk::RTE_ETH_RX_OFFLOAD_SCATTER as u64;
         }
