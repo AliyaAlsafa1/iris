@@ -10,10 +10,10 @@ duration = 60
 nb_rxd = 4096
 promiscuous = true
 mtu = 1500
-hardware_assist = false
+hardware_assist = true
 dyn_hardware_assist = false
 drop_tls_raw = true
-drop_quic_raw = false
+drop_quic_raw = true
 
 [[online.ports]]
 device = "0000:8a:00.1"
