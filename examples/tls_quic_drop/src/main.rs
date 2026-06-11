@@ -1,7 +1,7 @@
 use clap::Parser;
 use iris_compiler::*;
 use iris_core::{config::load_config, Runtime};
-use iris_datatypes::{QuicStream, TlsHandshake};
+use iris_core::L4Pdu;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -16,8 +16,8 @@ struct Args {
     config: PathBuf,
 }
 
-#[callback("tcp,level=InL4Conn")]
-fn log_packet(tls: &TlsHandshake) -> bool {
+#[callback("ipv4 or ipv6,level=InL4Conn")]
+fn handle_packet(_pdu: &L4Pdu) -> bool {
     true
 }
 
