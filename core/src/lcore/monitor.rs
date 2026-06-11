@@ -303,12 +303,14 @@ impl AggRxStats {
         let mut hw_dropped_pkts = 0;
         let mut sw_dropped_pkts = 0;
         for (port_id, rx_queues) in ports.iter() {
-            let mut sink_queue = None;
-            for queue in rx_queues {
-                if queue.ty == RxQueueType::Sink {
-                    sink_queue = Some(queue.qid.raw());
-                }
-            }
+            // All sink queues on this port (TLS/QUIC measure sinks, sampling
+            // sink, etc.). Their traffic is excluded from the "reached workers"
+            // stat below.
+            let sink_qids: Vec<u16> = rx_queues
+                .iter()
+                .filter(|queue| queue.ty == RxQueueType::Sink)
+                .map(|queue| queue.qid.raw())
+                .collect();
 
             match PortStats::collect(*port_id) {
                 Ok(port_stats) => {
@@ -346,27 +348,26 @@ impl AggRxStats {
                     good_bytes += good_bytes_temp;
                     good_pkts += good_pkts_temp;
 
-                    // Process (reached workers)
-                    process_bytes += if let Some(sink) = sink_queue {
-                        let label = format!("rx_q{}_bytes", sink);
-                        let sink_bytes = match port_stats.stats.get(&label) {
-                            Some(v) => *v,
-                            None => bail!("Failed retrieving sink_bytes"),
-                        };
-                        good_bytes_temp - sink_bytes
-                    } else {
-                        good_bytes_temp
-                    };
-                    process_pkts += if let Some(sink) = sink_queue {
-                        let label = format!("rx_q{}_packets", sink);
-                        let sink_pkts = match port_stats.stats.get(&label) {
-                            Some(v) => *v,
-                            None => bail!("Failed retrieving sink_pkts"),
-                        };
-                        good_pkts_temp - sink_pkts
-                    } else {
-                        good_pkts_temp
-                    };
+                    // Process (reached workers) = good minus traffic steered to
+                    // every sink queue. Per-queue byte/packet xstats are not
+                    // exposed by all PMDs (e.g. ICE); when missing, fall back to
+                    // the good total rather than failing the whole display.
+                    let mut sink_bytes = 0;
+                    let mut sink_pkts = 0;
+                    for sink in &sink_qids {
+                        match port_stats.stats.get(&format!("rx_q{}_bytes", sink)) {
+                            Some(v) => sink_bytes += *v,
+                            None => log::debug!(
+                                "No per-queue byte xstat for sink queue {}; not excluded from process stats",
+                                sink
+                            ),
+                        }
+                        if let Some(v) = port_stats.stats.get(&format!("rx_q{}_packets", sink)) {
+                            sink_pkts += *v;
+                        }
+                    }
+                    process_bytes += good_bytes_temp.saturating_sub(sink_bytes);
+                    process_pkts += good_pkts_temp.saturating_sub(sink_pkts);
 
                     // dropped
                     hw_dropped_pkts += match port_stats.stats.get("rx_phy_discard_packets") {

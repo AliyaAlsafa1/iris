@@ -14,10 +14,23 @@ use anyhow::{bail, Result};
 
 use crate::dpdk;
 use crate::dpdk::{
-    rte_flow, rte_flow_action, rte_flow_attr, rte_flow_create, rte_flow_error, rte_flow_item,
-    rte_flow_item_raw,
+    rte_flow, rte_flow_action, rte_flow_action_queue, rte_flow_attr, rte_flow_create,
+    rte_flow_error, rte_flow_item, rte_flow_item_raw,
 };
 use crate::port::PortId;
+
+/// What the raw-pattern rule does with a matching packet.
+///
+/// `Drop` is the production action (hardware drop). `Steer` redirects matches
+/// to a dedicated RX queue instead, so a sink core can poll and count them —
+/// used to measure how many packets the rule matches without relying on
+/// hardware flow counters (which the ICE PMD does not support for raw/parser
+/// FDIR rules; see ice_fdir_create_filter).
+#[derive(Clone, Copy, Debug)]
+pub enum RawAction {
+    Drop,
+    Steer(u16),
+}
 
 const TLS_APPDATA_TYPE: u8 = 0x17;
 const TLS_VERSION_MAJOR: u8 = 0x03;
@@ -76,6 +89,7 @@ fn create_raw_drop(
     mask: &[u8],
     priority: u32,
     label: &str,
+    action: RawAction,
 ) -> Result<*mut rte_flow> {
     assert_eq!(spec.len(), mask.len());
     let total = spec.len();
@@ -108,11 +122,24 @@ fn create_raw_drop(
         },
     ];
 
-    let actions: [rte_flow_action; 2] = [
-        rte_flow_action {
+    // Terminal action: either hardware drop, or steer to a sink queue for
+    // software counting. queue_conf must outlive the rte_flow_create call.
+    let queue_conf = match action {
+        RawAction::Steer(qid) => rte_flow_action_queue { index: qid },
+        RawAction::Drop => rte_flow_action_queue { index: 0 },
+    };
+    let terminal = match action {
+        RawAction::Drop => rte_flow_action {
             type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_DROP,
             conf: ptr::null(),
         },
+        RawAction::Steer(_) => rte_flow_action {
+            type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_QUEUE,
+            conf: &queue_conf as *const _ as *const _,
+        },
+    };
+    let actions: [rte_flow_action; 2] = [
+        terminal,
         rte_flow_action {
             type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_END,
             conf: ptr::null(),
@@ -189,7 +216,12 @@ fn create_raw_drop(
     Ok(flow)
 }
 
-fn install_tls_appdata_drop_variant(port_id: PortId, ip_ver: u8, ihl: u8) -> Result<*mut rte_flow> {
+fn install_tls_appdata_drop_variant(
+    port_id: PortId,
+    ip_ver: u8,
+    ihl: u8,
+    action: RawAction,
+) -> Result<*mut rte_flow> {
     let ip_off = 14usize;
     let ip_hlen = if ip_ver == 4 { ihl as usize * 4 } else { 40 };
     let tcp_off = ip_off + ip_hlen;
@@ -215,13 +247,18 @@ fn install_tls_appdata_drop_variant(port_id: PortId, ip_ver: u8, ihl: u8) -> Res
     mask[tls_off + 1] = 0xff;
 
     let label = format!(
-        "tls-appdata-drop v{} ihl={} doff={}",
-        ip_ver, ihl, TCP_DOFF_PINNED
+        "tls-appdata v{} ihl={} doff={} {:?}",
+        ip_ver, ihl, TCP_DOFF_PINNED, action
     );
-    create_raw_drop(port_id, &spec, &mask, 0, &label)
+    create_raw_drop(port_id, &spec, &mask, 0, &label, action)
 }
 
-fn install_quic_short_drop_variant(port_id: PortId, ip_ver: u8, ihl: u8) -> Result<*mut rte_flow> {
+fn install_quic_short_drop_variant(
+    port_id: PortId,
+    ip_ver: u8,
+    ihl: u8,
+    action: RawAction,
+) -> Result<*mut rte_flow> {
     let ip_off = 14usize;
     let ip_hlen = if ip_ver == 4 { ihl as usize * 4 } else { 40 };
     let udp_off = ip_off + ip_hlen;
@@ -242,43 +279,47 @@ fn install_quic_short_drop_variant(port_id: PortId, ip_ver: u8, ihl: u8) -> Resu
     spec[quic_off] = 0x40;
     mask[quic_off] = 0xc0;
 
-    let label = format!("quic-short-drop v{} ihl={} (b0-only)", ip_ver, ihl);
-    create_raw_drop(port_id, &spec, &mask, 0, &label)
+    let label = format!("quic-short v{} ihl={} (b0-only) {:?}", ip_ver, ihl, action);
+    create_raw_drop(port_id, &spec, &mask, 0, &label, action)
 }
 
-/// Drops TLS Application-Data records (type 0x17, version-major 0x03) over
-/// TCP with `data offset = 8`. Installs IPv4 (IHL=5) and IPv6 variants.
-/// Failure on a single variant is logged and skipped.
-pub fn install_tls_appdata_drop(port_id: PortId) -> Result<Vec<*mut rte_flow>> {
+/// Installs the TLS Application-Data raw rules (type 0x17, version-major 0x03)
+/// over TCP with `data offset = 8`, for IPv4 (IHL=5) and IPv6. `action` selects
+/// hardware drop or steer-to-queue. Failure on a single variant is logged and
+/// skipped.
+pub fn install_tls_appdata_drop(port_id: PortId, action: RawAction) -> Result<Vec<*mut rte_flow>> {
     let mut flows = Vec::new();
     for &(ip_ver, ihl) in &[(4u8, 5u8), (6u8, 0u8)] {
-        match install_tls_appdata_drop_variant(port_id, ip_ver, ihl) {
+        match install_tls_appdata_drop_variant(port_id, ip_ver, ihl, action) {
             Ok(f) => flows.push(f),
-            Err(e) => log::warn!("tls-appdata-drop v{} ihl={} skipped: {:?}", ip_ver, ihl, e),
+            Err(e) => log::warn!("tls-appdata v{} ihl={} skipped: {:?}", ip_ver, ihl, e),
         }
     }
     log::info!(
-        "Installed {} TLS-AppData raw drop flows on port {}",
+        "Installed {} TLS-AppData raw flows on port {} ({:?})",
         flows.len(),
-        port_id.raw()
+        port_id.raw(),
+        action
     );
     Ok(flows)
 }
 
-/// Drops QUIC short-header packets (form=0, fixed=1) on UDP using the
-/// 5-byte parser-anchor template. Installs IPv4 (IHL=5) and IPv6 variants.
-pub fn install_quic_short_drop(port_id: PortId) -> Result<Vec<*mut rte_flow>> {
+/// Installs the QUIC short-header raw rules (form=0, fixed=1) on UDP using the
+/// 5-byte parser-anchor template, for IPv4 (IHL=5) and IPv6. `action` selects
+/// hardware drop or steer-to-queue.
+pub fn install_quic_short_drop(port_id: PortId, action: RawAction) -> Result<Vec<*mut rte_flow>> {
     let mut flows = Vec::new();
     for &(ip_ver, ihl) in &[(4u8, 5u8), (6u8, 0u8)] {
-        match install_quic_short_drop_variant(port_id, ip_ver, ihl) {
+        match install_quic_short_drop_variant(port_id, ip_ver, ihl, action) {
             Ok(f) => flows.push(f),
-            Err(e) => log::warn!("quic-short-drop v{} ihl={} skipped: {:?}", ip_ver, ihl, e),
+            Err(e) => log::warn!("quic-short v{} ihl={} skipped: {:?}", ip_ver, ihl, e),
         }
     }
     log::info!(
-        "Installed {} QUIC short-header raw drop flows on port {}",
+        "Installed {} QUIC short-header raw flows on port {} ({:?})",
         flows.len(),
-        port_id.raw()
+        port_id.raw(),
+        action
     );
     Ok(flows)
 }

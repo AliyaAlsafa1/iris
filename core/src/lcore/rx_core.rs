@@ -161,31 +161,29 @@ where
             self.rxqueues.iter().format(", "),
         );
 
-        let mut nb_pkts = 0;
-        let mut nb_bytes = 0;
+        // Per-queue counters so a sink core polling multiple steered queues
+        // (e.g. TLS on one queue, QUIC on another) reports each separately.
+        let mut per_queue: Vec<(u64, u64)> = vec![(0, 0); self.rxqueues.len()];
 
         while self.is_running.load(Ordering::Relaxed) {
-            for rxqueue in self.rxqueues.iter() {
+            for (i, rxqueue) in self.rxqueues.iter().enumerate() {
                 let mbufs: Vec<Mbuf> = self.rx_burst(rxqueue, 32);
                 for mbuf in mbufs.into_iter() {
-                    log::debug!("RSS Hash: 0x{:x}", mbuf.rss_hash());
-                    log::debug!(
-                        "Queue ID: {}, Port ID: {}, Core ID: {}",
-                        rxqueue.qid,
-                        rxqueue.pid,
-                        self.id,
-                    );
-                    nb_pkts += 1;
-                    nb_bytes += mbuf.data_len() as u64;
+                    per_queue[i].0 += 1;
+                    per_queue[i].1 += mbuf.data_len() as u64;
                 }
             }
         }
-        log::info!(
-            "Sink Core {} total recv from {}: {} pkts, {} bytes",
-            self.id,
-            self.rxqueues.iter().format(", "),
-            nb_pkts,
-            nb_bytes
-        );
+
+        for (i, rxqueue) in self.rxqueues.iter().enumerate() {
+            let (nb_pkts, nb_bytes) = per_queue[i];
+            log::info!(
+                "Sink Core {} queue {}: {} pkts, {} bytes",
+                self.id,
+                rxqueue,
+                nb_pkts,
+                nb_bytes
+            );
+        }
     }
 }

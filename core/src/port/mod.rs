@@ -121,14 +121,27 @@ impl Port {
         // NICE-TO-HAVE: error handling
         // - Display warning if cores do not match port socket
         // - Display warning and handle duplicate cores per port and across ports
+        // Queue ids are assigned in allocation order from 0. Sinks are
+        // allocated before the Receive queues below, so when any sink is
+        // configured it takes qid 0 (additional sinks take 1, 2, ...). That
+        // ordering is what lets RSS sampling work: the RETA (further down) is
+        // default-initialized to RxQueueId(0), and `nb_buckets` (from the first
+        // sink) controls how many buckets get overwritten with Receive queues.
+        // With the default nb_buckets == RSS_RETA_SIZE every bucket maps to a
+        // Receive queue, so NO RSS traffic reaches a sink — sinks then receive
+        // only flow-steered packets (the measurement case). Only an explicit
+        // nb_buckets < RSS_RETA_SIZE leaves leftover buckets at the qid-0
+        // default, sampling that fraction of RSS traffic into the first sink.
         let mut q: u16 = 0;
-        let nb_buckets = if let Some(sink) = &port_map.sink {
-            queue_map.insert(
-                RxQueue::new(port_id, RxQueueId(q), RxQueueType::Sink),
-                CoreId(sink.core),
-            );
-            q += 1;
-            sink.nb_buckets
+        let nb_buckets = if let Some(first_sink) = port_map.sinks.first() {
+            for sink in &port_map.sinks {
+                queue_map.insert(
+                    RxQueue::new(port_id, RxQueueId(q), RxQueueType::Sink),
+                    CoreId(sink.core),
+                );
+                q += 1;
+            }
+            first_sink.nb_buckets
         } else {
             RSS_RETA_SIZE
         };

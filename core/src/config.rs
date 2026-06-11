@@ -103,7 +103,7 @@ impl RuntimeConfig {
         if let Some(online) = &self.online {
             for port in online.ports.iter() {
                 cores.extend(port.cores.iter().map(|c| CoreId(*c)));
-                if let Some(sink) = &port.sink {
+                for sink in &port.sinks {
                     cores.push(CoreId(sink.core));
                 }
             }
@@ -366,7 +366,17 @@ pub struct OnlineConfig {
     /// short-header packets (form=0, fixed=1) over UDP at port startup.
     #[serde(default = "default_drop_quic_raw")]
     pub drop_quic_raw: bool,
-    
+
+    /// Measurement mode for the raw TLS/QUIC rules: instead of dropping matched
+    /// packets in hardware, steer them to the port's sink queue so the sink core
+    /// can count them. Requires `[[online.ports.sinks]]` to be configured (two
+    /// sinks recommended: TLS steers to the first, QUIC to the second). The ICE
+    /// PMD does not support hardware flow counters for raw/parser FDIR rules, so
+    /// this steer-and-count path is how match volume is measured. Defaults to
+    /// `false` (hardware drop).
+    #[serde(default = "default_measure_raw_drop")]
+    pub measure_raw_drop: bool,
+
     /// Controls whether hardware flow rules are installed for matched connections.
     /// Defaults to `standard` (no rules installed).
     #[serde(default = "default_flow_mode")]
@@ -411,6 +421,10 @@ fn default_drop_quic_raw() -> bool {
     false
 }
 
+fn default_measure_raw_drop() -> bool {
+    false
+}
+
 fn default_dpdk_supl_args() -> Vec<String> {
     Vec::new()
 }
@@ -449,9 +463,13 @@ fn default_prometheus() -> Option<PrometheusConfig> {
 /// packet loss. However, it can be quite wasteful of system resources, as it requires configuring
 /// one additional core per interface and thrashes the cache.
 ///
+/// Multiple sinks may be configured per port (e.g. one per raw rule in
+/// `measure_raw_drop` mode); each gets its own RX queue (qid 0, 1, ...) and
+/// core. The first sink owns any RSS redirection-table sampling buckets.
+///
 /// ## Example
 /// ```toml
-/// [online.ports.sink]
+/// [[online.ports.sinks]]
 ///     core = 9
 ///     nb_buckets = 384   # drops 25% of 4-tuples
 /// ```
@@ -499,13 +517,14 @@ pub struct PortMap {
     /// the PCI device.
     pub cores: Vec<u32>,
 
-    /// Sink core configuration. Defaults to `None`.
-    #[serde(default = "default_sink")]
-    pub sink: Option<SinkConfig>,
+    /// Sink core configuration. Defaults to empty (no sink queues). Each entry
+    /// creates a dedicated sink RX queue (qid 0, 1, ...) on its own core.
+    #[serde(default = "default_sinks")]
+    pub sinks: Vec<SinkConfig>,
 }
 
-fn default_sink() -> Option<SinkConfig> {
-    None
+fn default_sinks() -> Vec<SinkConfig> {
+    Vec::new()
 }
 
 /* --------------------------------------------------------------------------------- */
