@@ -28,6 +28,10 @@ struct Args {
         default_value = "./configs/offline.toml"
     )]
     config: PathBuf,
+
+    /// CSV output path for the classifier results (overwritten each run).
+    #[clap(long, parse(from_os_str), value_name = "FILE", default_value = "./measure.csv")]
+    csv: PathBuf,
 }
 
 /// Counter categories. One global atomic per entry, indexed by these constants.
@@ -63,20 +67,21 @@ mod cat {
 lazy_static! {
     /// Global per-category packet counters.
     static ref COUNTS: [AtomicU64; cat::N] = std::array::from_fn(|_| AtomicU64::new(0));
-    /// Total bytes seen (not a category — kept separately).
-    static ref TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
-}
-
-#[inline]
-fn bump(i: usize) {
-    COUNTS[i].fetch_add(1, Ordering::Relaxed);
+    /// Global per-category byte counters (volume), parallel to COUNTS.
+    static ref BYTES: [AtomicU64; cat::N] = std::array::from_fn(|_| AtomicU64::new(0));
 }
 
 /// Classify one L2 frame, mirroring the raw-rule byte tests in
 /// `core/src/filter/flow_drop/raw_drop.rs`, incrementing the relevant counters.
 fn classify(data: &[u8]) {
+    let len = data.len() as u64;
+    // Each category bump records one packet and its full frame length (volume).
+    let bump = |i: usize| {
+        COUNTS[i].fetch_add(1, Ordering::Relaxed);
+        BYTES[i].fetch_add(len, Ordering::Relaxed);
+    };
+
     bump(cat::TOTAL);
-    TOTAL_BYTES.fetch_add(data.len() as u64, Ordering::Relaxed);
 
     let b = |i: usize| data.get(i).copied();
 
@@ -171,40 +176,43 @@ fn classify(data: &[u8]) {
     }
 }
 
-fn report() {
-    let g = |i: usize| COUNTS[i].load(Ordering::Relaxed);
-    let total = g(cat::TOTAL);
-    let pct = |n: u64| if total == 0 { 0.0 } else { 100.0 * n as f64 / total as f64 };
+/// Write the classifier results as a flat CSV (overwriting `path`) with both
+/// packet counts and byte volume per metric. `pct_packets` / `pct_bytes` are
+/// percent-of-total.
+fn write_csv(path: &std::path::Path) {
+    use std::fmt::Write as _;
 
-    println!("\n==================== SW classifier (oracle) ====================");
-    println!("total bytes: {}", TOTAL_BYTES.load(Ordering::Relaxed));
-    for i in 0..cat::N {
-        println!("  {:<16}: {:>12}  ({:.2}%)", cat::LABELS[i], g(i), pct(g(i)));
-    }
+    let gp = |i: usize| COUNTS[i].load(Ordering::Relaxed);
+    let gb = |i: usize| BYTES[i].load(Ordering::Relaxed);
+    let total_p = gp(cat::TOTAL);
+    let total_b = gb(cat::TOTAL);
+    let pct = |n: u64, d: u64| if d == 0 { 0.0 } else { 100.0 * n as f64 / d as f64 };
 
-    // Derived comparison: total vs addressable TLS+QUIC vs HW-rule match.
-    let hw_match = g(cat::TLS_HW) + g(cat::QUIC_HW);
-    let addr_proto = g(cat::TLS_APPDATA) + g(cat::QUIC_SHORT) + g(cat::QUIC_LONG);
-    let addr_port = g(cat::TCP443) + g(cat::UDP443);
-    println!("----------------------------------------------------------------");
-    println!("[1] total traffic         : {}", total);
-    println!(
-        "[2] addressable TLS+QUIC  : {} (by protocol) | {} (by port 443)",
-        addr_proto, addr_port
-    );
-    println!("[3] HW rules would match  : {}  ({:.2}% of total)", hw_match, pct(hw_match));
-    if addr_proto > 0 {
-        println!(
-            "    HW / addressable      : {:.1}% (proto) | {:.1}% (port)",
-            100.0 * hw_match as f64 / addr_proto as f64,
-            if addr_port > 0 {
-                100.0 * hw_match as f64 / addr_port as f64
-            } else {
-                0.0
-            }
+    let mut out = String::from("metric,packets,bytes,pct_packets,pct_bytes\n");
+    let mut row = |out: &mut String, label: &str, p: u64, b: u64| {
+        let _ = writeln!(
+            out,
+            "{},{},{},{:.2},{:.2}",
+            label,
+            p,
+            b,
+            pct(p, total_p),
+            pct(b, total_b)
         );
+    };
+    for i in 0..cat::N {
+        row(&mut out, cat::LABELS[i], gp(i), gb(i));
     }
-    println!("================================================================\n");
+
+    // Derived: what the HW rules would match (TLS HW + QUIC HW).
+    let hw_p = gp(cat::TLS_HW) + gp(cat::QUIC_HW);
+    let hw_b = gb(cat::TLS_HW) + gb(cat::QUIC_HW);
+    row(&mut out, "hw_match", hw_p, hw_b);
+
+    match std::fs::write(path, out) {
+        Ok(()) => eprintln!("wrote results to {}", path.display()),
+        Err(e) => eprintln!("error: could not write CSV to {}: {}", path.display(), e),
+    }
 }
 
 #[callback("ipv4 or ipv6,level=InL4Conn")]
@@ -221,5 +229,5 @@ fn main() {
     let config = load_config(&args.config);
     let mut runtime: Runtime<SubscribedWrapper> = Runtime::new(config, filter).unwrap();
     runtime.run();
-    report();
+    write_csv(&args.csv);
 }

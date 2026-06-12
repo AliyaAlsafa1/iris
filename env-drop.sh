@@ -12,8 +12,10 @@ export DPDK_PATH="${DPDK_INSTALL}"
 export DPDK_VERSION="25.11"
 export LD_LIBRARY_PATH="${DPDK_LIB}"
 export PKG_CONFIG_PATH="${DPDK_LIB}/pkgconfig"
-export LIBCLANG_PATH="/usr/lib/llvm-18/lib"
-export PATH="/usr/lib/llvm-18/bin:${PATH}"
+# Pick the newest installed LLVM (hosts vary: some have llvm-18, others 17/14).
+LLVM_DIR="$(ls -d /usr/lib/llvm-* 2>/dev/null | sort -V | tail -1)"
+export LIBCLANG_PATH="${LLVM_DIR}/lib"
+export PATH="${LLVM_DIR}/bin:${PATH}"
 
 build() {
     echo "==> Building tls_quic_drop example (release) ..."
