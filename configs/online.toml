@@ -2,7 +2,8 @@ main_core = 0
 nb_memory_channels = 6
 
 [mempool]
-capacity = 8_388_608
+#capacity = 8_388_608
+capacity = 4_000_000
 cache_size = 512
 
 [online]
@@ -16,10 +17,6 @@ flow_mode = "standard"
 [[online.ports]]
 device = "0000:3b:00.0"
 cores = [ 1, 2, 3, 4, 5, 6, 7, 8 ]
-
-# [online.ports.sink]
-# core = 17
-# nb_buckets = 512
 
 [[online.ports]]
 device = "0000:d8:00.0"

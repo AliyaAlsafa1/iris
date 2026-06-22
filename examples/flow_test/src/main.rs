@@ -53,15 +53,14 @@ static FLOW_DISPATCHER: OnceLock<Arc<ChannelDispatcher<FlowEvent>>> = OnceLock::
 static MODE: RwLock<FlowMode> = RwLock::new(FlowMode::Standard);
 static SPLIT_QUEUES: RwLock<Option<HashMap<CoreId, u16>>> = RwLock::new(None);
 
+static TIMEOUT_SECS: OnceLock<u64> = OnceLock::new();
+static NUM_FLOWS: OnceLock<usize> = OnceLock::new();
+
 #[derive(Clone, Serialize)]
 enum FlowEvent {
     /// Minimal payload to keep cloning cheap
     TlsSeen { tuple: FiveTuple, rx_core: CoreId },
 }
-
-const TIMEOUT_SECS: u64 = 10;
-const NUM_FLOWS: usize = 100;
-const GRACE_PERIOD: u64 = 5;
 
 // ===== CLI =====
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -113,6 +112,12 @@ struct Args {
 
     #[clap(long, value_parser, value_name = "FILE")]
     model: PathBuf,
+
+    #[clap(long, value_name = "SECS", default_value = "10")]
+    timeout_secs: u64,
+
+    #[clap(long, value_name = "COUNT", default_value = "100")]
+    num_flows: usize,
 }
 
 
@@ -151,15 +156,15 @@ fn tls_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount, conn: &Conn
     let is_elephant = ConnFeatures::from_conn(conn, iat)
         .and_then(|features| {
             let proba = model::predict(&features)?;
-            println!(
-                "[FLOW] src_subn={} dst_subn={} src_port={} dst_port={} proto={} p={:.4}",
-                features.src_ip_subn,
-                features.dst_ip_subn,
-                features.src_port,
-                features.dst_port,
-                features.protocol,
-                proba,
-            );
+            // println!(
+            //     "[FLOW] src_subn={} dst_subn={} src_port={} dst_port={} proto={} p={:.4}",
+            //     features.src_ip_subn,
+            //     features.dst_ip_subn,
+            //     features.src_port,
+            //     features.dst_port,
+            //     features.protocol,
+            //     proba,
+            // );
             Some(proba >= 0.5)
         })
         .unwrap_or(false);
@@ -192,6 +197,9 @@ fn main() {
         println!("{args:#?}");
     }
 
+    TIMEOUT_SECS.set(args.timeout_secs).unwrap();
+    NUM_FLOWS.set(args.num_flows).unwrap();
+
     // Load the LightGBM model before starting the runtime.
     model::load_model(args.model.to_str().expect("Invalid model path"));
 
@@ -214,12 +222,9 @@ fn main() {
     // Initialize split queues if needed
     if flow_mode == FlowMode::Split {
         // Layout per port (no sink): q0=receive  q1=split    q2=receive  q3=split    ...
-        // Layout per port (sink):    q0=sink     q1=receive  q2=split    q3=receive  ...
         let mut split_queues: HashMap<CoreId, u16> = HashMap::new();
         if let Some(online) = &config.online {
             for port_map in &online.ports {
-                let sink_offset = u16::from(port_map.sink.is_some());
-
                 for (i, core) in port_map
                     .cores
                     .iter()
@@ -230,7 +235,7 @@ fn main() {
                 {
                     split_queues.insert(
                         CoreId(core),
-                        sink_offset + (i as u16) * 2 + 1,
+                        (i as u16) * 2 + 1,
                     );
                 }
             }
@@ -268,15 +273,17 @@ fn main() {
                         return;
                     }
 
-                    // Respect NUM_FLOWS cap first
-                    if NUM_FLOWS == 0 {
+                    let num_flows = *NUM_FLOWS.get().unwrap();
+
+                    // Respect num_flows cap first
+                    if num_flows == 0 {
                         return;
                     }
 
                     // Deduplicate and cap
                     {
                         let mut targets = TARGET_FLOWS.lock().unwrap();
-                        if targets.contains_key(&tuple) || targets.len() >= NUM_FLOWS {
+                        if targets.contains_key(&tuple) || targets.len() >= num_flows {
                             return;
                         }
                         // Record when we installed the drop rule for this tuple
@@ -311,7 +318,8 @@ fn main() {
                                     tuple: tuple.clone(),
                                     ports: ports.clone(),
                                     flow_ptrs: raw_flows.into_iter().map(FlowPtr).collect(),
-                                    expires_at: Instant::now() + Duration::from_secs(TIMEOUT_SECS),
+                                    expires_at: Instant::now()
+                                        + Duration::from_secs(*TIMEOUT_SECS.get().unwrap()),
                                 };
                                 FLOW_QUEUE.lock().unwrap().push_back(entry);
                             }
