@@ -11,8 +11,10 @@ use crate::protocols::packet::udp::UDP_PROTOCOL;
 
 use crate::dpdk;
 use crate::dpdk::{rte_flow, rte_flow_item, rte_flow_attr, rte_flow_error, rte_flow_create,
-    rte_flow_destroy, rte_flow_query, rte_flow_query_count, rte_flow_action, rte_flow_item_ipv4, rte_flow_item_ipv6,
-    rte_flow_item_tcp, rte_flow_item_udp, rte_flow_action_queue, rte_flow_action_count};
+    rte_flow_destroy, rte_flow_query_count, rte_flow_action, rte_flow_item_ipv4, rte_flow_item_ipv6,
+    rte_flow_item_tcp, rte_flow_item_udp, rte_flow_action_queue, rte_flow_action_count,
+    rte_flow_action_handle, rte_flow_action_handle_create, rte_flow_action_handle_destroy,
+    rte_flow_action_handle_query, rte_flow_indir_action_conf};
 
 const BASE_GROUP: u32 = 2;
 const LAST_GROUP: u32 = 2;
@@ -176,20 +178,53 @@ fn build_pattern<'a>(
     Ok(pattern)
 }
 
-/// Installs a flow rule (forward + reverse) on each port with the given actions.
-fn install(
+/// Create an indirect (shared) COUNT action handle for a port.
+fn create_count_handle(port_id: u16) -> Result<*mut rte_flow_action_handle> {
+    let mut conf: rte_flow_indir_action_conf = unsafe { mem::zeroed() };
+    conf.set_ingress(1);
+
+    let count_conf = rte_flow_action_count { id: 0 };
+    let count_action = rte_flow_action {
+        type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_COUNT,
+        conf: &count_conf as *const _ as *const _,
+    };
+
+    let mut error: rte_flow_error = unsafe { mem::zeroed() };
+    let handle = unsafe {
+        rte_flow_action_handle_create(port_id, &conf, &count_action, &mut error)
+    };
+
+    if handle.is_null() {
+        let msg = unsafe {
+            CStr::from_ptr(error.message).to_string_lossy().into_owned()
+        };
+        bail!("rte_flow_action_handle_create failed on port {}: {}", port_id, msg);
+    }
+
+    Ok(handle)
+}
+
+/// Installs a flow rule (forward + reverse) on each port.
+fn install<F>(
     port_ids: &[PortId],
     tuple:    &FiveTuple,
     attr:     &rte_flow_attr,
-    actions:  &[rte_flow_action],
-) -> Result<Vec<*mut rte_flow>> {
+    make_actions: F,
+) -> Result<(Vec<*mut rte_flow>, Vec<*mut rte_flow_action_handle>)>
+where
+    F: Fn(*mut rte_flow_action_handle) -> Vec<rte_flow_action>,
+{
     let mut flows = Vec::with_capacity(port_ids.len() * 2);
+    let mut handles = Vec::with_capacity(port_ids.len() * 2);
 
     let mut storage = PatternStorage::zeroed();
     let pattern = build_pattern(tuple, &mut storage)?;
 
     // Create flow rule using pattern
     for port_id in port_ids.iter() {
+        let handle = create_count_handle(port_id.raw())?;
+        let actions = make_actions(handle);
+
         let mut error: rte_flow_error = unsafe { mem::zeroed() };
 
         let start = unsafe { dpdk::rte_rdtsc() };
@@ -213,6 +248,9 @@ fn install(
                     .to_string_lossy()
                     .into_owned()
             };
+            // Clean up the handle we just created since the rule failed.
+            let mut derr: rte_flow_error = unsafe { mem::zeroed() };
+            unsafe { rte_flow_action_handle_destroy(port_id.raw(), handle, &mut derr) };
             anyhow::bail!(
                 "Failed to install flow on port {}: {}",
                 port_id.raw(),
@@ -221,6 +259,7 @@ fn install(
         }
 
         flows.push(flow);
+        handles.push(handle);
     }
 
     // -------- REVERSE FLOW (resp -> orig) --------
@@ -234,6 +273,9 @@ fn install(
     let rev_pattern = build_pattern(&rev, &mut rev_storage)?;
 
     for port_id in port_ids.iter() {
+        let handle = create_count_handle(port_id.raw())?;
+        let actions = make_actions(handle);
+
         let mut error_rev: rte_flow_error = unsafe { mem::zeroed() };
         let start = unsafe { dpdk::rte_rdtsc() };
         let flow_rev = unsafe {
@@ -256,7 +298,8 @@ fn install(
                     .to_string_lossy()
                     .into_owned()
             };
-
+            let mut derr: rte_flow_error = unsafe { mem::zeroed() };
+            unsafe { rte_flow_action_handle_destroy(port_id.raw(), handle, &mut derr) };
             anyhow::bail!(
                 "Failed to install flow on port {}: {}",
                 port_id.raw(),
@@ -265,61 +308,74 @@ fn install(
         }
 
         flows.push(flow_rev);
+        handles.push(handle);
     }
 
-    Ok(flows)
+    Ok((flows, handles))
 }
 
 pub fn install_drop_flow(
     port_ids: Vec<PortId>,
     tuple:    &FiveTuple,
-) -> Result<Vec<*mut rte_flow>> {
-    let count_conf = rte_flow_action_count { id: 0 };
-    let actions = [
-        rte_flow_action {
-            type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_COUNT,
-            conf: &count_conf as *const _ as *const _,
-        },
-        rte_flow_action {
-            type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_DROP,
-            conf: ptr::null(),
-        },
-        rte_flow_action {
-            type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_END,
-            conf: ptr::null(),
-        },
-    ];
-
-    install(&port_ids, tuple, &ingress_attr(1, 0), &actions)
+) -> Result<(Vec<*mut rte_flow>, Vec<*mut rte_flow_action_handle>)> {
+    install(&port_ids, tuple, &ingress_attr(1, 0), |handle| {
+        vec![
+            rte_flow_action {
+                type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_INDIRECT,
+                conf: handle as *const _,
+            },
+            rte_flow_action {
+                type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_DROP,
+                conf: ptr::null(),
+            },
+            rte_flow_action {
+                type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_END,
+                conf: ptr::null(),
+            },
+        ]
+    })
 }
 
 pub fn install_split_flow(
     port_ids: Vec<PortId>,
     tuple:    &FiveTuple,
     queue_id: u16,
-) -> Result<Vec<*mut rte_flow>> {
-    let count_conf = rte_flow_action_count { id: 0 };
-    let conf = rte_flow_action_queue { index: queue_id };
-    let actions = [
-        rte_flow_action {
-            type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_COUNT,
-            conf: &count_conf as *const _ as *const _,
-        },
-        rte_flow_action {
-            type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_QUEUE,
-            conf:  &conf as *const _ as *const _,
-        },
-        rte_flow_action {
-            type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_END,
-            conf:  ptr::null(),
-        },
-    ];
+) -> Result<(Vec<*mut rte_flow>, Vec<*mut rte_flow_action_handle>)> {
+    // queue conf must outlive the actions array; box it so the pointer
+    // stays valid for each per-flow actions vec.
+    let queue_conf = Box::new(rte_flow_action_queue { index: queue_id });
+    let queue_ptr = &*queue_conf as *const rte_flow_action_queue;
 
-    install(&port_ids, tuple, &ingress_attr(1, 0), &actions)
+    let result = install(&port_ids, tuple, &ingress_attr(1, 0), |handle| {
+        vec![
+            rte_flow_action {
+                type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_INDIRECT,
+                conf: handle as *const _,
+            },
+            rte_flow_action {
+                type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_QUEUE,
+                conf:  queue_ptr as *const _,
+            },
+            rte_flow_action {
+                type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_END,
+                conf:  ptr::null(),
+            },
+        ]
+    });
+
+    // queue_conf is dropped here, after all rte_flow_create calls have
+    // copied the pattern/actions into the PMD.
+    drop(queue_conf);
+    result
 }
 
-/// Uninstall flow rules previously installed
-pub fn uninstall_flow(port_ids: Vec<PortId>, flows: Vec<*mut rte_flow>) -> Result<()> {
+/// Uninstall flow rules previously installed, querying their indirect
+/// counters first. `flows` and `handles` are parallel vectors of equal length.
+pub fn uninstall_flow(
+    port_ids: Vec<PortId>,
+    flows: Vec<*mut rte_flow>,
+    handles: Vec<*mut rte_flow_action_handle>,
+) -> Result<()> {
     if (port_ids.len() * 2) != flows.len() { // Must double length of port_ids to account for forward/rev flows
         bail!(
             "Mismatched lengths: {} ports but {} flows",
@@ -327,22 +383,36 @@ pub fn uninstall_flow(port_ids: Vec<PortId>, flows: Vec<*mut rte_flow>) -> Resul
             flows.len()
         );
     }
+    if flows.len() != handles.len() {
+        bail!(
+            "Mismatched lengths: {} flows but {} handles",
+            flows.len(),
+            handles.len()
+        );
+    }
 
-    for (port_id, flow) in port_ids.iter().zip(flows.iter()) {
+    // forward flows occupy [0..ports.len()), reverse flows [ports.len()..2*ports.len())
+    let n = port_ids.len();
+    for (idx, flow) in flows.iter().enumerate() {
+        let port_id = &port_ids[idx % n];
+        let handle = handles[idx];
+
         if flow.is_null() {
             println!("No flow to uninstall on port {}", port_id.raw());
             continue;
         }
 
-        match query_flow_stats(port_id.raw(), *flow) {
-            Ok((hits, bytes)) => println!(
-                "Port {} flow stats — packets: {}, bytes: {}",
-                port_id.raw(), hits, bytes
-            ),
-            Err(e) => println!(
-                "Port {} flow stats unavailable: {}",
-                port_id.raw(), e
-            ),
+        if !handle.is_null() {
+            match query_flow_stats(port_id.raw(), handle) {
+                Ok((hits, bytes)) => println!(
+                    "Port {} flow stats — packets: {}, bytes: {}",
+                    port_id.raw(), hits, bytes
+                ),
+                Err(e) => println!(
+                    "Port {} flow stats unavailable: {}",
+                    port_id.raw(), e
+                ),
+            }
         }
 
         let mut error: rte_flow_error = unsafe { mem::zeroed() };
@@ -363,28 +433,41 @@ pub fn uninstall_flow(port_ids: Vec<PortId>, flows: Vec<*mut rte_flow>) -> Resul
                 msg
             );
         }
+
+        // Destroy the indirect counter handle after the rule referencing it
+        // is gone.
+        if !handle.is_null() {
+            let mut derr: rte_flow_error = unsafe { mem::zeroed() };
+            let dret = unsafe {
+                rte_flow_action_handle_destroy(port_id.raw(), handle, &mut derr)
+            };
+            if dret != 0 {
+                let msg = unsafe {
+                    CStr::from_ptr(derr.message).to_string_lossy().into_owned()
+                };
+                eprintln!(
+                    "Failed to destroy count handle on port {}: {}",
+                    port_id.raw(), msg
+                );
+            }
+        }
     }
 
     Ok(())
 }
 
-fn query_flow_stats(port_id: u16, flow: *mut rte_flow) -> Result<(u64, u64)> {
-    let count_conf = rte_flow_action_count { id: 0 };
-    let count_action = rte_flow_action {
-        type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_COUNT,
-        conf: &count_conf as *const _ as *const _,
-    };
-
+fn query_flow_stats(
+    port_id: u16,
+    handle: *mut rte_flow_action_handle,
+) -> Result<(u64, u64)> {
     let mut count_data: rte_flow_query_count = unsafe { mem::zeroed() };
-    count_data.set_reset(1);
 
     let mut error: rte_flow_error = unsafe { mem::zeroed() };
 
     let ret = unsafe {
-        rte_flow_query(
+        rte_flow_action_handle_query(
             port_id,
-            flow,
-            &count_action,
+            handle,
             &mut count_data as *mut _ as *mut _,
             &mut error,
         )
@@ -394,7 +477,7 @@ fn query_flow_stats(port_id: u16, flow: *mut rte_flow) -> Result<(u64, u64)> {
         let msg = unsafe {
             CStr::from_ptr(error.message).to_string_lossy().into_owned()
         };
-        bail!("rte_flow_query failed on port {}: {}", port_id, msg);
+        bail!("rte_flow_action_handle_query failed on port {}: {}", port_id, msg);
     }
 
     let hits  = if count_data.hits_set()  != 0 { count_data.hits  } else { 0 };

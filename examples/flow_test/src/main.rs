@@ -13,7 +13,7 @@ use iris_core::{
     Runtime,
 };
 
-use iris_core::dpdk::rte_flow;
+use iris_core::dpdk::{rte_flow, rte_flow_action_handle};
 use iris_compiler::{callback, input_files, iris_end_macros};
 
 use std::{
@@ -34,11 +34,17 @@ struct FlowPtr(*mut rte_flow);
 unsafe impl Send for FlowPtr {}
 unsafe impl Sync for FlowPtr {}
 
+#[derive(Clone, Copy)]
+struct HandlePtr(*mut rte_flow_action_handle);
+unsafe impl Send for HandlePtr {}
+unsafe impl Sync for HandlePtr {}
+
 #[derive(Clone)]
 struct FlowEntry {
     tuple: FiveTuple,
     ports: Vec<PortId>,
     flow_ptrs: Vec<FlowPtr>,
+    handle_ptrs: Vec<HandlePtr>,
     expires_at: Instant,
 }
 
@@ -136,7 +142,9 @@ fn expire_flows_now() {
         // pop first (to drop the borrow) then uninstall
         let expired = queue.pop_front().unwrap();
         let raw_ptrs: Vec<*mut rte_flow> = expired.flow_ptrs.iter().map(|fp| fp.0).collect();
-        if let Err(e) = uninstall_flow(expired.ports.clone(), raw_ptrs) {
+        let raw_handles: Vec<*mut rte_flow_action_handle> =
+            expired.handle_ptrs.iter().map(|hp| hp.0).collect();
+        if let Err(e) = uninstall_flow(expired.ports.clone(), raw_ptrs, raw_handles) {
             eprintln!("Failed to uninstall flow: {:?}", e);
         }
         // Optionally also remove from TARGET_FLOWS when it expires:
@@ -313,11 +321,12 @@ fn main() {
                         };
 
                         match result {
-                            Ok(raw_flows) => {
+                            Ok((raw_flows, raw_handles)) => {
                                 let entry = FlowEntry {
                                     tuple: tuple.clone(),
                                     ports: ports.clone(),
                                     flow_ptrs: raw_flows.into_iter().map(FlowPtr).collect(),
+                                    handle_ptrs: raw_handles.into_iter().map(HandlePtr).collect(),
                                     expires_at: Instant::now()
                                         + Duration::from_secs(*TIMEOUT_SECS.get().unwrap()),
                                 };
