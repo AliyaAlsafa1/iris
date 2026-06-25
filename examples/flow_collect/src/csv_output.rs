@@ -1,7 +1,6 @@
 use flow_features::conn_features::ConnFeatures;
-use flow_features::dns_features::DnsFeatures;
 use flow_features::tls_features::TlsFeatures;
-use crate::headers::{CONN_ONLY_HEADER, TLS_CONN_HEADER, DNS_CONN_HEADER};
+use crate::headers::{TLS_CONN_HEADER};
 use array_init::array_init;
 use csv::Writer;
 use serde::Serialize;
@@ -77,6 +76,7 @@ impl CSVWriters {
         unsafe { &mut *ptr }
     }
 
+    #[allow(dead_code)]
     fn write_row<T: Serialize>(&self, row: &T, core: &CoreId) {
         self.writer_for(core).serialize(row).unwrap();
     }
@@ -109,25 +109,25 @@ impl CSVWriters {
     }
 }
 
-static REGULAR: CSVWriters = CSVWriters::new("flow_features_",     CONN_ONLY_HEADER);
+// static REGULAR: CSVWriters = CSVWriters::new("flow_features_",     CONN_ONLY_HEADER);
 static TLS:     CSVWriters = CSVWriters::new("flow_features_tls_", TLS_CONN_HEADER);
-static DNS:     CSVWriters = CSVWriters::new("flow_features_dns_", DNS_CONN_HEADER);
+// static DNS:     CSVWriters = CSVWriters::new("flow_features_dns_", DNS_CONN_HEADER);
 
 /// Public API
-pub fn write(features: &ConnFeatures, core: &CoreId) {
-    REGULAR.write_row(features, core);
-}
+// pub fn write(features: &ConnFeatures, core: &CoreId) {
+//     REGULAR.write_row(features, core);
+// }
 
 pub fn write_tls(conn: &ConnFeatures, tls: &TlsFeatures, core: &CoreId) {
     TLS.write_pair(conn, tls, core);
 }
 
-pub fn write_dns(conn: &ConnFeatures, dns: &DnsFeatures, core: &CoreId) {
-    DNS.write_pair(conn, dns, core);
-}
+// pub fn write_dns(conn: &ConnFeatures, dns: &DnsFeatures, core: &CoreId) {
+//     DNS.write_pair(conn, dns, core);
+// }
 
 pub fn combine() {
-    REGULAR.flush_and_combine("flow_features.csv");
+    // REGULAR.flush_and_combine("flow_features.csv");
     TLS.flush_and_combine("flow_features_tls.csv");
-    DNS.flush_and_combine("flow_features_dns.csv");
+    // DNS.flush_and_combine("flow_features_dns.csv");
 }

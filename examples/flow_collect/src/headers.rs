@@ -1,7 +1,7 @@
 use const_format::concatcp;
 
 pub const CONN_HEADER: &str =
-    "first_seen_ts,src_ip_hash,dst_ip_hash,\
+    "first_seen_ts,\
      src_ip_subn,dst_ip_subn,src_port,dst_port,protocol,\
      duration_ms,max_inactivity_ms,time_to_second_pkt_ms,\
      hist_syn,hist_synack,hist_ack,hist_data,hist_fin,hist_rst,\
@@ -18,15 +18,15 @@ pub const CONN_HEADER: &str =
      resp_iat_mean,resp_iat_median,resp_iat_min,resp_iat_max,resp_iat_std,\
      final_total_payload_bytes,final_duration_ms,final_total_pkts";
 
-pub const DNS_HEADER: &str =
-    "client_ip_hash,resolved_ip_hash_a,resolved_ip_hash_aaaa,\
-     query_num_questions,query_recursion_desired,has_query,\
-     has_response,response_code,response_authoritative,response_recursion_available,\
-     response_num_answers,response_num_nameservers,response_num_additional,\
-     answer_num_a,answer_num_aaaa,answer_num_cname,answer_num_mx,answer_num_ns,\
-     answer_num_ptr,answer_num_soa,answer_num_srv,answer_num_txt,answer_num_unknown,\
-     ns_num_ns,ns_num_soa,ns_num_other,\
-     additional_num_a,additional_num_aaaa,additional_num_other";
+// pub const DNS_HEADER: &str =
+//     "client_ip_hash,resolved_ip_hash_a,resolved_ip_hash_aaaa,\
+//      query_num_questions,query_recursion_desired,has_query,\
+//      has_response,response_code,response_authoritative,response_recursion_available,\
+//      response_num_answers,response_num_nameservers,response_num_additional,\
+//      answer_num_a,answer_num_aaaa,answer_num_cname,answer_num_mx,answer_num_ns,\
+//      answer_num_ptr,answer_num_soa,answer_num_srv,answer_num_txt,answer_num_unknown,\
+//      ns_num_ns,ns_num_soa,ns_num_other,\
+//      additional_num_a,additional_num_aaaa,additional_num_other";
 
 pub const TLS_HEADER: &str =
     "has_client_hello,client_version,\
@@ -40,6 +40,6 @@ pub const TLS_HEADER: &str =
      num_server_certs,num_client_certs,server_cert0_len,server_cert1_len,\
      has_server_kex,has_client_kex,kex_type";
 
-pub const DNS_CONN_HEADER: &str = concatcp!(CONN_HEADER, ",", DNS_HEADER, "\n");
+// pub const DNS_CONN_HEADER: &str = concatcp!(CONN_HEADER, ",", DNS_HEADER, "\n");
 pub const TLS_CONN_HEADER: &str = concatcp!(CONN_HEADER, ",", TLS_HEADER, "\n");
 pub const CONN_ONLY_HEADER: &str = concatcp!(CONN_HEADER, "\n");
