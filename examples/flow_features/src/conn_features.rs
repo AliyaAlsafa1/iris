@@ -5,23 +5,23 @@ use serde::Serialize;
 use std::time::SystemTime;
 use crate::hash_utils::hash_ip;
 
-fn ip_to_prefix(ip: &std::net::IpAddr) -> u128 {
+fn ip_to_prefix(ip: &std::net::IpAddr) -> u64 {
     match ip {
         std::net::IpAddr::V4(ipv4) => {
             let octets = ipv4.octets();
             let prefix = u32::from_be_bytes([octets[0], octets[1], octets[2], 0]);
-            prefix as u128
+            prefix as u64
         }
         std::net::IpAddr::V6(ipv6) => {
             let octets = ipv6.octets();
-            let mut prefix_bytes = [0u8; 16];
-            prefix_bytes[..6].copy_from_slice(&octets[..6]);
-            u128::from_be_bytes(prefix_bytes)
+            let mut prefix_bytes = [0u8; 8];
+            prefix_bytes[2..8].copy_from_slice(&octets[..6]);
+            u64::from_be_bytes(prefix_bytes)
         }
     }
 }
 
-fn iat_stats(iats_us: &[u128]) -> (f64, f64, u128, u128, f64) {
+fn iat_stats(iats_us: &[u128]) -> (f64, f64, u64, u64, f64) {
     let n = iats_us.len();
     if n == 0 {
         return (0.0, 0.0, 0, 0, 0.0);
@@ -47,7 +47,7 @@ fn iat_stats(iats_us: &[u128]) -> (f64, f64, u128, u128, f64) {
         (sorted[n / 2 - 1] + sorted[n / 2]) as f64 / 2.0
     };
 
-    (mean, median, min, max, std_dev)
+    (mean, median, min as u64, max as u64, std_dev)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -55,15 +55,15 @@ pub struct ConnFeatures {
     pub first_seen_ts: u64,              // Timestamp
     pub src_ip_hash: u64,                // hash of source IP address
     pub dst_ip_hash: u64,                // hash of destination IP address
-    pub src_ip_subn: u128,               // source IP address, masked to /24 (IPv4) or /48 (IPv6)
-    pub dst_ip_subn: u128,               // destination IP address, masked to /24 (IPv4) or /48 (IPv6)
+    pub src_ip_subn: u64,                // source IP address, masked to /24 (IPv4) or /48 (IPv6)
+    pub dst_ip_subn: u64,                // destination IP address, masked to /24 (IPv4) or /48 (IPv6)
     pub src_port: u16,                   // source port
     pub dst_port: u16,                   // destination port
     pub protocol: usize,                 // IP protocol number (6=TCP, 17=UDP)
 
-    pub duration_ms: u128,               // elapsed time between first and Nth packet (ms)
-    pub max_inactivity_ms: u128,         // maximum time between any two consecutive packets up to Nth (ms)
-    pub time_to_second_pkt_ms: u128,     // elapsed time between first and second packet (ms)
+    pub duration_ms: u64,                // elapsed time between first and Nth packet (ms)
+    pub max_inactivity_ms: u64,          // maximum time between any two consecutive packets up to Nth (ms)
+    pub time_to_second_pkt_ms: u64,      // elapsed time between first and second packet (ms)
 
     pub hist_syn:      u8,               // originator sent a pure SYN
     pub hist_synack:   u8,               // originator sent a pure SYNACK
@@ -102,18 +102,19 @@ pub struct ConnFeatures {
 
     pub orig_iat_mean:    f64,           // originator mean inter-arrival time in first N packets (us)
     pub orig_iat_median:  f64,           // originator median inter-arrival time in first N packets (us)
-    pub orig_iat_min:     u128,          // originator minimum inter-arrival time in first N packets (us)
-    pub orig_iat_max:     u128,          // originator maximum inter-arrival time in first N packets (us)
+    pub orig_iat_min:     u64,           // originator minimum inter-arrival time in first N packets (us)
+    pub orig_iat_max:     u64,           // originator maximum inter-arrival time in first N packets (us)
     pub orig_iat_std:     f64,           // originator inter-arrival time std deviation in first N packets (us)
 
     pub resp_iat_mean:    f64,           // responder mean inter-arrival time in first N packets (us)
     pub resp_iat_median:  f64,           // responder median inter-arrival time in first N packets (us)
-    pub resp_iat_min:     u128,          // responder minimum inter-arrival time in first N packets (us)
-    pub resp_iat_max:     u128,          // responder maximum inter-arrival time in first N packets (us)
+    pub resp_iat_min:     u64,           // responder minimum inter-arrival time in first N packets (us)
+    pub resp_iat_max:     u64,           // responder maximum inter-arrival time in first N packets (us)
     pub resp_iat_std:     f64,           // responder inter-arrival time std deviation in first N packets (us)
 
     pub final_total_payload_bytes: u64,  // total payload bytes across full connection (both directions)
-    pub final_duration_ms: u128,         // elapsed time between first and last packet of full connection (ms)
+    pub final_duration_ms: u64,          // elapsed time between first and last packet of full connection (ms)
+    pub final_total_pkts: u64,           // total packets across full connection (both directions)
 }
 
 impl ConnFeatures {
@@ -147,9 +148,9 @@ impl ConnFeatures {
             dst_port: conn.five_tuple.resp.port(),
             protocol: conn.five_tuple.proto,
 
-            duration_ms:           conn.prefix_duration?.as_millis(),
-            max_inactivity_ms:     conn.prefix_max_inactivity?.as_millis(),
-            time_to_second_pkt_ms: conn.prefix_time_to_second_pkt?.as_millis(),
+            duration_ms:           conn.prefix_duration?.as_millis() as u64,
+            max_inactivity_ms:     conn.prefix_max_inactivity?.as_millis() as u64,
+            time_to_second_pkt_ms: conn.prefix_time_to_second_pkt?.as_millis() as u64,
 
             hist_syn:      history.contains(&HIST_SYN)             as u8,
             hist_synack:   history.contains(&HIST_SYNACK)          as u8,
@@ -199,7 +200,8 @@ impl ConnFeatures {
             resp_iat_std,
 
             final_total_payload_bytes: conn.orig.nb_payload_bytes + conn.resp.nb_payload_bytes,
-            final_duration_ms: conn.duration().as_millis(),
+            final_duration_ms: conn.duration().as_millis() as u64,
+            final_total_pkts: conn.total_pkts(),
         })
     }
 }

@@ -2,6 +2,7 @@ use lightgbm3::Booster;
 use std::sync::OnceLock;
 
 use flow_features::conn_features::ConnFeatures;
+use flow_features::tls_features::TlsFeatures;
 
 pub struct SendSyncBooster(Booster);
 unsafe impl Send for SendSyncBooster {}
@@ -14,10 +15,11 @@ pub fn load_model(path: &str) {
     BOOSTER.set(SendSyncBooster(booster)).ok();
 }
 
-pub fn predict(f: &ConnFeatures) -> Option<f64> {
+pub fn predict(f: &ConnFeatures, t: &TlsFeatures) -> Option<f64> {
     let booster = &BOOSTER.get()?.0;
 
     let features: Vec<f64> = vec![
+        // --- ConnFeatures ---
         f.src_ip_subn                 as f64,
         f.dst_ip_subn                 as f64,
         f.src_port                    as f64,
@@ -67,7 +69,41 @@ pub fn predict(f: &ConnFeatures) -> Option<f64> {
         f.resp_iat_median,
         f.resp_iat_min                as f64,
         f.resp_iat_max                as f64,
-        f.resp_iat_std
+        f.resp_iat_std,
+        f.final_total_payload_bytes   as f64,
+        f.final_duration_ms           as f64,
+
+        // --- TlsFeatures ---
+        t.has_client_hello            as f64,
+        t.client_version              as f64,
+        t.client_num_supported_groups as f64,
+        t.client_num_sig_algs         as f64,
+        t.client_num_alpn_protocols   as f64,
+        t.client_num_key_shares       as f64,
+        t.client_num_supported_vers   as f64,
+        t.client_has_sni              as f64,
+        t.client_sni_hash             as f64,
+        t.client_sni_len              as f64,
+        t.client_has_session_id       as f64,
+        t.client_session_id_len       as f64,
+        t.client_has_compression      as f64,
+        t.client_has_alpn             as f64,
+        t.client_has_key_share        as f64,
+        t.client_has_supported_vers   as f64,
+        t.has_server_hello            as f64,
+        t.server_version              as f64,
+        t.server_cipher_suite         as f64,
+        t.server_compression_alg      as f64,
+        t.server_has_alpn             as f64,
+        t.server_has_key_share        as f64,
+        t.server_has_selected_vers    as f64,
+        t.num_server_certs            as f64,
+        t.num_client_certs            as f64,
+        t.server_cert0_len            as f64,
+        t.server_cert1_len            as f64,
+        t.has_server_kex              as f64,
+        t.has_client_kex              as f64,
+        t.kex_type                    as f64,
     ];
 
     let n_features = features.len() as i32;

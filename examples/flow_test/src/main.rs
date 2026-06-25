@@ -1,5 +1,6 @@
 use clap::{ArgAction, Parser, ValueEnum};
-use iris_datatypes::PktCount;
+use iris_datatypes::{PktCount, TlsHandshake, ConnRecord};
+use iris_datatypes::conn_fts::InterArrivals;
 use lazy_static::lazy_static;
 use serde::Serialize;
 
@@ -26,6 +27,7 @@ use std::{
 mod model;
 
 use flow_features::conn_features::ConnFeatures;
+use flow_features::tls_features::TlsFeatures;
 
 #[derive(Clone, Copy)]
 struct FlowPtr(*mut rte_flow);
@@ -152,29 +154,32 @@ fn expire_flows_now() {
 
 // ===== Filters =====
 
-// Try for all TCP
-#[callback("tcp,level=InL4Conn")]
-fn tls_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount, conn: &ConnRecord, iat: &InterArrivals) -> bool {
+// Fire on TLS connections
+#[callback("tls,level=InL4Conn")]
+fn tls_cb(
+    five_tuple: &FiveTuple,
+    rx_core: &CoreId,
+    pkts: &PktCount,
+    conn: &ConnRecord,
+    iat: &InterArrivals,
+    tls: &TlsHandshake,
+) -> bool {
     if pkts.total() != 20 {
         return true;
     }
- 
-    let is_elephant = ConnFeatures::from_conn(conn, iat)
-        .and_then(|features| {
-            let proba = model::predict(&features)?;
-            // println!(
-            //     "[FLOW] src_subn={} dst_subn={} src_port={} dst_port={} proto={} p={:.4}",
-            //     features.src_ip_subn,
-            //     features.dst_ip_subn,
-            //     features.src_port,
-            //     features.dst_port,
-            //     features.protocol,
-            //     proba,
-            // );
-            Some(proba >= 0.5)
-        })
-        .unwrap_or(false);
- 
+
+    let is_elephant = match (
+        ConnFeatures::from_conn(conn, iat),
+        TlsFeatures::from_tls(tls),
+    ) {
+        (Some(conn_features), Some(tls_features)) => {
+            model::predict(&conn_features, &tls_features)
+                .map(|proba| proba >= 0.5)
+                .unwrap_or(false)
+        }
+        _ => false,
+    };
+
     if is_elephant {
         let tuple = five_tuple.clone();
         if let Some(dispatcher) = FLOW_DISPATCHER.get() {
@@ -187,7 +192,7 @@ fn tls_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount, conn: &Conn
             );
         }
     }
- 
+
     true
 }
 

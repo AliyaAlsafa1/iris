@@ -52,7 +52,7 @@ fn flow_cb_dns(
 }
 
 #[input_files("$IRIS_HOME/datatypes/data.txt")]
-#[iris_main]
+#[iris_end_macros]
 fn main() {
     let config = load_config("./configs/online.toml");
     let mut runtime: Runtime<SubscribedWrapper> = Runtime::new(config, filter).unwrap();

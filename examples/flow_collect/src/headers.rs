@@ -16,7 +16,7 @@ pub const CONN_HEADER: &str =
      resp_mean_pkts_to_fill,resp_median_pkts_to_fill,\
      orig_iat_mean,orig_iat_median,orig_iat_min,orig_iat_max,orig_iat_std,\
      resp_iat_mean,resp_iat_median,resp_iat_min,resp_iat_max,resp_iat_std,\
-     final_total_payload_bytes,final_duration_ms";
+     final_total_payload_bytes,final_duration_ms,final_total_pkts";
 
 pub const DNS_HEADER: &str =
     "client_ip_hash,resolved_ip_hash_a,resolved_ip_hash_aaaa,\
@@ -32,7 +32,7 @@ pub const TLS_HEADER: &str =
     "has_client_hello,client_version,\
      client_num_supported_groups,client_num_sig_algs,client_num_alpn_protocols,\
      client_num_key_shares,client_num_supported_vers,\
-     client_has_sni,client_sni,client_sni_len,client_has_session_id,client_session_id_len,\
+     client_has_sni,client_sni_hash,client_sni_len,client_has_session_id,client_session_id_len,\
      client_has_compression,client_has_alpn,client_has_key_share,client_has_supported_vers,\
      has_server_hello,server_version,server_cipher_suite,\
      server_compression_alg,\

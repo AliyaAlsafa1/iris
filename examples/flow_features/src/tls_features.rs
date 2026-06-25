@@ -1,5 +1,6 @@
 use iris_datatypes::TlsHandshake;
 use serde::Serialize;
+use crate::hash_utils::hash_str;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TlsFeatures {
@@ -12,7 +13,7 @@ pub struct TlsFeatures {
     pub client_num_key_shares:        u16,  // number of key share entries (TLS 1.3)
     pub client_num_supported_vers:    u16,  // number of supported_versions entries (TLS 1.3)
     pub client_has_sni:               u8,   // 1 if SNI extension is present
-    pub client_sni:                   String, // SNI hostname, empty string if absent
+    pub client_sni_hash:              u64,  // bucketed hash of SNI hostname, 0 if absent
     pub client_sni_len:               u16,  // byte length of the SNI hostname, 0 if absent
     pub client_has_session_id:        u8,   // 1 if session_id is non-empty (session resumption hint)
     pub client_session_id_len:        u8,   // length of session_id in bytes (0–32)
@@ -58,7 +59,7 @@ impl TlsFeatures {
             client_num_key_shares,
             client_num_supported_vers,
             client_has_sni,
-            client_sni,
+            client_sni_hash,
             client_sni_len,
             client_has_session_id,
             client_session_id_len,
@@ -69,6 +70,7 @@ impl TlsFeatures {
         ) = if let Some(ch) = &tls.client_hello {
             let sni = ch.server_name.clone().unwrap_or_default();
             let sni_len = sni.len() as u16;
+            let sni_hash = if sni.is_empty() { 0 } else { hash_str(&sni) };
             (
                 1u8,
                 ch.version.0,
@@ -78,7 +80,7 @@ impl TlsFeatures {
                 ch.key_shares.len() as u16,
                 ch.supported_versions.len() as u16,
                 ch.server_name.is_some() as u8,
-                sni,
+                sni_hash,
                 sni_len,
                 (!ch.session_id.is_empty()) as u8,
                 ch.session_id.len() as u8,
@@ -88,7 +90,7 @@ impl TlsFeatures {
                 (!ch.supported_versions.is_empty()) as u8,
             )
         } else {
-            (0, 0, 0, 0, 0, 0, 0, 0, String::new(), 0, 0, 0, 0, 0, 0, 0)
+            (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
         };
 
         // --- ServerHello fields ---
@@ -145,7 +147,7 @@ impl TlsFeatures {
             client_num_key_shares,
             client_num_supported_vers,
             client_has_sni,
-            client_sni,
+            client_sni_hash,
             client_sni_len,
             client_has_session_id,
             client_session_id_len,
