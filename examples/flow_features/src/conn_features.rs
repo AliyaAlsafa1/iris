@@ -4,18 +4,16 @@ use iris_datatypes::conn_fts::InterArrivals;
 use serde::Serialize;
 use std::time::SystemTime;
 
-fn ip_to_prefix(ip: &std::net::IpAddr) -> u64 {
+fn ip_to_octets(ip: &std::net::IpAddr) -> [u8; 6] {
     match ip {
         std::net::IpAddr::V4(ipv4) => {
-            let octets = ipv4.octets();
-            let prefix = u32::from_be_bytes([octets[0], octets[1], octets[2], 0]);
-            prefix as u64
+            let o = ipv4.octets();
+            // pad high slots with 0, keep the 3 retained /24 octets in the low slots
+            [0, 0, 0, o[0], o[1], o[2]]
         }
         std::net::IpAddr::V6(ipv6) => {
-            let octets = ipv6.octets();
-            let mut prefix_bytes = [0u8; 8];
-            prefix_bytes[2..8].copy_from_slice(&octets[..6]);
-            u64::from_be_bytes(prefix_bytes)
+            let o = ipv6.octets();
+            [o[0], o[1], o[2], o[3], o[4], o[5]]
         }
     }
 }
@@ -52,8 +50,23 @@ fn iat_stats(iats_us: &[u128]) -> (f64, f64, u64, u64, f64) {
 #[derive(Clone, Debug, Serialize)]
 pub struct ConnFeatures {
     pub first_seen_ts: u64,              // Timestamp
-    pub src_ip_subn: u64,                // source IP address, masked to /24 (IPv4) or /48 (IPv6)
-    pub dst_ip_subn: u64,                // destination IP address, masked to /24 (IPv4) or /48 (IPv6)
+
+    // Masked source IP, /24 (IPv4) or /48 (IPv6), split into per-octet features.
+    pub src_ip_oct0: u8,
+    pub src_ip_oct1: u8,
+    pub src_ip_oct2: u8,
+    pub src_ip_oct3: u8,
+    pub src_ip_oct4: u8,
+    pub src_ip_oct5: u8,
+
+    // Masked destination IP, split into per-octet features.
+    pub dst_ip_oct0: u8,
+    pub dst_ip_oct1: u8,
+    pub dst_ip_oct2: u8,
+    pub dst_ip_oct3: u8,
+    pub dst_ip_oct4: u8,
+    pub dst_ip_oct5: u8,
+
     pub src_port: u16,                   // source port
     pub dst_port: u16,                   // destination port
     pub protocol: usize,                 // IP protocol number (6=TCP, 17=UDP)
@@ -132,13 +145,29 @@ impl ConnFeatures {
         let (orig_iat_mean, orig_iat_median, orig_iat_min, orig_iat_max, orig_iat_std) = iat_stats(&orig_iats_us);
         let (resp_iat_mean, resp_iat_median, resp_iat_min, resp_iat_max, resp_iat_std) = iat_stats(&resp_iats_us);
 
+        let src_oct = ip_to_octets(&conn.five_tuple.orig.ip());
+        let dst_oct = ip_to_octets(&conn.five_tuple.resp.ip());
+
         Some(Self {
             first_seen_ts: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_micros() as u64,
-            src_ip_subn: ip_to_prefix(&conn.five_tuple.orig.ip()),
-            dst_ip_subn: ip_to_prefix(&conn.five_tuple.resp.ip()),
+
+            src_ip_oct0: src_oct[0],
+            src_ip_oct1: src_oct[1],
+            src_ip_oct2: src_oct[2],
+            src_ip_oct3: src_oct[3],
+            src_ip_oct4: src_oct[4],
+            src_ip_oct5: src_oct[5],
+
+            dst_ip_oct0: dst_oct[0],
+            dst_ip_oct1: dst_oct[1],
+            dst_ip_oct2: dst_oct[2],
+            dst_ip_oct3: dst_oct[3],
+            dst_ip_oct4: dst_oct[4],
+            dst_ip_oct5: dst_oct[5],
+
             src_port: conn.five_tuple.orig.port(),
             dst_port: conn.five_tuple.resp.port(),
             protocol: conn.five_tuple.proto,

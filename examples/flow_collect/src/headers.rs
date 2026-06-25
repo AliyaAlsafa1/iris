@@ -2,7 +2,9 @@ use const_format::concatcp;
 
 pub const CONN_HEADER: &str =
     "first_seen_ts,\
-     src_ip_subn,dst_ip_subn,src_port,dst_port,protocol,\
+     src_ip_oct0,src_ip_oct1,src_ip_oct2,src_ip_oct3,src_ip_oct4,src_ip_oct5,\
+     dst_ip_oct0,dst_ip_oct1,dst_ip_oct2,dst_ip_oct3,dst_ip_oct4,dst_ip_oct5,\
+     src_port,dst_port,protocol,\
      duration_ms,max_inactivity_ms,time_to_second_pkt_ms,\
      hist_syn,hist_synack,hist_ack,hist_data,hist_fin,hist_rst,\
      hist_syn_r,hist_synack_r,hist_ack_r,hist_data_r,hist_fin_r,hist_rst_r,\

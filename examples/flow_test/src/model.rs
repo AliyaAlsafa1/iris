@@ -20,8 +20,18 @@ pub fn predict(f: &ConnFeatures, t: &TlsFeatures) -> Option<f64> {
 
     let features: Vec<f64> = vec![
         // --- ConnFeatures ---
-        f.src_ip_subn                 as f64,
-        f.dst_ip_subn                 as f64,
+        f.src_ip_oct0                 as f64,
+        f.src_ip_oct1                 as f64,
+        f.src_ip_oct2                 as f64,
+        f.src_ip_oct3                 as f64,
+        f.src_ip_oct4                 as f64,
+        f.src_ip_oct5                 as f64,
+        f.dst_ip_oct0                 as f64,
+        f.dst_ip_oct1                 as f64,
+        f.dst_ip_oct2                 as f64,
+        f.dst_ip_oct3                 as f64,
+        f.dst_ip_oct4                 as f64,
+        f.dst_ip_oct5                 as f64,
         f.src_port                    as f64,
         f.dst_port                    as f64,
         f.protocol                    as f64,
