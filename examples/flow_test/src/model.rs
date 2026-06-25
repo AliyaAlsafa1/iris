@@ -1,7 +1,7 @@
 use lightgbm3::Booster;
 use std::sync::OnceLock;
 
-use crate::conn_features::ConnFeatures;
+use flow_features::conn_features::ConnFeatures;
 
 pub struct SendSyncBooster(Booster);
 unsafe impl Send for SendSyncBooster {}

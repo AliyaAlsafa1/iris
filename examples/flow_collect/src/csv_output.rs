@@ -1,6 +1,6 @@
-use crate::conn_features::ConnFeatures;
-use crate::dns_features::DnsFeatures;
-use crate::tls_features::TlsFeatures;
+use flow_features::conn_features::ConnFeatures;
+use flow_features::dns_features::DnsFeatures;
+use flow_features::tls_features::TlsFeatures;
 use crate::headers::{CONN_ONLY_HEADER, TLS_CONN_HEADER, DNS_CONN_HEADER};
 use array_init::array_init;
 use csv::Writer;

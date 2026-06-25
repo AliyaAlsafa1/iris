@@ -23,11 +23,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod hash_utils;
-mod conn_features;
 mod model;
 
-use conn_features::ConnFeatures;
+use flow_features::conn_features::ConnFeatures;
 
 #[derive(Clone, Copy)]
 struct FlowPtr(*mut rte_flow);
