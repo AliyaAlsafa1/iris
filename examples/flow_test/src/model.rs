@@ -80,8 +80,6 @@ pub fn predict(f: &ConnFeatures, t: &TlsFeatures) -> Option<f64> {
         f.resp_iat_min                as f64,
         f.resp_iat_max                as f64,
         f.resp_iat_std,
-        f.final_total_payload_bytes   as f64,
-        f.final_duration_ms           as f64,
 
         // --- TlsFeatures ---
         t.has_client_hello            as f64,
