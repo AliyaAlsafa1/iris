@@ -1,0 +1,46 @@
+main_core = 0
+nb_memory_channels = 6
+
+[mempool]
+capacity = 125_000
+cache_size = 512
+
+[online]
+duration = 120
+nb_rxd = 8192
+promiscuous = true
+mtu = 1500
+hardware_assist = true
+dyn_hardware_assist = true
+# flow_mode = "drop"
+[[online.ports]]
+# txq_mem_algn=0 disables mlx5's default consecutive-TxQ umem alloc (DPDK 25.11),
+# which fails ("Failed to allocate consecutive memory for TxQs") on a port
+# configured with 0 TX queues, as this RX-only drop app does.
+device = "0000:51:00.0,txq_mem_algn=0"
+cores = [ 1]
+
+
+
+[conntrack]
+max_connections = 1000000
+max_out_of_order = 500
+timeout_resolution = 100
+udp_inactivity_timeout = 60000
+tcp_inactivity_timeout = 300000
+tcp_establish_timeout = 5000
+
+# Software flow-table sizing (used by --drop-mode software, IRIS_SW_FLOW=1).
+# Preallocated to 2 rules/connection, so capacity should exceed the live
+# connection count; ways is the set-associativity of the table.
+[flow_table]
+capacity = 1048576
+ways = 8
+
+[online.prometheus]
+port = 9898
+
+[online.monitor.display]
+throughput = true
+mempool_usage = true
+port_stats = [ "rx_good_packets", "rx_good_bytes", "rx_phy_packets", "rx_phy_bytes", "rx_mbuf_allocation_errors", "rx_phy_discard_packets", "rx_missed_errors", "rx_q",]

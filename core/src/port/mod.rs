@@ -34,8 +34,12 @@ impl PortId {
     pub fn new_from_device(device: String) -> PortId {
         let mut port_id: u16 = 0;
         let _device = device.clone();
+        // The registered ethdev name is the bare PCI address; EAL strips any
+        // devargs (e.g. "0000:51:00.0,txq_mem_algn=0") after probe. Look the
+        // port up by the address alone so devargs in the config still work.
+        let dev_addr = device.split(',').next().unwrap_or(&device).to_owned();
         let ret = unsafe {
-            let dev_name = CString::new(device).unwrap();
+            let dev_name = CString::new(dev_addr).unwrap();
             dpdk::rte_eth_dev_get_port_by_name(dev_name.as_ptr(), &mut port_id)
         };
         if ret != 0 {

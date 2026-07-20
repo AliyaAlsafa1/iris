@@ -1,7 +1,8 @@
 use super::CoreId;
-use crate::config::ConnTrackConfig;
+use crate::config::{ConnTrackConfig, FlowTableConfig};
 use crate::conntrack::{ConnTracker, TrackerConfig};
 use crate::dpdk;
+use crate::filter::sw_flow::{FlowAction, FlowTable};
 use crate::memory::mbuf::Mbuf;
 use crate::port::{RxQueue, RxQueueType};
 use crate::stats::{
@@ -25,6 +26,7 @@ where
     pub(crate) id: CoreId,
     pub(crate) rxqueues: Vec<RxQueue>,
     pub(crate) conntrack: ConnTrackConfig,
+    pub(crate) flow_table: FlowTableConfig,
     #[cfg(feature = "prometheus")]
     pub(crate) is_prometheus_enabled: bool,
     pub(crate) subscription: Arc<Subscription<S>>,
@@ -39,6 +41,7 @@ where
         core_id: CoreId,
         rxqueues: Vec<RxQueue>,
         conntrack: ConnTrackConfig,
+        flow_table: FlowTableConfig,
         #[cfg(feature = "prometheus")] is_prometheus_enabled: bool,
         subscription: Arc<Subscription<S>>,
         is_running: Arc<AtomicBool>,
@@ -47,6 +50,7 @@ where
             id: core_id,
             rxqueues,
             conntrack,
+            flow_table,
             #[cfg(feature = "prometheus")]
             is_prometheus_enabled,
             subscription,
@@ -96,13 +100,40 @@ where
         log::debug!("{:#?}", registry);
         let mut conn_table = ConnTracker::<S::Tracked>::new(config, registry, self.id);
 
+        // Per-core (sharded) software flow table, mirroring NIC rte_flow rules.
+        // Rules arrive via `inbox` from the control-plane API and are drained
+        // right after each rx_burst. Preallocated (2 rules per connection, both
+        // directions) so it never resizes mid-run within the connection cap.
+        // Disabled (IRIS_SW_FLOW=0) => no preallocation, no lookup/drain.
+        let sw_flow_on = crate::filter::sw_flow::enabled();
+        let mut flow_table = if sw_flow_on {
+            FlowTable::with_capacity_ways(self.flow_table.capacity, self.flow_table.ways)
+        } else {
+            FlowTable::new()
+        };
+        let inbox = crate::filter::sw_flow::register_core(self.id);
+
         let mut now = Instant::now();
+
+        // rte_rdtsc-based per-packet cost: accumulate cycles only for non-empty
+        // bursts (idle poll-spin excluded), divided by received packets.
+        let mut busy_cycles: u64 = 0;
+        let mut busy_pkts: u64 = 0;
 
         while self.is_running.load(Ordering::Relaxed) {
             for rxqueue in self.rxqueues.iter() {
+                let t_start = unsafe { dpdk::rte_rdtsc() };
                 let mbufs: Vec<Mbuf> = self.rx_burst(rxqueue, 32);
+                let n_recv = mbufs.len();
                 if mbufs.is_empty() {
                     IDLE_CYCLES.inc();
+                }
+
+                // Apply any pending flow rules pushed by the control plane.
+                if sw_flow_on {
+                    while let Ok(cmd) = inbox.try_recv() {
+                        flow_table.apply(cmd);
+                    }
                 }
 
                 TOTAL_CYCLES.inc();
@@ -115,6 +146,17 @@ where
                 }
 
                 for mbuf in mbufs.into_iter() {
+                    // Consult the flow table first, just as the NIC would apply
+                    // rte_flow rules before the packet reaches the pipeline.
+                    if sw_flow_on {
+                        if let Some(action) = flow_table.lookup(&mbuf) {
+                            match action {
+                                FlowAction::Drop => continue,
+                                FlowAction::Queue(_) => {} // no SW steering; fall through
+                            }
+                        }
+                    }
+
                     // log::debug!("{:#?}", mbuf);
                     // log::debug!("Mark: {}", mbuf.mark());
                     // log::debug!("RSS Hash: 0x{:x}", mbuf.rss_hash());
@@ -138,9 +180,17 @@ where
                         IGNORED_BY_PACKET_FILTER_BYTE.inc_by(mbuf.data_len() as u64);
                     }
                 }
+
+                // Charge this burst's cycles to per-packet cost (skip idle polls).
+                if n_recv > 0 {
+                    busy_cycles += unsafe { dpdk::rte_rdtsc() } - t_start;
+                    busy_pkts += n_recv as u64;
+                }
             }
             conn_table.check_inactive(&self.subscription, now);
         }
+
+        crate::stats::add_datapath_busy(busy_cycles, busy_pkts);
 
         // // Deliver remaining data in table from unfinished connections
         conn_table.drain(&self.subscription);
