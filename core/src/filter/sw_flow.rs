@@ -291,21 +291,24 @@ lazy_static! {
     /// where each core drains its own lock-free `Receiver`.
     static ref INBOXES: RwLock<HashMap<CoreId, Sender<FlowCommand>>> =
         RwLock::new(HashMap::new());
-
-    /// Global on/off switch, read once from the `IRIS_SW_FLOW` env var
-    /// (default on; `0`/`false` disables). When disabled, installs are no-ops
-    /// and the datapath skips the lookup/drain entirely — a zero-overhead
-    /// baseline for measuring the software flow table's cost.
-    static ref ENABLED: bool = std::env::var("IRIS_SW_FLOW")
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true);
 }
 
-/// Whether the software flow table is enabled (see `IRIS_SW_FLOW`). Read this
-/// once per RX loop, not per packet.
+/// Global on/off switch, set once at runtime startup from the config: enabled
+/// iff `[flow_table]` is present. When disabled, no table is allocated on the
+/// datapath, installs are no-ops, and the lookup/drain is skipped entirely.
+/// Defaults to `false` — nothing is allocated unless the config asks for it.
+static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable or disable the software flow table. Called once by the runtime before
+/// RX cores start, driven by whether `[flow_table]` is set in the config.
+pub fn set_enabled(on: bool) {
+    ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the software flow table is enabled. Read once per RX loop, not per packet.
 #[inline]
 pub fn enabled() -> bool {
-    *ENABLED
+    ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Registers an inbox for `core` and returns the `Receiver` it drains at the

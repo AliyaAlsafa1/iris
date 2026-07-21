@@ -103,11 +103,16 @@ where
             );
         }
 
+        // Enable the software flow table iff the config provides a [flow_table]
+        // section; otherwise no table is allocated and installs are no-ops.
+        crate::filter::sw_flow::set_enabled(config.flow_table.is_some());
+
         let online = config.online.as_ref().map(|cfg| {
             log::info!("Initializing Online Runtime...");
             let online_opts = OnlineOptions {
                 online: cfg.clone(),
                 conntrack: config.conntrack.clone(),
+                flow_table: config.flow_table.clone(),
             };
             OnlineRuntime::new(
                 &config,
@@ -124,6 +129,7 @@ where
             let offline_opts = OfflineOptions {
                 offline: cfg.clone(),
                 conntrack: config.conntrack.clone(),
+                flow_table: config.flow_table.clone(),
             };
             OfflineRuntime::new(offline_opts, &standard_mempools, Arc::clone(&subscription))
         });

@@ -90,6 +90,12 @@ pub struct RuntimeConfig {
     /// Connection tracking settings.
     pub conntrack: ConnTrackConfig,
 
+    /// Software flow-table settings. Absent (`None`) means the SW flow table is
+    /// disabled: no table is allocated and `sw_flow` installs are no-ops. Add a
+    /// `[flow_table]` section to enable it.
+    #[serde(default)]
+    pub flow_table: Option<FlowTableConfig>,
+
     #[doc(hidden)]
     /// Runtime filter for testing purposes.
     #[serde(default = "default_filter")]
@@ -232,6 +238,7 @@ impl Default for RuntimeConfig {
                 init_rst: false,
                 init_data: false,
             },
+            flow_table: None,
             filter: None,
         }
     }
@@ -800,6 +807,37 @@ pub struct ConnTrackConfig {
     pub init_data: bool,
 }
 
+/// Software flow-table settings.
+///
+/// The software flow table is a per-core, bounded, set-associative cache of
+/// `rte_flow`-style rules (e.g. drop rules), consulted on the datapath right
+/// after `rx_burst`. When a set fills, the least-recently-accessed rule in that
+/// set is evicted (per-set LRU); eviction is best-effort, so an evicted rule
+/// just means those packets fall through to the normal pipeline.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct FlowTableConfig {
+    /// Maximum number of rules held per core before per-set LRU eviction. The
+    /// true capacity is rounded so the set count is a power of two. Defaults to
+    /// `1_048_576`.
+    #[serde(default = "default_flow_table_capacity")]
+    pub capacity: usize,
+
+    /// Associativity (ways per set). `1` is direct-mapped; higher values
+    /// approach global LRU at the cost of a wider per-lookup scan. Defaults to
+    /// `8`.
+    #[serde(default = "default_flow_table_ways")]
+    pub ways: usize,
+}
+
+impl Default for FlowTableConfig {
+    fn default() -> Self {
+        FlowTableConfig {
+            capacity: default_flow_table_capacity(),
+            ways: default_flow_table_ways(),
+        }
+    }
+}
+
 fn default_max_connections() -> usize {
     10_000_000
 }
@@ -822,6 +860,14 @@ fn default_tcp_inactivity_timeout() -> usize {
 
 fn default_tcp_establish_timeout() -> usize {
     5000
+}
+
+fn default_flow_table_capacity() -> usize {
+    1_048_576
+}
+
+fn default_flow_table_ways() -> usize {
+    8
 }
 
 fn default_init_synack() -> bool {

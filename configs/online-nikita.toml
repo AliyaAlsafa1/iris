@@ -30,9 +30,10 @@ udp_inactivity_timeout = 60000
 tcp_inactivity_timeout = 300000
 tcp_establish_timeout = 5000
 
-# Software flow-table sizing (used by --drop-mode software, IRIS_SW_FLOW=1).
-# Preallocated to 2 rules/connection, so capacity should exceed the live
-# connection count; ways is the set-associativity of the table.
+# Software flow-table. Presence of this [flow_table] section enables the SW
+# table (the runtime allocates it iff present); absent = disabled, nothing
+# allocated. flow_stats also forces it on only for --drop-mode software.
+# capacity = max rules before per-set LRU eviction; ways = set-associativity.
 [flow_table]
 capacity = 1048576
 ways = 8

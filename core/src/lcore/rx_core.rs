@@ -26,7 +26,7 @@ where
     pub(crate) id: CoreId,
     pub(crate) rxqueues: Vec<RxQueue>,
     pub(crate) conntrack: ConnTrackConfig,
-    pub(crate) flow_table: FlowTableConfig,
+    pub(crate) flow_table: Option<FlowTableConfig>,
     #[cfg(feature = "prometheus")]
     pub(crate) is_prometheus_enabled: bool,
     pub(crate) subscription: Arc<Subscription<S>>,
@@ -41,7 +41,7 @@ where
         core_id: CoreId,
         rxqueues: Vec<RxQueue>,
         conntrack: ConnTrackConfig,
-        flow_table: FlowTableConfig,
+        flow_table: Option<FlowTableConfig>,
         #[cfg(feature = "prometheus")] is_prometheus_enabled: bool,
         subscription: Arc<Subscription<S>>,
         is_running: Arc<AtomicBool>,
@@ -101,16 +101,14 @@ where
         let mut conn_table = ConnTracker::<S::Tracked>::new(config, registry, self.id);
 
         // Per-core (sharded) software flow table, mirroring NIC rte_flow rules.
-        // Rules arrive via `inbox` from the control-plane API and are drained
-        // right after each rx_burst. Preallocated (2 rules per connection, both
-        // directions) so it never resizes mid-run within the connection cap.
-        // Disabled (IRIS_SW_FLOW=0) => no preallocation, no lookup/drain.
-        let sw_flow_on = crate::filter::sw_flow::enabled();
-        let mut flow_table = if sw_flow_on {
-            FlowTable::with_capacity_ways(self.flow_table.capacity, self.flow_table.ways)
-        } else {
-            FlowTable::new()
-        };
+        // Allocated only when the config provides a [flow_table] section;
+        // otherwise `flow_table` is None and the datapath allocates nothing and
+        // skips the lookup/drain entirely. Rules arrive via `inbox` from the
+        // control-plane API and are drained right after each rx_burst.
+        let mut flow_table = self
+            .flow_table
+            .as_ref()
+            .map(|c| FlowTable::with_capacity_ways(c.capacity, c.ways));
         let inbox = crate::filter::sw_flow::register_core(self.id);
 
         let mut now = Instant::now();
@@ -130,9 +128,9 @@ where
                 }
 
                 // Apply any pending flow rules pushed by the control plane.
-                if sw_flow_on {
+                if let Some(ft) = flow_table.as_mut() {
                     while let Ok(cmd) = inbox.try_recv() {
-                        flow_table.apply(cmd);
+                        ft.apply(cmd);
                     }
                 }
 
@@ -148,8 +146,8 @@ where
                 for mbuf in mbufs.into_iter() {
                     // Consult the flow table first, just as the NIC would apply
                     // rte_flow rules before the packet reaches the pipeline.
-                    if sw_flow_on {
-                        if let Some(action) = flow_table.lookup(&mbuf) {
+                    if let Some(ft) = flow_table.as_mut() {
+                        if let Some(action) = ft.lookup(&mbuf) {
                             match action {
                                 FlowAction::Drop => continue,
                                 FlowAction::Queue(_) => {} // no SW steering; fall through

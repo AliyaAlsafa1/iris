@@ -6,8 +6,9 @@
 //!   none      no drop — count every packet (the full-monitoring baseline).
 //!   software  software flow table: at the threshold, install a Drop rule
 //!             (`sw_flow`) inline. Tail packets are dropped at RX, before the
-//!             pipeline, and skip the byte counting. Requires the runtime flow
-//!             table (this app sets `IRIS_SW_FLOW=1` itself) and reads its
+//!             pipeline, and skip the byte counting. This app enables the table
+//!             by setting `config.flow_table = Some(..)` (only in this mode; the
+//!             runtime allocates it iff `[flow_table]` is present) and takes its
 //!             sizing from `[flow_table]` (capacity/ways) — override with
 //!             `--capacity`/`--ways`.
 //!   hardware  NIC rte_flow: at the threshold, the RX callback *dispatches* the
@@ -42,7 +43,8 @@ use iris_core::filter::flow_drop::{install_drop_flow, uninstall_flow};
 use iris_core::filter::sw_flow::{self, FlowAction};
 use iris_core::multicore::{ChannelDispatcher, ChannelMode, SharedWorkerThreadSpawner};
 use iris_core::port::PortId;
-use iris_core::{config::load_config, CoreId, FiveTuple, L4Pdu, Runtime};
+use iris_core::config::load_config;
+use iris_core::{CoreId, FiveTuple, L4Pdu, Runtime};
 use iris_datatypes::PktCount;
 use lazy_static::lazy_static;
 use serde::Serialize;
@@ -351,12 +353,6 @@ fn main() {
 
     let mode = args.drop_mode;
     let _ = DROP_MODE.set(mode);
-    // The software flow table is enabled once, lazily, at rx-core start; setting
-    // the env here (before the runtime runs) makes --drop-mode fully drive it.
-    std::env::set_var(
-        "IRIS_SW_FLOW",
-        if mode == DropMode::Software { "1" } else { "0" },
-    );
 
     let after = args.drop_after.unwrap_or_else(|| env_usize("IRIS_DROP_AFTER", 1) as u64);
     let _ = DROP_AFTER.set(after);
@@ -364,12 +360,21 @@ fn main() {
     init_stats(size);
 
     let mut config = load_config(&args.config);
-    if let Some(c) = args.capacity {
-        config.flow_table.capacity = c;
-    }
-    if let Some(w) = args.ways {
-        config.flow_table.ways = w;
-    }
+    // The SW flow table is enabled iff config.flow_table is Some (the runtime
+    // reads this once at startup). Drive it from --drop-mode: only `software`
+    // allocates one; other modes force it off so nothing is allocated.
+    config.flow_table = if mode == DropMode::Software {
+        let mut ft = config.flow_table.take().unwrap_or_default();
+        if let Some(c) = args.capacity {
+            ft.capacity = c;
+        }
+        if let Some(w) = args.ways {
+            ft.ways = w;
+        }
+        Some(ft)
+    } else {
+        None
+    };
 
     // Hardware arm: stand up the off-datapath install worker before the runtime.
     let mut worker_handle = None;

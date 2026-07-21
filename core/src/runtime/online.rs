@@ -1,4 +1,4 @@
-use crate::config::{ConnTrackConfig, OnlineConfig, RuntimeConfig};
+use crate::config::{ConnTrackConfig, FlowTableConfig, OnlineConfig, RuntimeConfig};
 use crate::dpdk;
 use crate::filter::flow_drop::RawAction;
 use crate::filter::Filter;
@@ -90,6 +90,7 @@ where
                 core_id,
                 rxqueues,
                 options.conntrack.clone(),
+                options.flow_table.clone(),
                 #[cfg(feature = "prometheus")]
                 options.online.prometheus.is_some(),
                 Arc::clone(&subscription),
@@ -289,6 +290,7 @@ where
 pub(crate) struct OnlineOptions {
     pub(crate) online: OnlineConfig,
     pub(crate) conntrack: ConnTrackConfig,
+    pub(crate) flow_table: Option<FlowTableConfig>,
 }
 
 extern "C" fn launch_rx<S>(arg: *mut c_void) -> i32
