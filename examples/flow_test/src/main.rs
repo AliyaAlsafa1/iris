@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use iris_core::{
     config::{default_config, load_config, FlowMode},
-    filter::flow_drop::{install_drop_flow, install_split_flow, uninstall_flow},
+    filter::flow_drop::{install_drop_flow, install_split_flow, uninstall_flow, query_resident_flow, DISCARDED_PACKETS, DISCARDED_BYTES},
     multicore::{ChannelDispatcher, ChannelMode, SharedWorkerThreadSpawner},
     port::PortId,
     CoreId,
@@ -234,6 +234,11 @@ fn main() {
 
     let flow_mode = config.online.as_ref().map_or(FlowMode::Standard, |o| o.flow_mode);
     *MODE.write().unwrap() = flow_mode;
+    println!(
+        "resolved flow_mode = {:?} (online section present: {})",
+        flow_mode,
+        config.online.is_some()
+    );
 
     // Initialize split queues if needed
     if flow_mode == FlowMode::Split {
@@ -273,6 +278,14 @@ fn main() {
 
     // Map provided worker cores
     let worker_core_ids: Vec<CoreId> = args.worker_cores.iter().map(|&c| CoreId(c)).collect();
+
+    if worker_core_ids.len() > 1 {
+        eprintln!(
+            "warning: {} worker cores supplied, but the flow handler runs \
+             serially; extra cores provide no additional throughput.",
+            worker_core_ids.len()
+        );
+    }
 
     // Spawn workers and attach the handler
     let worker_handle = SharedWorkerThreadSpawner::new()
@@ -381,6 +394,28 @@ fn main() {
 
     // Graceful shutdown
     let final_stats = worker_handle.shutdown(args.flush_channels.as_ref());
+
+    // Discard totals are accumulated at eviction time (each evicted rule's
+    // indirect counter is queried in uninstall_flow). Flows still resident at
+    // exit were never evicted, so their counters have not been read yet. Query
+    // them here (WITHOUT destroying the rules — mass rte_flow_destroy at
+    // shutdown faults in the PMD) so the totals include the resident set too.
+    {
+        let queue = FLOW_QUEUE.lock().unwrap();
+        for entry in queue.iter() {
+            let raw_ptrs: Vec<*mut rte_flow> =
+                entry.flow_ptrs.iter().map(|fp| fp.0).collect();
+            let raw_handles: Vec<*mut rte_flow_action_handle> =
+                entry.handle_ptrs.iter().map(|hp| hp.0).collect();
+            if let Err(e) = query_resident_flow(&entry.ports, &raw_ptrs, &raw_handles) {
+                eprintln!("resident flow query failed: {e:?}");
+            }
+        }
+    }
+
+    let discarded_packets = DISCARDED_PACKETS.load(std::sync::atomic::Ordering::Relaxed);
+    let discarded_bytes = DISCARDED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    println!("{discarded_packets} packets and {discarded_bytes} bytes discarded");
 
     if args.show_stats {
         if let Some(flow_stats) = final_stats.get(0) {

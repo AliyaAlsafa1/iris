@@ -2,6 +2,7 @@ use std::ffi::CStr;
 use std::mem;
 use std::ptr;
 use std::net::{IpAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{bail, Result};
 use crate::FiveTuple;
@@ -23,6 +24,12 @@ const L4_LSB_MASK: u16 = 0x000F;
 
 const TCP: u8 = 6;
 const UDP: u8 = 17;
+
+/// Aggregate hits/bytes read from each rule's indirect counter at uninstall
+/// time (on eviction and at teardown). Incremented in `uninstall_flow`, read
+/// by the binary at shutdown to report totals instead of printing per rule.
+pub static DISCARDED_PACKETS: AtomicU64 = AtomicU64::new(0);
+pub static DISCARDED_BYTES:   AtomicU64 = AtomicU64::new(0);
 
 /// Returns a table in [2..=14] using dest port low nibble for TCP/UDP.
 /// Non-TCP/UDP fall back to BASE_GROUP.
@@ -371,6 +378,8 @@ pub fn install_split_flow(
 
 /// Uninstall flow rules previously installed, querying their indirect
 /// counters first. `flows` and `handles` are parallel vectors of equal length.
+/// The queried hits/bytes are accumulated into the global DISCARDED_PACKETS /
+/// DISCARDED_BYTES counters rather than printed per rule.
 pub fn uninstall_flow(
     port_ids: Vec<PortId>,
     flows: Vec<*mut rte_flow>,
@@ -398,17 +407,16 @@ pub fn uninstall_flow(
         let handle = handles[idx];
 
         if flow.is_null() {
-            println!("No flow to uninstall on port {}", port_id.raw());
             continue;
         }
 
         if !handle.is_null() {
             match query_flow_stats(port_id.raw(), handle) {
-                Ok((hits, bytes)) => println!(
-                    "Port {} flow stats — packets: {}, bytes: {}",
-                    port_id.raw(), hits, bytes
-                ),
-                Err(e) => println!(
+                Ok((hits, bytes)) => {
+                    DISCARDED_PACKETS.fetch_add(hits, Ordering::Relaxed);
+                    DISCARDED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+                }
+                Err(e) => eprintln!(
                     "Port {} flow stats unavailable: {}",
                     port_id.raw(), e
                 ),
@@ -450,6 +458,56 @@ pub fn uninstall_flow(
                     port_id.raw(), msg
                 );
             }
+        }
+    }
+
+    Ok(())
+}
+
+/// Query the indirect counters of a still-installed rule set and accumulate
+/// the hits/bytes into DISCARDED_PACKETS / DISCARDED_BYTES, WITHOUT destroying
+/// the rules or their handles. Use this at shutdown to tally flows that are
+/// still resident (never evicted). `flows` and `handles` are the parallel
+/// vectors returned by install_drop_flow / install_split_flow; `flows` is only
+/// used for its length/null checks, no rte_flow_destroy is called.
+pub fn query_resident_flow(
+    port_ids: &[PortId],
+    flows: &[*mut rte_flow],
+    handles: &[*mut rte_flow_action_handle],
+) -> Result<()> {
+    if (port_ids.len() * 2) != flows.len() {
+        bail!(
+            "Mismatched lengths: {} ports but {} flows",
+            port_ids.len(),
+            flows.len()
+        );
+    }
+    if flows.len() != handles.len() {
+        bail!(
+            "Mismatched lengths: {} flows but {} handles",
+            flows.len(),
+            handles.len()
+        );
+    }
+
+    let n = port_ids.len();
+    for (idx, flow) in flows.iter().enumerate() {
+        let port_id = &port_ids[idx % n];
+        let handle = handles[idx];
+
+        if flow.is_null() || handle.is_null() {
+            continue;
+        }
+
+        match query_flow_stats(port_id.raw(), handle) {
+            Ok((hits, bytes)) => {
+                DISCARDED_PACKETS.fetch_add(hits, Ordering::Relaxed);
+                DISCARDED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+            }
+            Err(e) => eprintln!(
+                "Port {} resident flow stats unavailable: {}",
+                port_id.raw(), e
+            ),
         }
     }
 
