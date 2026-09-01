@@ -7,10 +7,13 @@ edition = "2024"
 iris-core = { path = "../../core" }
 iris-datatypes = { path = "../../datatypes" }
 iris-compiler = { path = "../../compiler" }
-serde = "1.0.228"
+serde = { version = "1", features = ["rc"] }
 
 array-init = "2.1"
-csv = "1"
 const_format = "0.2"
 
+arrow = "57"
+parquet = "57"
+
 flow_features = { path = "../flow_features" }
+clap = { version = "4.6.1", features = ["derive"] }

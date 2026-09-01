@@ -11,13 +11,12 @@ use iris_core::subscription::Tracked;
 
 use serde::ser::{SerializeStruct, Serializer};
 use serde::Serialize;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
-
-pub const N_PACKETS: usize = 20;
+use std::sync::OnceLock;
 
 /// Pure SYN
 pub const HIST_SYN: u8 = b'S';
@@ -31,6 +30,49 @@ pub const HIST_DATA: u8 = b'D';
 pub const HIST_FIN: u8 = b'F';
 /// Has RST set
 pub const HIST_RST: u8 = b'R';
+
+/// Monotonic-derived wall clock.
+///
+/// Captures a wall/monotonic anchor pair once, then derives every timestamp by
+/// adding a monotonic elapsed offset to the wall anchor.
+#[derive(Debug, Clone)]
+pub struct MonotonicWallClock {
+    wall_at_start: SystemTime,
+    mono_at_start: Instant,
+}
+
+impl MonotonicWallClock {
+    pub fn new() -> Self {
+        let wall_at_start = SystemTime::now();
+        let mono_at_start = Instant::now();
+        Self { wall_at_start, mono_at_start }
+    }
+
+    /// Derived wall time for a given monotonic instant, as epoch microseconds.
+    pub fn epoch_micros_at(&self, mono_now: Instant) -> u64 {
+        let elapsed = mono_now.saturating_duration_since(self.mono_at_start);
+        (self.wall_at_start + elapsed)
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64
+    }
+}
+
+impl Default for MonotonicWallClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Process-wide clock anchor, captured once. Shared across all connection records
+/// and cores so every derived timestamp references the same wall/monotonic pair.
+static CLOCK: OnceLock<MonotonicWallClock> = OnceLock::new();
+
+/// Returns the process-wide clock anchor, initializing it on first use. Force this
+/// once at startup (before any flow is stamped) so the anchor precedes all traffic.
+pub fn clock() -> &'static MonotonicWallClock {
+    CLOCK.get_or_init(MonotonicWallClock::new)
+}
 
 impl ConnRecord {
     /// Returns the client (originator) socket address.
@@ -61,6 +103,12 @@ impl ConnRecord {
     #[inline]
     pub fn total_payload_bytes(&self) -> u64 {
         self.orig.nb_payload_bytes + self.resp.nb_payload_bytes
+    }
+
+    /// Wall-clock time of the first packet, in microseconds since the Unix epoch.
+    #[inline]
+    pub fn first_seen_epoch_micros(&self) -> u64 {
+        clock().epoch_micros_at(self.first_seen_ts)
     }
 
     /// Returns the connection history.
@@ -133,6 +181,8 @@ pub struct ConnRecord {
     /// This represents the time Iris observed the first packet in the connection, and does not
     /// reflect timestamps read from a packet capture in offline analysis.
     pub first_seen_ts: Instant,
+    /// Wall-clock time of the first packet (UNIX epoch). Stable for the life of the connection.
+    pub first_seen_wall: SystemTime,
     /// Timestamp of the second packet (approximate).
     pub second_seen_ts: Instant,
     /// Timestamp of the last packet (approximate).
@@ -159,19 +209,6 @@ pub struct ConnRecord {
     pub orig: Flow,
     /// Responder flow.
     pub resp: Flow,
-
-    /// Snapshot of orig flow state at the Nth packet.
-    pub prefix_orig: Option<Flow>,
-    /// Snapshot of resp flow state at the Nth packet.
-    pub prefix_resp: Option<Flow>,
-    /// Snapshot of history at the Nth packet.
-    pub prefix_history: Option<Vec<u8>>,
-    /// Duration at the Nth packet.
-    pub prefix_duration: Option<Duration>,
-    /// Max inactivity at the Nth packet.
-    pub prefix_max_inactivity: Option<Duration>,
-    /// Time to second packet, snapshotted at the Nth packet.
-    pub prefix_time_to_second_pkt: Option<Duration>,
 }
 
 #[inline]
@@ -202,7 +239,7 @@ pub(crate) fn update_history(history: &mut Vec<u8>, segment: &L4Pdu, mask: u8) {
 
 impl ConnRecord {
     #[inline]
-    fn update_data(&mut self, segment: &L4Pdu, n_packets: u64) {
+    fn update_data(&mut self, segment: &L4Pdu) {
         let now = Instant::now();
         let inactivity = now - self.last_seen_ts;
         if inactivity > self.max_inactivity {
@@ -221,20 +258,11 @@ impl ConnRecord {
         if self.orig.nb_pkts + self.resp.nb_pkts == 2 {
             self.second_seen_ts = now;
         }
-
-        if self.orig.nb_pkts + self.resp.nb_pkts == n_packets {
-            self.prefix_orig = Some(self.orig.clone());
-            self.prefix_resp = Some(self.resp.clone());
-            self.prefix_history = Some(self.history.clone());
-            self.prefix_duration = Some(self.duration());
-            self.prefix_max_inactivity = Some(self.max_inactivity);
-            self.prefix_time_to_second_pkt = Some(self.time_to_second_packet());
-        }
     }
 
     #[cfg_attr(not(feature = "skip_expand"), datatype_fn("ConnRecord,level=InL4Conn"))]
     pub fn update(&mut self, pdu: &L4Pdu) {
-        self.update_data(pdu, N_PACKETS as u64);
+        self.update_data(pdu);
     }
 }
 
@@ -242,24 +270,21 @@ impl Tracked for ConnRecord {
     fn new(first_pkt: &L4Pdu) -> Self {
         let five_tuple = FiveTuple::from_ctxt(&first_pkt.ctxt);
         let now = Instant::now();
+        let wall = SystemTime::now();
         Self {
             five_tuple,
             first_seen_ts: now,
+            first_seen_wall: wall,
             second_seen_ts: now,
             last_seen_ts: now,
             max_inactivity: Duration::default(),
             history: Vec::with_capacity(16),
             orig: Flow::new(),
             resp: Flow::new(),
-            prefix_orig: None,
-            prefix_resp: None,
-            prefix_history: None,
-            prefix_duration: None,
-            prefix_max_inactivity: None,
-            prefix_time_to_second_pkt: None,
         }
     }
 
+    // Clear the more memory-intensive data structures
     fn clear(&mut self) {
         self.orig.chunks = Vec::with_capacity(0);
         self.orig.gaps = HashMap::with_capacity(0);

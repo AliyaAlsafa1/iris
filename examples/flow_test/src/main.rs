@@ -21,12 +21,12 @@ use std::{
     collections::{HashMap, BTreeSet, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock, RwLock},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 mod model;
 
-use flow_features::conn_features::ConnFeatures;
+use flow_features::conn_features::{ConnFeatures, ConnInvariants};
 use flow_features::tls_features::TlsFeatures;
 
 #[derive(Clone, Copy)]
@@ -168,8 +168,15 @@ fn tls_cb(
         return true;
     }
 
+    let conn_hash = conn.five_tuple.conn_hash();
+    let first_seen_ts = conn.first_seen_wall
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64;
+    let inv = ConnInvariants::from_conn(conn, conn_hash, first_seen_ts);
+    
     let is_elephant = match (
-        ConnFeatures::from_conn(conn, iat),
+      ConnFeatures::from_conn_at(conn, iat, 20, &inv),
         TlsFeatures::from_tls(tls),
     ) {
         (Some(conn_features), Some(tls_features)) => {

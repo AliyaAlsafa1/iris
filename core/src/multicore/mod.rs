@@ -11,7 +11,7 @@ mod shared_worker;
 mod subscription_stats;
 
 pub use channel_dispatcher::{ChannelDispatcher, ChannelMode, Channels};
-pub use dedicated_worker::DedicatedWorkerThreadSpawner;
+pub use dedicated_worker::{DedicatedWorkerThreadSpawner, DedicatedWorkerHandle};
 pub use pin::pin_thread_to_core;
 pub use shared_worker::SharedWorkerThreadSpawner;
 pub use subscription_stats::SubscriptionStats;

@@ -1,3 +1,4 @@
+// examples/flow_test/src/model.rs
 use lightgbm3::Booster;
 use std::sync::OnceLock;
 
@@ -20,18 +21,8 @@ pub fn predict(f: &ConnFeatures, t: &TlsFeatures) -> Option<f64> {
 
     let features: Vec<f64> = vec![
         // --- ConnFeatures ---
-        f.src_ip_oct0                 as f64,
-        f.src_ip_oct1                 as f64,
-        f.src_ip_oct2                 as f64,
-        f.src_ip_oct3                 as f64,
-        f.src_ip_oct4                 as f64,
-        f.src_ip_oct5                 as f64,
-        f.dst_ip_oct0                 as f64,
-        f.dst_ip_oct1                 as f64,
-        f.dst_ip_oct2                 as f64,
-        f.dst_ip_oct3                 as f64,
-        f.dst_ip_oct4                 as f64,
-        f.dst_ip_oct5                 as f64,
+        f.src_ip_subn                 as f64,
+        f.dst_ip_subn                 as f64,
         f.src_port                    as f64,
         f.dst_port                    as f64,
         f.protocol                    as f64,
@@ -59,7 +50,6 @@ pub fn predict(f: &ConnFeatures, t: &TlsFeatures) -> Option<f64> {
         f.orig_content_gaps           as f64,
         f.orig_missed_bytes           as f64,
         f.orig_mean_pkts_to_fill,
-        f.orig_median_pkts_to_fill    as f64,
         f.resp_nb_pkts                as f64,
         f.resp_nb_malformed_pkts      as f64,
         f.resp_nb_late_start_pkts     as f64,
@@ -69,14 +59,11 @@ pub fn predict(f: &ConnFeatures, t: &TlsFeatures) -> Option<f64> {
         f.resp_content_gaps           as f64,
         f.resp_missed_bytes           as f64,
         f.resp_mean_pkts_to_fill,
-        f.resp_median_pkts_to_fill    as f64,
         f.orig_iat_mean,
-        f.orig_iat_median,
         f.orig_iat_min                as f64,
         f.orig_iat_max                as f64,
         f.orig_iat_std,
         f.resp_iat_mean,
-        f.resp_iat_median,
         f.resp_iat_min                as f64,
         f.resp_iat_max                as f64,
         f.resp_iat_std,

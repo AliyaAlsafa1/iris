@@ -42,6 +42,43 @@ impl FiveTuple {
         ConnId::new(self.orig, self.resp, self.proto)
     }
 
+    /// Non-bucketed u64 hash of the canonicalized five-tuple.
+    ///
+    /// Paired downstream with `first_seen_ts` to form
+    /// the composite connection key; `conn_hash` alone is NOT unique.
+    pub fn conn_hash(&self) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+
+        #[inline]
+        fn mix(mut h: u64, v: u64) -> u64 {
+            for byte in v.to_le_bytes() {
+                h ^= byte as u64;
+                h = h.wrapping_mul(FNV_PRIME);
+            }
+            h
+        }
+
+        #[inline]
+        fn hash_sockaddr(sa: SocketAddr) -> u64 {
+            let ip: u64 = match sa {
+                V4(a) => a.ip().to_bits() as u64,
+                V6(a) => {
+                    let n = a.ip().to_bits();
+                    (n as u64) ^ ((n >> 64) as u64)
+                }
+            };
+            (ip << 16) ^ (sa.port() as u64)
+        }
+
+        let (hi, lo) = (cmp::max(self.orig, self.resp), cmp::min(self.orig, self.resp));
+        let mut h = FNV_OFFSET;
+        h = mix(h, hash_sockaddr(hi));
+        h = mix(h, hash_sockaddr(lo));
+        h = mix(h, self.proto as u64);
+        h
+    }
+
     /// Utility for returning a string representation of the dst. subnet
     /// /24 for IPv4, /64 for IPv6; no mask for broadcast
     pub fn dst_subnet_str(&self) -> String {

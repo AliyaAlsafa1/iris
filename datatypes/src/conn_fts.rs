@@ -153,6 +153,66 @@ impl Tracked for ByteCount {
     fn clear(&mut self) {}
 }
 
+/// Streaming inter-arrival statistics for one direction.
+///
+/// Maintains running count, sum, sum-of-squares, min, and max so per-packet
+/// snapshots are O(1) to update and read, avoiding a full re-scan of the
+/// interarrival history.
+#[derive(Debug, Clone)]
+pub struct IatStats {
+    count: u64,
+    sum_us: f64,
+    sum_sq_us: f64,
+    min_us: u128,
+    max_us: u128,
+}
+
+impl IatStats {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            sum_us: 0.0,
+            sum_sq_us: 0.0,
+            min_us: 0,
+            max_us: 0,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, dur: Duration) {
+        let v = dur.as_micros();
+        if self.count == 0 || v < self.min_us {
+            self.min_us = v;
+        }
+        if self.count == 0 || v > self.max_us {
+            self.max_us = v;
+        }
+        self.count += 1;
+        self.sum_us += v as f64;
+        self.sum_sq_us += (v as f64) * (v as f64);
+    }
+
+    fn clear(&mut self) {
+        self.count = 0;
+        self.sum_us = 0.0;
+        self.sum_sq_us = 0.0;
+        self.min_us = 0;
+        self.max_us = 0;
+    }
+
+    /// Returns (mean, min, max, std) in microseconds.
+    pub fn summary(&self) -> (f64, u64, u64, f64) {
+        let n = self.count;
+        if n == 0 {
+            return (0.0, 0, 0, 0.0);
+        }
+        let mean = self.sum_us / n as f64;
+        let variance = (self.sum_sq_us / n as f64) - mean * mean;
+        let std_dev = variance.max(0.0).sqrt();
+        (mean, self.min_us as u64, self.max_us as u64, std_dev)
+    }
+}
+
 /// Tracked data for packet inter-arrival times
 #[derive(Debug, Clone)]
 #[cfg_attr(not(feature = "skip_expand"), datatype)]
@@ -164,6 +224,8 @@ pub struct InterArrivals {
     pub interarrivals_ctos: Vec<Duration>,
     /// Interarrival durations server-to-client (resp.) flow
     pub interarrivals_stoc: Vec<Duration>,
+    pub stats_ctos: IatStats,
+    pub stats_stoc: IatStats,
 }
 
 impl InterArrivals {
@@ -176,6 +238,8 @@ impl InterArrivals {
             last_pkt_stoc: now,
             interarrivals_ctos: Vec::new(),
             interarrivals_stoc: Vec::new(),
+            stats_ctos: IatStats::new(),
+            stats_stoc: IatStats::new(),
         }
     }
 }
@@ -191,13 +255,17 @@ impl InterArrivals {
         if pdu.dir {
             self.pkt_count_ctos += 1;
             if self.pkt_count_ctos > 1 {
-                self.interarrivals_ctos.push(now - self.last_pkt_ctos);
+                let iat = now - self.last_pkt_ctos;
+                self.interarrivals_ctos.push(iat);
+                self.stats_ctos.push(iat);
             }
             self.last_pkt_ctos = now;
         } else {
             self.pkt_count_stoc += 1;
             if self.pkt_count_stoc > 1 {
-                self.interarrivals_stoc.push(now - self.last_pkt_stoc);
+                let iat = now - self.last_pkt_stoc;
+                self.interarrivals_stoc.push(iat);
+                self.stats_stoc.push(iat);
             }
             self.last_pkt_stoc = now;
         }
@@ -213,6 +281,8 @@ impl Tracked for InterArrivals {
     fn clear(&mut self) {
         self.interarrivals_ctos.clear();
         self.interarrivals_stoc.clear();
+        self.stats_ctos.clear();
+        self.stats_stoc.clear();
     }
 }
 
