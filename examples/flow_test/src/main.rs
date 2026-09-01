@@ -61,6 +61,7 @@ static SPLIT_QUEUES: RwLock<Option<HashMap<CoreId, u16>>> = RwLock::new(None);
 
 static TIMEOUT_SECS: OnceLock<u64> = OnceLock::new();
 static NUM_FLOWS: OnceLock<usize> = OnceLock::new();
+static USE_MODEL: OnceLock<bool> = OnceLock::new();
 
 #[derive(Clone, Serialize)]
 enum FlowEvent {
@@ -117,7 +118,7 @@ struct Args {
     show_args: bool,
 
     #[clap(long, value_parser, value_name = "FILE")]
-    model: PathBuf,
+    model: Option<PathBuf>,
 
     #[clap(long, value_name = "SECS", default_value = "10")]
     timeout_secs: u64,
@@ -156,6 +157,7 @@ fn expire_flows_now() {
 
 // Fire on TLS connections
 #[callback("tls,level=InL4Conn")]
+#[allow(unused_variables)]
 fn tls_cb(
     five_tuple: &FiveTuple,
     rx_core: &CoreId,
@@ -168,23 +170,27 @@ fn tls_cb(
         return true;
     }
 
-    let conn_hash = conn.five_tuple.conn_hash();
-    let first_seen_ts = conn.first_seen_wall
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as u64;
-    let inv = ConnInvariants::from_conn(conn, conn_hash, first_seen_ts);
-    
-    let is_elephant = match (
-      ConnFeatures::from_conn_at(conn, iat, 20, &inv),
-        TlsFeatures::from_tls(tls),
-    ) {
-        (Some(conn_features), Some(tls_features)) => {
-            model::predict(&conn_features, &tls_features)
-                .map(|proba| proba >= 0.5)
-                .unwrap_or(false)
+    let is_elephant = if *USE_MODEL.get().unwrap_or(&false) {
+        let conn_hash = conn.five_tuple.conn_hash();
+        let first_seen_ts = conn.first_seen_wall
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        let inv = ConnInvariants::from_conn(conn, conn_hash, first_seen_ts);
+
+        match (
+            ConnFeatures::from_conn_at(conn, iat, 20, &inv),
+            TlsFeatures::from_tls(tls),
+        ) {
+            (Some(conn_features), Some(tls_features)) => {
+                model::predict(&conn_features, &tls_features)
+                    .map(|proba| proba >= 0.5)
+                    .unwrap_or(false)
+            }
+            _ => false,
         }
-        _ => false,
+    } else {
+        true
     };
 
     if is_elephant {
@@ -218,8 +224,19 @@ fn main() {
     TIMEOUT_SECS.set(args.timeout_secs).unwrap();
     NUM_FLOWS.set(args.num_flows).unwrap();
 
-    // Load the LightGBM model before starting the runtime.
-    model::load_model(args.model.to_str().expect("Invalid model path"));
+    // Load the LightGBM model before starting the runtime, if one was provided.
+    // With no model, every qualifying TLS flow is admitted (admit-all mode).
+    let use_model = match &args.model {
+        Some(path) => {
+            model::load_model(path.to_str().expect("Invalid model path"));
+            true
+        }
+        None => {
+            println!("No model provided; running in admit-all mode.");
+            false
+        }
+    };
+    USE_MODEL.set(use_model).unwrap();
 
     let config = if let Some(path) = args.config.clone() {
         load_config(path)
