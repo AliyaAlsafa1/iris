@@ -18,10 +18,9 @@ use iris_core::dpdk::{rte_flow, rte_flow_action_handle};
 use iris_compiler::{callback, input_files, iris_end_macros};
 
 use std::{
-    collections::{HashMap, BTreeSet, VecDeque},
+    collections::{HashMap, HashSet, BTreeSet, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock, RwLock},
-    time::{Duration, Instant, SystemTime},
 };
 
 mod model;
@@ -45,12 +44,11 @@ struct FlowEntry {
     ports: Vec<PortId>,
     flow_ptrs: Vec<FlowPtr>,
     handle_ptrs: Vec<HandlePtr>,
-    expires_at: Instant,
 }
 
 lazy_static! {
     static ref PORT_IDS: RwLock<Option<Vec<PortId>>> = RwLock::new(None);
-    static ref TARGET_FLOWS: Mutex<HashMap<FiveTuple, Instant>> = Mutex::new(HashMap::new());
+    static ref TARGET_FLOWS: Mutex<HashSet<FiveTuple>> = Mutex::new(HashSet::new());
     static ref FLOW_QUEUE: Mutex<VecDeque<FlowEntry>> = Mutex::new(VecDeque::new());
 }
 
@@ -59,7 +57,6 @@ static FLOW_DISPATCHER: OnceLock<Arc<ChannelDispatcher<FlowEvent>>> = OnceLock::
 static MODE: RwLock<FlowMode> = RwLock::new(FlowMode::Standard);
 static SPLIT_QUEUES: RwLock<Option<HashMap<CoreId, u16>>> = RwLock::new(None);
 
-static TIMEOUT_SECS: OnceLock<u64> = OnceLock::new();
 static NUM_FLOWS: OnceLock<usize> = OnceLock::new();
 static USE_MODEL: OnceLock<bool> = OnceLock::new();
 
@@ -120,9 +117,6 @@ struct Args {
     #[clap(long, value_parser, value_name = "FILE")]
     model: Option<PathBuf>,
 
-    #[clap(long, value_name = "SECS", default_value = "10")]
-    timeout_secs: u64,
-
     #[clap(long, value_name = "COUNT", default_value = "100")]
     num_flows: usize,
 }
@@ -131,25 +125,13 @@ struct Args {
 
 // ===== Helpers =====
 
-/// Expire and uninstall any rules whose deadlines have passed.
-fn expire_flows_now() {
-    let mut queue = FLOW_QUEUE.lock().unwrap();
-    let now = Instant::now();
-
-    while let Some(entry) = queue.front() {
-        if entry.expires_at > now {
-            break;
-        }
-        // pop first (to drop the borrow) then uninstall
-        let expired = queue.pop_front().unwrap();
-        let raw_ptrs: Vec<*mut rte_flow> = expired.flow_ptrs.iter().map(|fp| fp.0).collect();
-        let raw_handles: Vec<*mut rte_flow_action_handle> =
-            expired.handle_ptrs.iter().map(|hp| hp.0).collect();
-        if let Err(e) = uninstall_flow(expired.ports.clone(), raw_ptrs, raw_handles) {
-            eprintln!("Failed to uninstall flow: {:?}", e);
-        }
-        // Optionally also remove from TARGET_FLOWS when it expires:
-        TARGET_FLOWS.lock().unwrap().remove(&expired.tuple);
+/// Uninstall a single flow entry's rules. Does not touch TARGET_FLOWS.
+fn uninstall_entry(entry: &FlowEntry) {
+    let raw_ptrs: Vec<*mut rte_flow> = entry.flow_ptrs.iter().map(|fp| fp.0).collect();
+    let raw_handles: Vec<*mut rte_flow_action_handle> =
+        entry.handle_ptrs.iter().map(|hp| hp.0).collect();
+    if let Err(e) = uninstall_flow(entry.ports.clone(), raw_ptrs, raw_handles) {
+        eprintln!("Failed to uninstall flow: {:?}", e);
     }
 }
 
@@ -221,7 +203,6 @@ fn main() {
         println!("{args:#?}");
     }
 
-    TIMEOUT_SECS.set(args.timeout_secs).unwrap();
     NUM_FLOWS.set(args.num_flows).unwrap();
 
     // Load the LightGBM model before starting the runtime, if one was provided.
@@ -298,9 +279,6 @@ fn main() {
         .set_cores(worker_core_ids)
         .set_batch_size(args.batch_size)
         .add_dispatcher(flow_dispatcher.clone(), |event: FlowEvent| {
-            // Lightweight periodic maintenance
-            expire_flows_now();
-
             match event {
                 FlowEvent::TlsSeen { tuple, rx_core } => {
                     let mode = *MODE.read().unwrap();
@@ -310,19 +288,14 @@ fn main() {
 
                     let num_flows = *NUM_FLOWS.get().unwrap();
 
-                    // Respect num_flows cap first
+                    // num_flows == 0 means install nothing.
                     if num_flows == 0 {
                         return;
                     }
 
-                    // Deduplicate and cap
-                    {
-                        let mut targets = TARGET_FLOWS.lock().unwrap();
-                        if targets.contains_key(&tuple) || targets.len() >= num_flows {
-                            return;
-                        }
-                        // Record when we installed the drop rule for this tuple
-                        targets.insert(tuple.clone(), Instant::now());
+                    // Deduplicate
+                    if TARGET_FLOWS.lock().unwrap().contains(&tuple) {
+                        return;
                     }
 
                     let split_queue = if mode == FlowMode::Split {
@@ -341,6 +314,20 @@ fn main() {
                     // Install, if we have ports
                     let maybe_ports = PORT_IDS.read().unwrap().clone();
                     if let Some(ports) = maybe_ports {
+                        // FIFO eviction
+                        let evicted = {
+                            let mut queue = FLOW_QUEUE.lock().unwrap();
+                            if queue.len() >= num_flows {
+                                queue.pop_front()
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(old) = evicted {
+                            uninstall_entry(&old);
+                            TARGET_FLOWS.lock().unwrap().remove(&old.tuple);
+                        }
+
                         let result = match mode {
                             FlowMode::Drop => install_drop_flow(ports.clone(), &tuple),
                             FlowMode::Split => install_split_flow(ports.clone(), &tuple, split_queue.unwrap()),
@@ -354,9 +341,8 @@ fn main() {
                                     ports: ports.clone(),
                                     flow_ptrs: raw_flows.into_iter().map(FlowPtr).collect(),
                                     handle_ptrs: raw_handles.into_iter().map(HandlePtr).collect(),
-                                    expires_at: Instant::now()
-                                        + Duration::from_secs(*TIMEOUT_SECS.get().unwrap()),
                                 };
+                                TARGET_FLOWS.lock().unwrap().insert(tuple.clone());
                                 FLOW_QUEUE.lock().unwrap().push_back(entry);
                             }
                             Err(e) => eprintln!("install flow failed: {e:?}"),
