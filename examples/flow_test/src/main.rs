@@ -59,6 +59,7 @@ lazy_static! {
 
 static TCP_BYTES: AtomicUsize = AtomicUsize::new(0);
 static UDP_BYTES: AtomicUsize = AtomicUsize::new(0);
+static TLS_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 // Dispatching
 static FLOW_DISPATCHER: OnceLock<Arc<ChannelDispatcher<FlowEvent>>> = OnceLock::new();
@@ -185,6 +186,35 @@ impl Tracked for TransportBytes {
 fn record_transport_bytes(bytes: &TransportBytes) {
     TCP_BYTES.fetch_add(bytes.tcp_bytes, Ordering::Relaxed);
     UDP_BYTES.fetch_add(bytes.udp_bytes, Ordering::Relaxed);
+}
+
+#[datatype]
+struct TlsWireBytes {
+    bytes: usize,
+}
+
+impl TlsWireBytes {
+    #[datatype_fn("TlsWireBytes,level=InL4Conn")]
+    fn update(&mut self, pdu: &L4Pdu) {
+        self.bytes += pdu.mbuf.data_len();
+    }
+}
+
+impl Tracked for TlsWireBytes {
+    fn new(_first_pkt: &L4Pdu) -> Self {
+        Self { bytes: 0 }
+    }
+
+    fn clear(&mut self) {
+        self.bytes = 0;
+    }
+}
+
+#[callback("tls,level=L4Terminated")]
+fn record_tls_bytes(bytes: &TlsWireBytes) {
+    if *MODE.read().unwrap() == FlowMode::Standard {
+        TLS_BYTES.fetch_add(bytes.bytes, Ordering::Relaxed);
+    }
 }
 
 // ===== Filters =====
@@ -465,21 +495,21 @@ fn main() {
         }
     }
 
-    let discarded_packets = DISCARDED_PACKETS.load(Ordering::Relaxed);
-    let discarded_bytes = DISCARDED_BYTES.load(Ordering::Relaxed);
+    let discarded_packets = DISCARDED_PACKETS.load(std::sync::atomic::Ordering::Relaxed);
+    let discarded_bytes = DISCARDED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    println!("{discarded_packets} packets and {discarded_bytes} bytes discarded");
 
     let tcp_bytes = TCP_BYTES.load(Ordering::Relaxed);
     let udp_bytes = UDP_BYTES.load(Ordering::Relaxed);
-    let total_transport = tcp_bytes + udp_bytes;
+    println!(
+        "Transport bytes seen: TCP {tcp_bytes} bytes, UDP {udp_bytes} bytes, total {} bytes",
+        tcp_bytes + udp_bytes,
+    );
 
-    let percent_discarded = if total_transport == 0 {
-        0.0
-    } else {
-        100.0 * discarded_bytes as f64 / total_transport as f64
-    };
-
-    println!("Total transport bytes seen: {total_transport} (tcp: {tcp_bytes}, udp: {udp_bytes})");
-    println!("{discarded_packets} packets and {discarded_bytes} bytes discarded");
+    if *MODE.read().unwrap() == FlowMode::Standard {
+        let tls_bytes = TLS_BYTES.load(Ordering::Relaxed);
+        println!("TLS on-wire bytes seen (Standard mode): {tls_bytes} bytes");
+    }
 
     if args.show_stats {
         if let Some(flow_stats) = final_stats.get(0) {
