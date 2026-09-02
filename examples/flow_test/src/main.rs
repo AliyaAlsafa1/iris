@@ -9,18 +9,23 @@ use iris_core::{
     filter::flow_drop::{install_drop_flow, install_split_flow, uninstall_flow, query_resident_flow, DISCARDED_PACKETS, DISCARDED_BYTES},
     multicore::{ChannelDispatcher, ChannelMode, SharedWorkerThreadSpawner},
     port::PortId,
+    protocols::packet::tcp::TCP_PROTOCOL,
+    protocols::packet::udp::UDP_PROTOCOL,
+    subscription::Tracked,
     CoreId,
     FiveTuple,
+    L4Pdu,
     Runtime,
 };
 
 use iris_core::dpdk::{rte_flow, rte_flow_action_handle};
-use iris_compiler::{callback, input_files, iris_end_macros};
+use iris_compiler::{callback, datatype, datatype_fn, input_files, iris_end_macros};
 
 use std::{
     collections::{HashMap, HashSet, BTreeSet, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock, RwLock},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 mod model;
@@ -51,6 +56,9 @@ lazy_static! {
     static ref TARGET_FLOWS: Mutex<HashSet<FiveTuple>> = Mutex::new(HashSet::new());
     static ref FLOW_QUEUE: Mutex<VecDeque<FlowEntry>> = Mutex::new(VecDeque::new());
 }
+
+static TCP_BYTES: AtomicUsize = AtomicUsize::new(0);
+static UDP_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 // Dispatching
 static FLOW_DISPATCHER: OnceLock<Arc<ChannelDispatcher<FlowEvent>>> = OnceLock::new();
@@ -133,6 +141,50 @@ fn uninstall_entry(entry: &FlowEntry) {
     if let Err(e) = uninstall_flow(entry.ports.clone(), raw_ptrs, raw_handles) {
         eprintln!("Failed to uninstall flow: {:?}", e);
     }
+}
+
+// ===== TCP/UDP byte counting =====
+
+/// Per-connection on-wire byte count, split by transport protocol. Accumulated into the
+/// global `TCP_BYTES`/`UDP_BYTES` totals at `L4Terminated`. This runs independently of the
+/// TLS flow-handling path above; it counts every TCP/UDP frame's full `mbuf.data_len()`,
+/// headers included, regardless of whether the connection was ever admitted or installed.
+#[datatype]
+struct TransportBytes {
+    tcp_bytes: usize,
+    udp_bytes: usize,
+}
+
+impl TransportBytes {
+    #[datatype_fn("TransportBytes,level=InL4Conn")]
+    fn update(&mut self, pdu: &L4Pdu) {
+        let len = pdu.mbuf.data_len();
+        match pdu.ctxt.proto {
+            TCP_PROTOCOL => self.tcp_bytes += len,
+            UDP_PROTOCOL => self.udp_bytes += len,
+            _ => {}
+        }
+    }
+}
+
+impl Tracked for TransportBytes {
+    fn new(_first_pkt: &L4Pdu) -> Self {
+        Self {
+            tcp_bytes: 0,
+            udp_bytes: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.tcp_bytes = 0;
+        self.udp_bytes = 0;
+    }
+}
+
+#[callback("tcp or udp,level=L4Terminated")]
+fn record_transport_bytes(bytes: &TransportBytes) {
+    TCP_BYTES.fetch_add(bytes.tcp_bytes, Ordering::Relaxed);
+    UDP_BYTES.fetch_add(bytes.udp_bytes, Ordering::Relaxed);
 }
 
 // ===== Filters =====
@@ -413,8 +465,20 @@ fn main() {
         }
     }
 
-    let discarded_packets = DISCARDED_PACKETS.load(std::sync::atomic::Ordering::Relaxed);
-    let discarded_bytes = DISCARDED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    let discarded_packets = DISCARDED_PACKETS.load(Ordering::Relaxed);
+    let discarded_bytes = DISCARDED_BYTES.load(Ordering::Relaxed);
+
+    let tcp_bytes = TCP_BYTES.load(Ordering::Relaxed);
+    let udp_bytes = UDP_BYTES.load(Ordering::Relaxed);
+    let total_transport = tcp_bytes + udp_bytes;
+
+    let percent_discarded = if total_transport == 0 {
+        0.0
+    } else {
+        100.0 * discarded_bytes as f64 / total_transport as f64
+    };
+
+    println!("Total transport bytes seen: {total_transport} (tcp: {tcp_bytes}, udp: {udp_bytes})");
     println!("{discarded_packets} packets and {discarded_bytes} bytes discarded");
 
     if args.show_stats {
