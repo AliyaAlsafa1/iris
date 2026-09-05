@@ -1,0 +1,29 @@
+# Offline pcap replay that runs WITHOUT root.
+#
+# `--no-huge --no-pci` makes EAL allocate from ordinary pages and skip PCI probing, so no
+# hugepages, VFIO binding or root are needed. Handy for checking that a subscription's callbacks
+# actually fire before spending time on the testbed.
+#
+# Note this cannot exercise any hardware path: with no `[online]` section `flow_mode` resolves to
+# Standard, so flow_test's install worker returns early and no rte_flow rules are created. What it
+# does verify is the admission side — which callbacks fire, and how often.
+
+main_core = 0
+nb_memory_channels = 6
+
+[mempool]
+capacity = 65_536
+cache_size = 512
+
+[offline]
+pcap = "./traces/small_flows.pcap"
+mtu = 1500
+dpdk_supl_args = ["--no-huge", "--no-pci", "-m", "1024"]
+
+[conntrack]
+max_connections = 10_000_000
+max_out_of_order = 500
+timeout_resolution = 100
+udp_inactivity_timeout = 60_000
+tcp_inactivity_timeout = 300_000
+tcp_establish_timeout = 5000
