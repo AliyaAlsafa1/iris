@@ -119,8 +119,14 @@ where
         println!("Frames read: {}", nb_frames);
         println!("Processed: {} pkts, {} bytes", nb_pkts, nb_bytes);
         println!("CPU time: {:?}ms", cpu_time.as_millis());
-        println!("Flow table entries: {}", flow_table.as_ref().map_or(0, |t| t.len()));
-        println!("Evictions: {}", flow_table.as_ref().map_or(0, |t| t.evictions()));
+        println!(
+            "Flow table entries: {}",
+            flow_table.as_ref().map_or(0, |t| t.len())
+        );
+        println!(
+            "Evictions: {}",
+            flow_table.as_ref().map_or(0, |t| t.evictions())
+        );
     }
 
     pub(crate) fn get_mempool_raw(&self) -> *mut dpdk::rte_mempool {

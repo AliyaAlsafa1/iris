@@ -8,10 +8,10 @@
 // these rows join 1:1 against that example's depth shards / trace if you ever run
 // both against the same capture.
 use clap::Parser;
-use iris_core::{config::load_config, CoreId, Runtime, L4Pdu};
-use iris_datatypes::{TlsHandshake, ConnRecord, connection::clock};
-use iris_datatypes::conn_fts::InterArrivals;
 use iris_compiler::*;
+use iris_core::{config::load_config, CoreId, L4Pdu, Runtime};
+use iris_datatypes::conn_fts::InterArrivals;
+use iris_datatypes::{connection::clock, ConnRecord, TlsHandshake};
 use std::path::PathBuf;
 mod csv_output;
 mod headers;
@@ -21,13 +21,20 @@ use csv_output::LabelRecord;
 /// only ever batches across the (rare) case of the same callback instance being
 /// reused; kept for symmetry with flow_collect's batched writes.
 const LABEL_BATCH_N: usize = 64;
-const WRITER_CORES: &[u32] = &[24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46];
+const WRITER_CORES: &[u32] = &[
+    24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+];
 // ===== CLI =====
 #[derive(Parser, Debug)]
 struct Args {
     /// Path to the runtime config TOML (e.g. configs/online.toml).
-    #[clap(short, long, value_parser, value_name = "FILE",
-           default_value = "./configs/online.toml")]
+    #[clap(
+        short,
+        long,
+        value_parser,
+        value_name = "FILE",
+        default_value = "./configs/online.toml"
+    )]
     config: PathBuf,
     /// Output root for all shards and stats. Takes precedence over the FLOW_OUT_DIR
     /// env var, which takes precedence over the built-in default (/mnt/netdata/).
@@ -71,7 +78,13 @@ impl LabelSweep {
     /// unbound). Signature matches flow_collect's InL4Conn callback; the args are
     /// unused here.
     #[callback_fn("LabelSweep,level=InL4Conn")]
-    fn on_packet(&mut self, _conn: &ConnRecord, _iat: &InterArrivals, _tls: &TlsHandshake, _core_id: &CoreId) -> bool {
+    fn on_packet(
+        &mut self,
+        _conn: &ConnRecord,
+        _iat: &InterArrivals,
+        _tls: &TlsHandshake,
+        _core_id: &CoreId,
+    ) -> bool {
         // Stay subscribed to termination; nothing to collect per packet.
         true
     }
@@ -92,10 +105,7 @@ impl LabelSweep {
         // One row per flow, so this flushes immediately; the >= keeps it correct if
         // a callback instance is ever reused for multiple terminations.
         if self.batch.len() >= LABEL_BATCH_N || !self.batch.is_empty() {
-            csv_output::write_label_batch(
-                std::mem::take(&mut self.batch),
-                core_id,
-            );
+            csv_output::write_label_batch(std::mem::take(&mut self.batch), core_id);
         }
         true
     }
@@ -118,9 +128,7 @@ fn main() {
         csv_output::set_out_dir(s);
     }
     let config = load_config(config_path);
-    let writer_handles = csv_output::init_writer(
-        WRITER_CORES.iter().map(|&c| CoreId(c)).collect(),
-    );
+    let writer_handles = csv_output::init_writer(WRITER_CORES.iter().map(|&c| CoreId(c)).collect());
     let mut runtime: Runtime<SubscribedWrapper> = Runtime::new(config, filter).unwrap();
     runtime.run();
     csv_output::shutdown_writer(writer_handles);

@@ -45,7 +45,10 @@ impl MonotonicWallClock {
     pub fn new() -> Self {
         let wall_at_start = SystemTime::now();
         let mono_at_start = Instant::now();
-        Self { wall_at_start, mono_at_start }
+        Self {
+            wall_at_start,
+            mono_at_start,
+        }
     }
 
     /// Derived wall time for a given monotonic instant, as epoch microseconds.

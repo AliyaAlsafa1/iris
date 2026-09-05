@@ -48,7 +48,9 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{WriterProperties, WriterVersion};
 
 use iris_core::CoreId;
-use iris_core::multicore::{ChannelDispatcher, ChannelMode, DedicatedWorkerThreadSpawner, DedicatedWorkerHandle};
+use iris_core::multicore::{
+    ChannelDispatcher, ChannelMode, DedicatedWorkerHandle, DedicatedWorkerThreadSpawner,
+};
 
 use crate::builders::{FlowColumns, TraceColumns};
 
@@ -144,8 +146,7 @@ fn writer_props() -> WriterProperties {
 
 /// Build a Parquet writer at `path` for the given schema.
 fn parquet_writer(path: &str, schema: Arc<Schema>) -> ParquetSink {
-    let file = File::create(path)
-        .unwrap_or_else(|e| panic!("could not create shard {path}: {e}"));
+    let file = File::create(path).unwrap_or_else(|e| panic!("could not create shard {path}: {e}"));
     ArrowWriter::try_new(file, schema, Some(writer_props()))
         .unwrap_or_else(|e| panic!("could not init parquet writer for {path}: {e}"))
 }
@@ -173,10 +174,10 @@ pub struct Snapshot {
 /// wall-clock arrival time of a single packet. Emitted every packet when --trace.
 #[derive(Clone, Debug, Serialize)]
 pub struct TraceRecord {
-    pub conn_hash: u64,         // full-tuple u64 hash (1st half of the composite connection key)
-    pub first_seen_ts: u64,     // connection first-seen wall clock, us (2nd half of the key)
-    pub snapshot_ts: u64,       // microseconds since UNIX_EPOCH (per-packet arrival)
-    pub cumulative_bytes: u64,  // running orig+resp payload bytes through this packet
+    pub conn_hash: u64, // full-tuple u64 hash (1st half of the composite connection key)
+    pub first_seen_ts: u64, // connection first-seen wall clock, us (2nd half of the key)
+    pub snapshot_ts: u64, // microseconds since UNIX_EPOCH (per-packet arrival)
+    pub cumulative_bytes: u64, // running orig+resp payload bytes through this packet
 }
 
 #[derive(Clone, Serialize)]
@@ -184,7 +185,10 @@ pub enum WriteEvent {
     /// A terminated flow's buffered stream-1 snapshots plus its final label. Each
     /// snapshot is routed to its depth file (by conn.pkt_snapshot) and written
     /// conn + tls + final so columns align with the schema.
-    FlowBatch { snaps: Vec<Snapshot>, label: FinalLabel },
+    FlowBatch {
+        snaps: Vec<Snapshot>,
+        label: FinalLabel,
+    },
     /// Stream-2 per-packet trace records (per-core, no depth split). Never
     /// dispatched under --no-trace.
     TraceBatch { rows: Vec<TraceRecord> },
@@ -207,7 +211,10 @@ impl Sinks {
     fn depth_writer(&mut self, depth: u64) -> &mut ParquetSink {
         let core_idx = self.core_idx;
         self.depth_writers.entry(depth).or_insert_with(|| {
-            let path = format!("{}{DEPTH_PREFIX}{depth}_core_{core_idx}.{SHARD_EXT}", out_dir());
+            let path = format!(
+                "{}{DEPTH_PREFIX}{depth}_core_{core_idx}.{SHARD_EXT}",
+                out_dir()
+            );
             parquet_writer(&path, crate::schema::flow_schema())
         })
     }
@@ -218,12 +225,18 @@ impl Sinks {
     fn close_all(&mut self) {
         for (depth, w) in self.depth_writers.drain() {
             if let Err(e) = w.close() {
-                eprintln!("warning: failed closing depth {depth} shard on core {}: {e}", self.core_idx);
+                eprintln!(
+                    "warning: failed closing depth {depth} shard on core {}: {e}",
+                    self.core_idx
+                );
             }
         }
         if let Some(w) = self.trace.take() {
             if let Err(e) = w.close() {
-                eprintln!("warning: failed closing trace shard on core {}: {e}", self.core_idx);
+                eprintln!(
+                    "warning: failed closing trace shard on core {}: {e}",
+                    self.core_idx
+                );
             }
         }
     }
@@ -242,7 +255,10 @@ static POOL: OnceLock<WriterPool> = OnceLock::new();
 
 /// Spin up one writer thread per core. `trace` mirrors main()'s --trace: when
 /// false, no per-core trace shard is opened and TraceBatch events are never sent.
-pub fn init_writer(worker_cores: Vec<CoreId>, trace: bool) -> Vec<DedicatedWorkerHandle<WriteEvent>> {
+pub fn init_writer(
+    worker_cores: Vec<CoreId>,
+    trace: bool,
+) -> Vec<DedicatedWorkerHandle<WriteEvent>> {
     // Output root resolved here (from --out-dir, FLOW_OUT_DIR, or the default),
     // assumed to already exist on disk.
     println!(
@@ -286,7 +302,10 @@ pub fn init_writer(worker_cores: Vec<CoreId>, trace: bool) -> Vec<DedicatedWorke
                         // coalesces them into full row groups across many flows.
                         let mut by_depth: HashMap<u64, Vec<&Snapshot>> = HashMap::new();
                         for snap in &snaps {
-                            by_depth.entry(snap.conn.pkt_snapshot).or_default().push(snap);
+                            by_depth
+                                .entry(snap.conn.pkt_snapshot)
+                                .or_default()
+                                .push(snap);
                         }
                         for (depth, group) in by_depth {
                             let batch = FlowColumns::build(&group, &label);
@@ -316,7 +335,12 @@ pub fn init_writer(worker_cores: Vec<CoreId>, trace: bool) -> Vec<DedicatedWorke
         handles.push(handle);
     }
     let n = dispatchers.len();
-    POOL.set(WriterPool { dispatchers, sinks: sinks_vec, n }).ok();
+    POOL.set(WriterPool {
+        dispatchers,
+        sinks: sinks_vec,
+        n,
+    })
+    .ok();
     handles
 }
 
@@ -377,10 +401,7 @@ pub fn write_flow_batch(snaps: Vec<Snapshot>, label: FinalLabel, core: &CoreId) 
     }
     if let Some(pool) = POOL.get() {
         let idx = core.raw() as usize % pool.n;
-        let _ = pool.dispatchers[idx].dispatch(
-            WriteEvent::FlowBatch { snaps, label },
-            None,
-        );
+        let _ = pool.dispatchers[idx].dispatch(WriteEvent::FlowBatch { snaps, label }, None);
     }
 }
 
@@ -392,9 +413,6 @@ pub fn write_trace_batch(rows: Vec<TraceRecord>, core: &CoreId) {
     }
     if let Some(pool) = POOL.get() {
         let idx = core.raw() as usize % pool.n;
-        let _ = pool.dispatchers[idx].dispatch(
-            WriteEvent::TraceBatch { rows },
-            None,
-        );
+        let _ = pool.dispatchers[idx].dispatch(WriteEvent::TraceBatch { rows }, None);
     }
 }

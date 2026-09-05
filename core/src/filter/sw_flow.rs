@@ -70,6 +70,12 @@ fn placeholder_tuple() -> FiveTuple {
     }
 }
 
+impl Default for FlowTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FlowTable {
     /// A minimal 1-slot table, used only on the disabled datapath (never hit).
     pub fn new() -> Self {

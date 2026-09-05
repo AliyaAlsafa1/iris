@@ -7,8 +7,7 @@
 use const_format::concatcp;
 
 /// Final per-flow outcome columns.
-pub const FINAL_HEADER: &str =
-    "final_total_payload_bytes,final_duration_ms,final_total_pkts";
+pub const FINAL_HEADER: &str = "final_total_payload_bytes,final_duration_ms,final_total_pkts";
 
 /// Full label row: identifying key + final outcome, newline-terminated.
 pub const LABELS_HEADER: &str = concatcp!("conn_hash,first_seen_ts,", FINAL_HEADER, "\n");

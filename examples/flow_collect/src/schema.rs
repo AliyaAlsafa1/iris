@@ -21,8 +21,8 @@
 // All columns are non-nullable: every row always carries every field (the
 // feature extractors substitute 0/0.0 rather than emitting nulls).
 
-use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema};
+use std::sync::Arc;
 
 fn f(name: &str, dt: DataType) -> Field {
     // Non-nullable: the collector never emits a null cell.

@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Result};
 
-pub(crate) const SPLIT_HDR_SIZE: u16 = 64; 
+pub(crate) const SPLIT_HDR_SIZE: u16 = 64;
 
 /// The Iris runtime.
 ///

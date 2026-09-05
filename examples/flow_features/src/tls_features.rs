@@ -1,46 +1,46 @@
+use crate::hash_utils::hash_str;
 use iris_datatypes::TlsHandshake;
 use serde::Serialize;
-use crate::hash_utils::hash_str;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TlsFeatures {
     // --- ClientHello ---
-    pub has_client_hello:             u8,   // 1 if a ClientHello was observed
-    pub client_version:               u16,  // legacy record version from ClientHello
-    pub client_num_supported_groups:  u16,  // number of named groups in supported_groups extension
-    pub client_num_sig_algs:          u16,  // number of signature algorithms advertised
-    pub client_num_alpn_protocols:    u16,  // number of ALPN protocols advertised
-    pub client_num_key_shares:        u16,  // number of key share entries (TLS 1.3)
-    pub client_num_supported_vers:    u16,  // number of supported_versions entries (TLS 1.3)
-    pub client_has_sni:               u8,   // 1 if SNI extension is present
-    pub client_sni_hash:              u64,  // bucketed hash of SNI hostname, 0 if absent
-    pub client_sni_len:               u16,  // byte length of the SNI hostname, 0 if absent
-    pub client_has_session_id:        u8,   // 1 if session_id is non-empty (session resumption hint)
-    pub client_session_id_len:        u8,   // length of session_id in bytes (0–32)
-    pub client_has_compression:       u8,   // 1 if any non-null compression method is offered
-    pub client_has_alpn:              u8,   // 1 if ALPN extension is present
-    pub client_has_key_share:         u8,   // 1 if key_share extension is present (TLS 1.3)
-    pub client_has_supported_vers:    u8,   // 1 if supported_versions extension is present (TLS 1.3)
+    pub has_client_hello: u8,             // 1 if a ClientHello was observed
+    pub client_version: u16,              // legacy record version from ClientHello
+    pub client_num_supported_groups: u16, // number of named groups in supported_groups extension
+    pub client_num_sig_algs: u16,         // number of signature algorithms advertised
+    pub client_num_alpn_protocols: u16,   // number of ALPN protocols advertised
+    pub client_num_key_shares: u16,       // number of key share entries (TLS 1.3)
+    pub client_num_supported_vers: u16,   // number of supported_versions entries (TLS 1.3)
+    pub client_has_sni: u8,               // 1 if SNI extension is present
+    pub client_sni_hash: u64,             // bucketed hash of SNI hostname, 0 if absent
+    pub client_sni_len: u16,              // byte length of the SNI hostname, 0 if absent
+    pub client_has_session_id: u8,        // 1 if session_id is non-empty (session resumption hint)
+    pub client_session_id_len: u8,        // length of session_id in bytes (0–32)
+    pub client_has_compression: u8,       // 1 if any non-null compression method is offered
+    pub client_has_alpn: u8,              // 1 if ALPN extension is present
+    pub client_has_key_share: u8,         // 1 if key_share extension is present (TLS 1.3)
+    pub client_has_supported_vers: u8,    // 1 if supported_versions extension is present (TLS 1.3)
 
     // --- ServerHello ---
-    pub has_server_hello:             u8,   // 1 if a ServerHello was observed
-    pub server_version:               u16,  // legacy record version from ServerHello
-    pub server_cipher_suite:          u16,  // chosen cipher suite ID
-    pub server_compression_alg:       u8,   // chosen compression method (0 = null)
-    pub server_has_alpn:              u8,   // 1 if server sent ALPN extension
-    pub server_has_key_share:         u8,   // 1 if server sent key_share extension (TLS 1.3)
-    pub server_has_selected_vers:     u8,   // 1 if server sent supported_versions extension (TLS 1.3)
+    pub has_server_hello: u8,         // 1 if a ServerHello was observed
+    pub server_version: u16,          // legacy record version from ServerHello
+    pub server_cipher_suite: u16,     // chosen cipher suite ID
+    pub server_compression_alg: u8,   // chosen compression method (0 = null)
+    pub server_has_alpn: u8,          // 1 if server sent ALPN extension
+    pub server_has_key_share: u8,     // 1 if server sent key_share extension (TLS 1.3)
+    pub server_has_selected_vers: u8, // 1 if server sent supported_versions extension (TLS 1.3)
 
     // --- Certificates ---
-    pub num_server_certs:             u16,  // number of certificates in the server certificate chain
-    pub num_client_certs:             u16,  // number of certificates in the client certificate chain
-    pub server_cert0_len:             u32,  // raw byte length of the leaf server certificate, 0 if absent
-    pub server_cert1_len:             u32,  // raw byte length of the first intermediate cert, 0 if absent
+    pub num_server_certs: u16, // number of certificates in the server certificate chain
+    pub num_client_certs: u16, // number of certificates in the client certificate chain
+    pub server_cert0_len: u32, // raw byte length of the leaf server certificate, 0 if absent
+    pub server_cert1_len: u32, // raw byte length of the first intermediate cert, 0 if absent
 
     // --- Key exchange ---
-    pub has_server_kex:               u8,   // 1 if ServerKeyExchange was observed (TLS 1.2-)
-    pub has_client_kex:               u8,   // 1 if ClientKeyExchange was observed (TLS 1.2-)
-    pub kex_type:                     u8,   // 0=none/unknown 1=ECDH 2=DH 3=RSA
+    pub has_server_kex: u8, // 1 if ServerKeyExchange was observed (TLS 1.2-)
+    pub has_client_kex: u8, // 1 if ClientKeyExchange was observed (TLS 1.2-)
+    pub kex_type: u8,       // 0=none/unknown 1=ECDH 2=DH 3=RSA
 }
 
 impl TlsFeatures {
@@ -119,8 +119,16 @@ impl TlsFeatures {
         // --- Certificate fields ---
         let num_server_certs = tls.server_certificates.len() as u16;
         let num_client_certs = tls.client_certificates.len() as u16;
-        let server_cert0_len = tls.server_certificates.first().map(|c| c.raw.len() as u32).unwrap_or(0);
-        let server_cert1_len = tls.server_certificates.get(1).map(|c| c.raw.len() as u32).unwrap_or(0);
+        let server_cert0_len = tls
+            .server_certificates
+            .first()
+            .map(|c| c.raw.len() as u32)
+            .unwrap_or(0);
+        let server_cert1_len = tls
+            .server_certificates
+            .get(1)
+            .map(|c| c.raw.len() as u32)
+            .unwrap_or(0);
 
         // --- Key exchange fields ---
         use iris_core::protocols::stream::tls::{ClientKeyExchange, ServerKeyExchange};
@@ -128,12 +136,12 @@ impl TlsFeatures {
         let has_client_kex = tls.client_key_exchange.is_some() as u8;
         let kex_type: u8 = match &tls.server_key_exchange {
             Some(ServerKeyExchange::Ecdh(_)) => 1,
-            Some(ServerKeyExchange::Dh(_))   => 2,
-            Some(ServerKeyExchange::Rsa(_))  => 3,
+            Some(ServerKeyExchange::Dh(_)) => 2,
+            Some(ServerKeyExchange::Rsa(_)) => 3,
             _ => match &tls.client_key_exchange {
                 Some(ClientKeyExchange::Ecdh(_)) => 1,
-                Some(ClientKeyExchange::Dh(_))   => 2,
-                Some(ClientKeyExchange::Rsa(_))  => 3,
+                Some(ClientKeyExchange::Dh(_)) => 2,
+                Some(ClientKeyExchange::Rsa(_)) => 3,
                 _ => 0,
             },
         };

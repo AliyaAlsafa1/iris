@@ -1,21 +1,23 @@
 use std::ffi::CStr;
 use std::mem;
+use std::net::IpAddr;
 use std::ptr;
-use std::net::{IpAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{bail, Result};
-use crate::FiveTuple;
 use crate::port::PortId;
 use crate::protocols::packet::tcp::TCP_PROTOCOL;
 use crate::protocols::packet::udp::UDP_PROTOCOL;
+use crate::FiveTuple;
+use anyhow::{bail, Result};
 
 use crate::dpdk;
-use crate::dpdk::{rte_flow, rte_flow_item, rte_flow_attr, rte_flow_error, rte_flow_create,
-    rte_flow_destroy, rte_flow_query_count, rte_flow_action, rte_flow_item_ipv4, rte_flow_item_ipv6,
-    rte_flow_item_tcp, rte_flow_item_udp, rte_flow_action_queue, rte_flow_action_count,
-    rte_flow_action_handle, rte_flow_action_handle_create, rte_flow_action_handle_destroy,
-    rte_flow_action_handle_query, rte_flow_indir_action_conf};
+use crate::dpdk::{
+    rte_flow, rte_flow_action, rte_flow_action_count, rte_flow_action_handle,
+    rte_flow_action_handle_create, rte_flow_action_handle_destroy, rte_flow_action_handle_query,
+    rte_flow_action_queue, rte_flow_attr, rte_flow_create, rte_flow_destroy, rte_flow_error,
+    rte_flow_indir_action_conf, rte_flow_item, rte_flow_item_ipv4, rte_flow_item_ipv6,
+    rte_flow_item_tcp, rte_flow_item_udp, rte_flow_query_count,
+};
 
 const BASE_GROUP: u32 = 2;
 const LAST_GROUP: u32 = 2;
@@ -29,11 +31,14 @@ const UDP: u8 = 17;
 /// time (on eviction and at teardown). Incremented in `uninstall_flow`, read
 /// by the binary at shutdown to report totals instead of printing per rule.
 pub static DISCARDED_PACKETS: AtomicU64 = AtomicU64::new(0);
-pub static DISCARDED_BYTES:   AtomicU64 = AtomicU64::new(0);
+pub static DISCARDED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Returns a table in [2..=14] using dest port low nibble for TCP/UDP.
 /// Non-TCP/UDP fall back to BASE_GROUP.
-/// CURRENTLY UNUSED FOR TESTING !
+/// CURRENTLY UNUSED FOR TESTING ! Kept, with the consts above, as scaffolding for
+/// spreading drop rules across groups; NUM_GROUPS is 1 until LAST_GROUP moves.
+#[allow(dead_code)]
+#[allow(clippy::modulo_one)]
 fn find_table(tuple: &FiveTuple) -> u32 {
     let nibble_u32 = match tuple.proto as u8 {
         TCP | UDP => u32::from(tuple.resp.port() & L4_LSB_MASK),
@@ -55,10 +60,10 @@ struct PatternStorage {
     ipv4_mask: rte_flow_item_ipv4,
     ipv6_spec: rte_flow_item_ipv6,
     ipv6_mask: rte_flow_item_ipv6,
-    tcp_spec:  rte_flow_item_tcp,
-    tcp_mask:  rte_flow_item_tcp,
-    udp_spec:  rte_flow_item_udp,
-    udp_mask:  rte_flow_item_udp,
+    tcp_spec: rte_flow_item_tcp,
+    tcp_mask: rte_flow_item_tcp,
+    udp_spec: rte_flow_item_udp,
+    udp_mask: rte_flow_item_udp,
 }
 
 impl PatternStorage {
@@ -69,10 +74,10 @@ impl PatternStorage {
                 ipv4_mask: mem::zeroed(),
                 ipv6_spec: mem::zeroed(),
                 ipv6_mask: mem::zeroed(),
-                tcp_spec:  mem::zeroed(),
-                tcp_mask:  mem::zeroed(),
-                udp_spec:  mem::zeroed(),
-                udp_mask:  mem::zeroed(),
+                tcp_spec: mem::zeroed(),
+                tcp_mask: mem::zeroed(),
+                udp_spec: mem::zeroed(),
+                udp_mask: mem::zeroed(),
             }
         }
     }
@@ -80,10 +85,7 @@ impl PatternStorage {
 
 /// Builds a pattern buffer [ETH + IP + L4 + END] from a FiveTuple.
 /// Returns the filled pattern array and takes ownership of storage to keep it alive.
-fn build_pattern<'a>(
-    tuple:   &FiveTuple,
-    storage: &'a mut PatternStorage,
-) -> Result<[rte_flow_item; 5]> {
+fn build_pattern(tuple: &FiveTuple, storage: &mut PatternStorage) -> Result<[rte_flow_item; 5]> {
     let (src_ip, dst_ip) = (tuple.orig.ip(), tuple.resp.ip());
     let (src_port, dst_port) = (tuple.orig.port(), tuple.resp.port());
 
@@ -197,15 +199,16 @@ fn create_count_handle(port_id: u16) -> Result<*mut rte_flow_action_handle> {
     };
 
     let mut error: rte_flow_error = unsafe { mem::zeroed() };
-    let handle = unsafe {
-        rte_flow_action_handle_create(port_id, &conf, &count_action, &mut error)
-    };
+    let handle =
+        unsafe { rte_flow_action_handle_create(port_id, &conf, &count_action, &mut error) };
 
     if handle.is_null() {
-        let msg = unsafe {
-            CStr::from_ptr(error.message).to_string_lossy().into_owned()
-        };
-        bail!("rte_flow_action_handle_create failed on port {}: {}", port_id, msg);
+        let msg = unsafe { CStr::from_ptr(error.message).to_string_lossy().into_owned() };
+        bail!(
+            "rte_flow_action_handle_create failed on port {}: {}",
+            port_id,
+            msg
+        );
     }
 
     Ok(handle)
@@ -214,8 +217,8 @@ fn create_count_handle(port_id: u16) -> Result<*mut rte_flow_action_handle> {
 /// Installs a flow rule (forward + reverse) on each port.
 fn install<F>(
     port_ids: &[PortId],
-    tuple:    &FiveTuple,
-    attr:     &rte_flow_attr,
+    tuple: &FiveTuple,
+    attr: &rte_flow_attr,
     make_actions: F,
 ) -> Result<(Vec<*mut rte_flow>, Vec<*mut rte_flow_action_handle>)>
 where
@@ -234,6 +237,9 @@ where
 
         let mut error: rte_flow_error = unsafe { mem::zeroed() };
 
+        // Read unconditionally: hw-assist-cycle-eval consumes this for its
+        // rule-install/uninstall cycle counters.
+        #[allow(unused_variables)]
         let start = unsafe { dpdk::rte_rdtsc() };
         let flow = unsafe {
             rte_flow_create(
@@ -250,19 +256,11 @@ where
         //println!("Latency (cycles): {}", duration);
 
         if flow.is_null() {
-            let msg = unsafe {
-                CStr::from_ptr(error.message)
-                    .to_string_lossy()
-                    .into_owned()
-            };
+            let msg = unsafe { CStr::from_ptr(error.message).to_string_lossy().into_owned() };
             // Clean up the handle we just created since the rule failed.
             let mut derr: rte_flow_error = unsafe { mem::zeroed() };
             unsafe { rte_flow_action_handle_destroy(port_id.raw(), handle, &mut derr) };
-            anyhow::bail!(
-                "Failed to install flow on port {}: {}",
-                port_id.raw(),
-                msg
-            );
+            anyhow::bail!("Failed to install flow on port {}: {}", port_id.raw(), msg);
         }
 
         flows.push(flow);
@@ -284,6 +282,9 @@ where
         let actions = make_actions(handle);
 
         let mut error_rev: rte_flow_error = unsafe { mem::zeroed() };
+        // Read unconditionally: hw-assist-cycle-eval consumes this for its
+        // rule-install/uninstall cycle counters.
+        #[allow(unused_variables)]
         let start = unsafe { dpdk::rte_rdtsc() };
         let flow_rev = unsafe {
             rte_flow_create(
@@ -307,11 +308,7 @@ where
             };
             let mut derr: rte_flow_error = unsafe { mem::zeroed() };
             unsafe { rte_flow_action_handle_destroy(port_id.raw(), handle, &mut derr) };
-            anyhow::bail!(
-                "Failed to install flow on port {}: {}",
-                port_id.raw(),
-                msg
-            );
+            anyhow::bail!("Failed to install flow on port {}: {}", port_id.raw(), msg);
         }
 
         flows.push(flow_rev);
@@ -323,7 +320,7 @@ where
 
 pub fn install_drop_flow(
     port_ids: Vec<PortId>,
-    tuple:    &FiveTuple,
+    tuple: &FiveTuple,
 ) -> Result<(Vec<*mut rte_flow>, Vec<*mut rte_flow_action_handle>)> {
     install(&port_ids, tuple, &ingress_attr(1, 0), |handle| {
         vec![
@@ -345,7 +342,7 @@ pub fn install_drop_flow(
 
 pub fn install_split_flow(
     port_ids: Vec<PortId>,
-    tuple:    &FiveTuple,
+    tuple: &FiveTuple,
     queue_id: u16,
 ) -> Result<(Vec<*mut rte_flow>, Vec<*mut rte_flow_action_handle>)> {
     // queue conf must outlive the actions array; box it so the pointer
@@ -361,11 +358,11 @@ pub fn install_split_flow(
             },
             rte_flow_action {
                 type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_QUEUE,
-                conf:  queue_ptr as *const _,
+                conf: queue_ptr as *const _,
             },
             rte_flow_action {
                 type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_END,
-                conf:  ptr::null(),
+                conf: ptr::null(),
             },
         ]
     });
@@ -385,7 +382,8 @@ pub fn uninstall_flow(
     flows: Vec<*mut rte_flow>,
     handles: Vec<*mut rte_flow_action_handle>,
 ) -> Result<()> {
-    if (port_ids.len() * 2) != flows.len() { // Must double length of port_ids to account for forward/rev flows
+    if (port_ids.len() * 2) != flows.len() {
+        // Must double length of port_ids to account for forward/rev flows
         bail!(
             "Mismatched lengths: {} ports but {} flows",
             port_ids.len(),
@@ -416,14 +414,14 @@ pub fn uninstall_flow(
                     DISCARDED_PACKETS.fetch_add(hits, Ordering::Relaxed);
                     DISCARDED_BYTES.fetch_add(bytes, Ordering::Relaxed);
                 }
-                Err(e) => eprintln!(
-                    "Port {} flow stats unavailable: {}",
-                    port_id.raw(), e
-                ),
+                Err(e) => eprintln!("Port {} flow stats unavailable: {}", port_id.raw(), e),
             }
         }
 
         let mut error: rte_flow_error = unsafe { mem::zeroed() };
+        // Read unconditionally: hw-assist-cycle-eval consumes this for its
+        // rule-install/uninstall cycle counters.
+        #[allow(unused_variables)]
         let start = unsafe { dpdk::rte_rdtsc() };
         let ret = unsafe { rte_flow_destroy(port_id.raw(), *flow, &mut error) };
 
@@ -432,9 +430,7 @@ pub fn uninstall_flow(
         //println!("Uninstall latency (cycles): {}", duration);
 
         if ret != 0 {
-            let msg = unsafe {
-                CStr::from_ptr(error.message).to_string_lossy().into_owned()
-            };
+            let msg = unsafe { CStr::from_ptr(error.message).to_string_lossy().into_owned() };
             bail!(
                 "Failed to uninstall flow on port {}: {}",
                 port_id.raw(),
@@ -446,16 +442,13 @@ pub fn uninstall_flow(
         // is gone.
         if !handle.is_null() {
             let mut derr: rte_flow_error = unsafe { mem::zeroed() };
-            let dret = unsafe {
-                rte_flow_action_handle_destroy(port_id.raw(), handle, &mut derr)
-            };
+            let dret = unsafe { rte_flow_action_handle_destroy(port_id.raw(), handle, &mut derr) };
             if dret != 0 {
-                let msg = unsafe {
-                    CStr::from_ptr(derr.message).to_string_lossy().into_owned()
-                };
+                let msg = unsafe { CStr::from_ptr(derr.message).to_string_lossy().into_owned() };
                 eprintln!(
                     "Failed to destroy count handle on port {}: {}",
-                    port_id.raw(), msg
+                    port_id.raw(),
+                    msg
                 );
             }
         }
@@ -506,7 +499,8 @@ pub fn query_resident_flow(
             }
             Err(e) => eprintln!(
                 "Port {} resident flow stats unavailable: {}",
-                port_id.raw(), e
+                port_id.raw(),
+                e
             ),
         }
     }
@@ -514,10 +508,7 @@ pub fn query_resident_flow(
     Ok(())
 }
 
-fn query_flow_stats(
-    port_id: u16,
-    handle: *mut rte_flow_action_handle,
-) -> Result<(u64, u64)> {
+fn query_flow_stats(port_id: u16, handle: *mut rte_flow_action_handle) -> Result<(u64, u64)> {
     let mut count_data: rte_flow_query_count = unsafe { mem::zeroed() };
 
     let mut error: rte_flow_error = unsafe { mem::zeroed() };
@@ -532,14 +523,24 @@ fn query_flow_stats(
     };
 
     if ret != 0 {
-        let msg = unsafe {
-            CStr::from_ptr(error.message).to_string_lossy().into_owned()
-        };
-        bail!("rte_flow_action_handle_query failed on port {}: {}", port_id, msg);
+        let msg = unsafe { CStr::from_ptr(error.message).to_string_lossy().into_owned() };
+        bail!(
+            "rte_flow_action_handle_query failed on port {}: {}",
+            port_id,
+            msg
+        );
     }
 
-    let hits  = if count_data.hits_set()  != 0 { count_data.hits  } else { 0 };
-    let bytes = if count_data.bytes_set() != 0 { count_data.bytes } else { 0 };
+    let hits = if count_data.hits_set() != 0 {
+        count_data.hits
+    } else {
+        0
+    };
+    let bytes = if count_data.bytes_set() != 0 {
+        count_data.bytes
+    } else {
+        0
+    };
 
     Ok((hits, bytes))
 }

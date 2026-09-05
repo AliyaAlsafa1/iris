@@ -71,7 +71,10 @@ impl FiveTuple {
             (ip << 16) ^ (sa.port() as u64)
         }
 
-        let (hi, lo) = (cmp::max(self.orig, self.resp), cmp::min(self.orig, self.resp));
+        let (hi, lo) = (
+            cmp::max(self.orig, self.resp),
+            cmp::min(self.orig, self.resp),
+        );
         let mut h = FNV_OFFSET;
         h = mix(h, hash_sockaddr(hi));
         h = mix(h, hash_sockaddr(lo));

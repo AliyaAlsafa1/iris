@@ -22,7 +22,12 @@ pub(crate) struct Mempool {
 
 impl Mempool {
     /// Creates a new mbuf pool on socket_id
-    pub(crate) fn new(config: &MempoolConfig, socket_id: SocketId, mtu: usize, prefix: &str) -> Result<Self> {
+    pub(crate) fn new(
+        config: &MempoolConfig,
+        socket_id: SocketId,
+        mtu: usize,
+        prefix: &str,
+    ) -> Result<Self> {
         let data_room = crate::port::mtu_to_max_frame_len(mtu as u32);
         let data_room_aligned = round_up(data_room, RX_BUF_ALIGN);
         let mbuf_size = data_room_aligned + dpdk::RTE_PKTMBUF_HEADROOM;
@@ -117,8 +122,17 @@ impl SplitMempool {
         hdr_len: u16,
         mtu: usize,
     ) -> Result<Self> {
-        let header = Mempool::new(&config, socket_id, hdr_len as usize, "split_header")?;
-        let remainder = Mempool::new(&config, socket_id, mtu - (hdr_len as usize), "split_remainder")?;
-        Ok(SplitMempool { header, remainder, hdr_len })
+        let header = Mempool::new(config, socket_id, hdr_len as usize, "split_header")?;
+        let remainder = Mempool::new(
+            config,
+            socket_id,
+            mtu - (hdr_len as usize),
+            "split_remainder",
+        )?;
+        Ok(SplitMempool {
+            header,
+            remainder,
+            hdr_len,
+        })
     }
 }

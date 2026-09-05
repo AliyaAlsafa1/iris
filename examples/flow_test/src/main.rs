@@ -1,31 +1,31 @@
 use clap::{ArgAction, Parser, ValueEnum};
-use iris_datatypes::{PktCount, TlsHandshake, ConnRecord};
 use iris_datatypes::conn_fts::InterArrivals;
+use iris_datatypes::{ConnRecord, PktCount, TlsHandshake};
 use lazy_static::lazy_static;
 use serde::Serialize;
 
 use iris_core::{
-    config::{default_config, load_config, FlowMode},
-    filter::flow_drop::{install_drop_flow, install_split_flow, uninstall_flow, query_resident_flow, DISCARDED_PACKETS, DISCARDED_BYTES},
+    CoreId, FiveTuple, L4Pdu, Runtime,
+    config::{FlowMode, default_config, load_config},
+    filter::flow_drop::{
+        DISCARDED_BYTES, DISCARDED_PACKETS, install_drop_flow, install_split_flow,
+        query_resident_flow, uninstall_flow,
+    },
     multicore::{ChannelDispatcher, ChannelMode, SharedWorkerThreadSpawner},
     port::PortId,
     protocols::packet::tcp::TCP_PROTOCOL,
     protocols::packet::udp::UDP_PROTOCOL,
     subscription::Tracked,
-    CoreId,
-    FiveTuple,
-    L4Pdu,
-    Runtime,
 };
 
-use iris_core::dpdk::{rte_flow, rte_flow_action_handle};
 use iris_compiler::{callback, datatype, datatype_fn, input_files, iris_end_macros};
+use iris_core::dpdk::{rte_flow, rte_flow_action_handle};
 
 use std::{
-    collections::{HashMap, HashSet, BTreeSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock, RwLock},
     sync::atomic::{AtomicUsize, Ordering},
+    sync::{Arc, Mutex, OnceLock, RwLock},
 };
 
 mod model;
@@ -82,7 +82,6 @@ enum ChannelModeArg {
     Shared,
 }
 
-
 #[derive(Parser, Debug)]
 struct Args {
     #[clap(short, long, value_parser, value_name = "FILE")]
@@ -129,8 +128,6 @@ struct Args {
     #[clap(long, value_name = "COUNT", default_value = "100")]
     num_flows: usize,
 }
-
-
 
 // ===== Helpers =====
 
@@ -236,7 +233,8 @@ fn tls_cb(
 
     let is_elephant = if *USE_MODEL.get().unwrap_or(&false) {
         let conn_hash = conn.five_tuple.conn_hash();
-        let first_seen_ts = conn.first_seen_wall
+        let first_seen_ts = conn
+            .first_seen_wall
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as u64;
@@ -272,7 +270,6 @@ fn tls_cb(
 
     true
 }
-
 
 // ===== Main =====
 
@@ -314,7 +311,10 @@ fn main() {
         ChannelModeArg::Shared => ChannelMode::Shared,
     };
 
-    let flow_mode = config.online.as_ref().map_or(FlowMode::Standard, |o| o.flow_mode);
+    let flow_mode = config
+        .online
+        .as_ref()
+        .map_or(FlowMode::Standard, |o| o.flow_mode);
     *MODE.write().unwrap() = flow_mode;
     println!(
         "resolved flow_mode = {:?} (online section present: {})",
@@ -336,10 +336,7 @@ fn main() {
                     .into_iter()
                     .enumerate()
                 {
-                    split_queues.insert(
-                        CoreId(core),
-                        (i as u16) * 2 + 1,
-                    );
+                    split_queues.insert(CoreId(core), (i as u16) * 2 + 1);
                 }
             }
         }
@@ -425,7 +422,9 @@ fn main() {
 
                         let result = match mode {
                             FlowMode::Drop => install_drop_flow(ports.clone(), &tuple),
-                            FlowMode::Split => install_split_flow(ports.clone(), &tuple, split_queue.unwrap()),
+                            FlowMode::Split => {
+                                install_split_flow(ports.clone(), &tuple, split_queue.unwrap())
+                            }
                             FlowMode::Standard => return,
                         };
 
@@ -485,8 +484,7 @@ fn main() {
     {
         let queue = FLOW_QUEUE.lock().unwrap();
         for entry in queue.iter() {
-            let raw_ptrs: Vec<*mut rte_flow> =
-                entry.flow_ptrs.iter().map(|fp| fp.0).collect();
+            let raw_ptrs: Vec<*mut rte_flow> = entry.flow_ptrs.iter().map(|fp| fp.0).collect();
             let raw_handles: Vec<*mut rte_flow_action_handle> =
                 entry.handle_ptrs.iter().map(|hp| hp.0).collect();
             if let Err(e) = query_resident_flow(&entry.ports, &raw_ptrs, &raw_handles) {

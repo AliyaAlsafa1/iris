@@ -12,13 +12,13 @@
 // expected) for these batches to be small -- a terminated flow contributes only
 // a handful of stream-1 rows, and a trace batch is TRACE_BATCH_N packets.
 
-use std::sync::Arc;
 use arrow::array::{
-    ArrayRef, Float64Array, RecordBatch, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    ArrayRef, Float64Array, RecordBatch, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
+use std::sync::Arc;
 
-use crate::schema;
 use crate::csv_output::{FinalLabel, Snapshot, TraceRecord};
+use crate::schema;
 
 pub struct FlowColumns;
 
@@ -155,7 +155,9 @@ impl FlowColumns {
 
         // ---- FinalLabel (broadcast: same value on every row of this flow) ----
         let mut columns = columns;
-        columns.push(Arc::new(UInt64Array::from(vec![label.final_total_payload_bytes; n])) as ArrayRef);
+        columns.push(
+            Arc::new(UInt64Array::from(vec![label.final_total_payload_bytes; n])) as ArrayRef,
+        );
         columns.push(Arc::new(UInt64Array::from(vec![label.final_duration_ms; n])) as ArrayRef);
         columns.push(Arc::new(UInt64Array::from(vec![label.final_total_pkts; n])) as ArrayRef);
 

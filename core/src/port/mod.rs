@@ -203,7 +203,7 @@ impl Port {
     pub(crate) fn init(
         &self,
         standard_mempools: &mut BTreeMap<SocketId, Mempool>,
-        split_mempools: &mut BTreeMap<SocketId, SplitMempool>, 
+        split_mempools: &mut BTreeMap<SocketId, SplitMempool>,
         nb_rxd: usize,
         mtu: usize,
         promiscuous: bool,
@@ -375,8 +375,13 @@ impl Port {
         }
 
         // turns on buffer split if supported and actually used
-        let has_split_queues = self.queue_map.keys().any(|rxq| rxq.ty == RxQueueType::Split);
-        if has_split_queues && dev_info.rx_offload_capa & dpdk::RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT as u64 != 0 {
+        let has_split_queues = self
+            .queue_map
+            .keys()
+            .any(|rxq| rxq.ty == RxQueueType::Split);
+        if has_split_queues
+            && dev_info.rx_offload_capa & dpdk::RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT as u64 != 0
+        {
             port_conf.rxmode.offloads |= dpdk::RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT as u64;
             port_conf.rxmode.offloads |= dpdk::RTE_ETH_RX_OFFLOAD_SCATTER as u64;
         }
@@ -441,12 +446,8 @@ impl Port {
     ) -> Result<()> {
         for rxqueue in self.queue_map.keys() {
             match rxqueue.ty {
-                RxQueueType::Split => {
-                    self.setup_split_queue(rxqueue, split_mempool, nb_rxd)?
-                }
-                _ => {
-                    self.setup_standard_queue(rxqueue, standard_mempool, nb_rxd)?
-                }
+                RxQueueType::Split => self.setup_split_queue(rxqueue, split_mempool, nb_rxd)?,
+                _ => self.setup_standard_queue(rxqueue, standard_mempool, nb_rxd)?,
             };
         }
 
@@ -468,7 +469,8 @@ impl Port {
         rx_segs[1].split.mp = split_mempool.remainder.raw_mut();
 
         let mut rxq_conf: dpdk::rte_eth_rxconf = unsafe { mem::zeroed() };
-        rxq_conf.offloads = dpdk::RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT as u64 | dpdk::RTE_ETH_RX_OFFLOAD_SCATTER as u64;
+        rxq_conf.offloads =
+            dpdk::RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT as u64 | dpdk::RTE_ETH_RX_OFFLOAD_SCATTER as u64;
         rxq_conf.rx_nseg = 2;
         rxq_conf.rx_seg = rx_segs.as_mut_ptr();
 
@@ -542,7 +544,7 @@ pub(crate) enum RxQueueType {
     /// Throwaway
     Sink,
     /// Packets backed by buffer segmentation
-    Split
+    Split,
 }
 
 impl fmt::Display for RxQueueType {

@@ -3,12 +3,14 @@
 // kind of row here (the per-flow label), so a core writes to exactly one file.
 use crate::headers::LABELS_HEADER;
 use csv::Writer;
+use iris_core::multicore::{
+    ChannelDispatcher, ChannelMode, DedicatedWorkerHandle, DedicatedWorkerThreadSpawner,
+};
+use iris_core::CoreId;
 use serde::Serialize;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::{Arc, Mutex, OnceLock};
-use iris_core::CoreId;
-use iris_core::multicore::{ChannelDispatcher, ChannelMode, DedicatedWorkerThreadSpawner, DedicatedWorkerHandle};
 
 const WRITE_BUF_CAP: usize = 1 << 20;
 const CHANNEL_CAP: usize = 1 << 18;
@@ -73,13 +75,14 @@ type ZstdCsv = Writer<zstd::stream::AutoFinishEncoder<'static, BufWriter<File>>>
 
 /// Build a headerless, zstd-framed CSV writer at `path`.
 fn zstd_csv_writer(path: &str) -> ZstdCsv {
-    let file = File::create(path)
-        .unwrap_or_else(|e| panic!("could not create shard {path}: {e}"));
+    let file = File::create(path).unwrap_or_else(|e| panic!("could not create shard {path}: {e}"));
     let buf = BufWriter::with_capacity(WRITE_BUF_CAP, file);
     let enc = zstd::stream::Encoder::new(buf, ZSTD_LEVEL)
         .unwrap_or_else(|e| panic!("could not init zstd encoder for {path}: {e}"))
         .auto_finish();
-    csv::WriterBuilder::new().has_headers(false).from_writer(enc)
+    csv::WriterBuilder::new()
+        .has_headers(false)
+        .from_writer(enc)
 }
 
 /// One per-flow label row: identifying key (conn_hash, first_seen_ts) + final
@@ -87,11 +90,11 @@ fn zstd_csv_writer(path: &str) -> ZstdCsv {
 /// are written headerless and serde emits fields in declaration order.
 #[derive(Clone, Debug, Serialize)]
 pub struct LabelRecord {
-    pub conn_hash: u64,                  // full-tuple u64 hash (1st half of the composite key)
-    pub first_seen_ts: u64,              // connection first-seen wall clock, us (2nd half of the key)
-    pub final_total_payload_bytes: u64,  // orig+resp payload bytes over the whole flow
-    pub final_duration_ms: u64,          // first-to-last packet span (ms)
-    pub final_total_pkts: u64,           // total packets over the whole flow
+    pub conn_hash: u64,     // full-tuple u64 hash (1st half of the composite key)
+    pub first_seen_ts: u64, // connection first-seen wall clock, us (2nd half of the key)
+    pub final_total_payload_bytes: u64, // orig+resp payload bytes over the whole flow
+    pub final_duration_ms: u64, // first-to-last packet span (ms)
+    pub final_total_pkts: u64, // total packets over the whole flow
 }
 
 #[derive(Clone, Serialize)]
@@ -200,10 +203,7 @@ pub fn write_label_batch(rows: Vec<LabelRecord>, core: &CoreId) {
     }
     if let Some(pool) = POOL.get() {
         let idx = core.raw() as usize % pool.n;
-        let _ = pool.dispatchers[idx].dispatch(
-            WriteEvent::LabelBatch { rows },
-            None,
-        );
+        let _ = pool.dispatchers[idx].dispatch(WriteEvent::LabelBatch { rows }, None);
     }
 }
 

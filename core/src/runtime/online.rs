@@ -7,8 +7,8 @@ use crate::lcore::rx_core::RxCore;
 use crate::lcore::{CoreId, SocketId};
 use crate::memory::mempool::{Mempool, SplitMempool};
 use crate::port::*;
-use crate::subscription::*;
 use crate::runtime::SPLIT_HDR_SIZE;
+use crate::subscription::*;
 
 use std::collections::BTreeMap;
 use std::os::raw::{c_uint, c_void};
@@ -251,7 +251,10 @@ where
             }
 
             if self.options.online.drop_tls_raw {
-                log::info!("Installing TLS Application-Data raw rule on port {}", port.id);
+                log::info!(
+                    "Installing TLS Application-Data raw rule on port {}",
+                    port.id
+                );
                 if let Err(e) =
                     crate::filter::flow_drop::install_tls_appdata_drop(port.id, tls_action)
                 {

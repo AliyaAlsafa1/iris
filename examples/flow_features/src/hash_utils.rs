@@ -24,7 +24,7 @@ fn hash_u128(n: u128) -> u64 {
 
 pub fn hash_str(s: &str) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME:  u64 = 0x100000001b3;
+    const FNV_PRIME: u64 = 0x100000001b3;
 
     let mut h = FNV_OFFSET;
     for b in s.as_bytes() {

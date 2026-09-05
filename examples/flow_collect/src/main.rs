@@ -1,17 +1,17 @@
 // examples/flow_collect/src/main.rs
 use clap::Parser;
-use iris_core::{config::load_config, CoreId, Runtime, L4Pdu};
-use iris_datatypes::{TlsHandshake, ConnRecord};
-use iris_datatypes::conn_fts::InterArrivals;
-use iris_compiler::*;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use flow_features::conn_features::{ConnFeatures, ConnInvariants};
 use flow_features::tls_features::TlsFeatures;
+use iris_compiler::*;
+use iris_core::{CoreId, L4Pdu, Runtime, config::load_config};
+use iris_datatypes::conn_fts::InterArrivals;
+use iris_datatypes::{ConnRecord, TlsHandshake};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+mod builders;
 mod csv_output;
 mod schema;
-mod builders;
 
 use csv_output::{FinalLabel, Snapshot, TraceRecord};
 
@@ -35,7 +35,9 @@ use csv_output::{FinalLabel, Snapshot, TraceRecord};
 const SNAPSHOT_DEPTHS: &[u64] = &[1, 5, 10, 20, 40, 80];
 /// Stream-2 trace flush granularity (one record per packet -> flush a bit larger).
 const TRACE_BATCH_N: usize = 64;
-const WRITER_CORES: &[u32] = &[24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46];
+const WRITER_CORES: &[u32] = &[
+    24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+];
 /// Whether stream 2 (the per-packet A_i(t) trace) is collected at all. Set once in
 /// main() from --trace before the runtime starts, then read-only for the process
 /// lifetime, so the per-packet load is an uncontended relaxed read of a cache-hot
@@ -56,8 +58,13 @@ fn trace_enabled() -> bool {
 #[derive(Parser, Debug)]
 struct Args {
     /// Path to the runtime config TOML (e.g. configs/online-train.toml).
-    #[clap(short, long, value_parser, value_name = "FILE",
-           default_value = "./configs/online.toml")]
+    #[clap(
+        short,
+        long,
+        value_parser,
+        value_name = "FILE",
+        default_value = "./configs/online.toml"
+    )]
     config: PathBuf,
     /// Collect stream 2, the per-packet cumulative-bytes trace (A_i(t)).
     ///
@@ -151,12 +158,18 @@ impl PrefixSweep {
     /// reused by both streams (line-rate safe).
     #[inline]
     fn conn_key(&mut self, conn: &ConnRecord) -> (u64, u64) {
-        *self.key.get_or_insert_with(|| {
-            (conn.five_tuple.conn_hash(), conn.first_seen_epoch_micros())
-        })
+        *self
+            .key
+            .get_or_insert_with(|| (conn.five_tuple.conn_hash(), conn.first_seen_epoch_micros()))
     }
     #[callback_fn("PrefixSweep,level=InL4Conn")]
-    fn on_packet(&mut self, conn: &ConnRecord, iat: &InterArrivals, tls: &TlsHandshake, core_id: &CoreId) -> bool {
+    fn on_packet(
+        &mut self,
+        conn: &ConnRecord,
+        iat: &InterArrivals,
+        tls: &TlsHandshake,
+        core_id: &CoreId,
+    ) -> bool {
         let total = conn.total_pkts();
         // --- Stream 2: per-packet byte/time trace (UNCAPPED, --trace only) --
         // When enabled, ALWAYS append, BEFORE the TLS gate below, for EVERY packet
@@ -207,9 +220,9 @@ impl PrefixSweep {
         }
         let tls_arc = std::sync::Arc::clone(tls_features);
         let (conn_hash, first_seen_ts) = self.conn_key(conn);
-        let inv = self.inv.get_or_insert_with(|| {
-            ConnInvariants::from_conn(conn, conn_hash, first_seen_ts)
-        });
+        let inv = self
+            .inv
+            .get_or_insert_with(|| ConnInvariants::from_conn(conn, conn_hash, first_seen_ts));
         // Emit every not-yet-emitted depth at or below `total`. The while loop (vs
         // a single emit) covers BATCHED delivery: total can jump by more than one
         // between callbacks and could skip past several depths at once. Advancing
@@ -240,10 +253,7 @@ impl PrefixSweep {
         // TLS state -- a flow with buffered trace rows but no TLS features must
         // still have them written). Empty under --no-trace, so this is a no-op.
         if !self.trace_batch.is_empty() {
-            csv_output::write_trace_batch(
-                std::mem::take(&mut self.trace_batch),
-                core_id,
-            );
+            csv_output::write_trace_batch(std::mem::take(&mut self.trace_batch), core_id);
         }
         // Backfill the now-known final label into every buffered stream-1 snapshot
         // and flush them as complete conn+tls+final rows.
@@ -253,11 +263,7 @@ impl PrefixSweep {
                 final_duration_ms: conn.duration().as_millis() as u64,
                 final_total_pkts: conn.total_pkts(),
             };
-            csv_output::write_flow_batch(
-                std::mem::take(&mut self.snapshots),
-                label,
-                core_id,
-            );
+            csv_output::write_flow_batch(std::mem::take(&mut self.snapshots), label, core_id);
         }
         true
     }
