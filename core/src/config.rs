@@ -164,6 +164,12 @@ impl RuntimeConfig {
             }
         }
 
+        if let Some(offline) = &self.offline {
+            for supl_arg in offline.dpdk_supl_args.iter() {
+                eal_params.push(supl_arg.to_string())
+            }
+        }
+
         eal_params.push("-n".to_owned());
         eal_params.push(self.nb_memory_channels.to_string());
 
@@ -211,6 +217,7 @@ impl Default for RuntimeConfig {
                 mtu: 9702,
                 // assumes Iris is being run from crate root
                 pcap: "./traces/small_flows.pcap".to_string(),
+                dpdk_supl_args: Vec::new(),
             }),
             conntrack: ConnTrackConfig {
                 max_connections: 100_000,
@@ -271,7 +278,7 @@ fn default_cache_size() -> usize {
 /// Live traffic analysis options.
 ///
 /// Online mode performs traffic analysis on a live network interface. Either
-/// [OnlineConfig](OnlineConfig) or [OfflineConfig](OfflineConfig) must be specified, but not both.
+/// [OnlineConfig] or [OfflineConfig] must be specified, but not both.
 ///
 /// ## Example
 /// ```toml
@@ -634,7 +641,7 @@ fn default_log_port_stats() -> Vec<String> {
 /// Offline traffic analysis options.
 ///
 /// Offline mode runs using a single core and performs offline analysis of already captured pcap
-/// files. Either [OnlineConfig](OnlineConfig) or [OfflineConfig](OfflineConfig) must be specified,
+/// files. Either [OnlineConfig] or [OfflineConfig] must be specified,
 /// but not both. This mode is primarily intended for functional testing.
 ///
 /// ## Example
@@ -653,6 +660,16 @@ pub struct OfflineConfig {
     /// To include jumbo frames, set this value higher (e.g., `9702`).
     #[serde(default = "default_mtu")]
     pub mtu: usize,
+
+    /// If set, will pass supplementary arguments to DPDK EAL (see DPDK configuration).
+    /// Defaults to empty.
+    ///
+    /// Useful for running a trace without root: `["--no-huge", "--no-pci", "-m", "6144"]`
+    /// takes memory from the regular heap instead of hugepages (which are typically
+    /// root-only) and skips NIC probing, neither of which offline mode needs. Expect a
+    /// performance hit; this is for testing, not measurement.
+    #[serde(default = "default_dpdk_supl_args")]
+    pub dpdk_supl_args: Vec<String>,
 }
 
 /* --------------------------------------------------------------------------------- */

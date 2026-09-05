@@ -1,5 +1,6 @@
 #![doc(hidden)]
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use crate::conntrack::conn::conn_layers::{SupportedLayer, NUM_LAYERS};
@@ -218,6 +219,29 @@ impl NodeActions {
         self.push_filter_pred(&level);
     }
 
+    /// Ensure that branches which are reachable before this pattern can be
+    /// fully checked set all actions that the pattern needs.
+    ///
+    /// Actions with an `if_matches` state condition are inserted into the tree on a
+    /// truncated subpattern (see `FlatPattern::get_subpattern`).
+    /// While the layer is still in that `if_matches` state, the truncated branch may be
+    /// the only branch of this pattern that can be reached.
+    /// If there are *unconditional* actions on the pattern, the truncated branch should
+    /// set those, too.
+    pub(crate) fn propagate_to_state_guards(&mut self) {
+        let Some(unconditional) = self
+            .actions
+            .iter()
+            .find(|a| a.if_matches.is_none())
+            .cloned()
+        else {
+            return;
+        };
+        for a in self.actions.iter_mut().filter(|a| a.if_matches.is_some()) {
+            a.merge(&unconditional);
+        }
+    }
+
     /// Merge two NodeActions together.
     /// This is typically needed when a Node already has actions
     /// accumulated and another subscription (sub-)pattern terminates
@@ -247,7 +271,7 @@ impl NodeActions {
 /// Compile-time struct for representing a datatype required for a callback
 /// or custom filter predicate.
 /// Might also be used to represent a stateful custom filter predicate.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StateTransitionSpec {
     /// Updates: streaming updates and state transitions requested.
     pub updates: Vec<StateTransition>,
@@ -409,6 +433,38 @@ impl Hash for CallbackSpec {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.as_str.hash(state);
         self.subscription_id.hash(state);
+    }
+}
+
+/// Ordered by name first, so that generated code is grouped by subscription and
+/// stays readable, then by the remaining fields to stay consistent with `Eq`
+/// (a single callback can appear multiple times with different `expl_level`s).
+impl Ord for CallbackSpec {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (
+            &self.subscription_id,
+            &self.as_str,
+            &self.expl_level,
+            &self.datatypes,
+            &self.must_deliver,
+            &self.invoke_once,
+            &self.filtered_data,
+        )
+            .cmp(&(
+                &other.subscription_id,
+                &other.as_str,
+                &other.expl_level,
+                &other.datatypes,
+                &other.must_deliver,
+                &other.invoke_once,
+                &other.filtered_data,
+            ))
+    }
+}
+
+impl PartialOrd for CallbackSpec {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -590,10 +646,10 @@ impl FilteredDatatype {
     }
 
     pub fn concat(
-        l: &HashMap<String, FilteredDatatype>,
-        r: &HashMap<String, FilteredDatatype>,
-    ) -> HashMap<String, FilteredDatatype> {
-        let mut ret: HashMap<String, FilteredDatatype> = HashMap::new();
+        l: &BTreeMap<String, FilteredDatatype>,
+        r: &BTreeMap<String, FilteredDatatype>,
+    ) -> BTreeMap<String, FilteredDatatype> {
+        let mut ret: BTreeMap<String, FilteredDatatype> = BTreeMap::new();
         for (k, v) in l.iter().chain(r.iter()) {
             if let Some(existing) = ret.get_mut(k) {
                 existing.extend(v);
@@ -656,7 +712,7 @@ mod tests {
         // Initial state: should parse until end of headers
         let actions = l7_header.to_actions(StateTransition::L4FirstPacket).actions;
         assert!(actions.len() == 1);
-        assert!(actions[0].if_matches == None);
+        assert!(actions[0].if_matches.is_none());
         assert!(actions[0].transport.has_next_layer() && actions[0].layers[0].needs_parse());
         for tx in StateTransition::iter() {
             if matches!(tx, StateTransition::L7EndHdrs) {
@@ -677,7 +733,7 @@ mod tests {
         }
         // Everything should be dropped after headers
         let actions = l7_header.to_actions(StateTransition::L7EndHdrs).actions;
-        assert!(actions.len() == 0);
+        assert!(actions.is_empty());
     }
 
     // Actions for datatype that requires both L4 and L7 data
