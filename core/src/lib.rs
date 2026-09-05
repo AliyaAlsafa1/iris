@@ -82,6 +82,9 @@ pub use self::runtime::Runtime;
 pub use dpdk::rte_flow;
 pub use dpdk::rte_lcore_id;
 pub use dpdk::rte_rdtsc;
+// TSC frequency, for turning `rte_rdtsc()` deltas into wall-clock time. Only meaningful after EAL
+// init, i.e. after a `Runtime` has been constructed.
+pub use dpdk::rte_get_tsc_hz;
 
 #[macro_use]
 extern crate pest_derive;

@@ -1,0 +1,66 @@
+# Cycle-budget A/B evaluation of dyn_hardware_assist on the ConnectX-5.
+#
+# Used by arms A (control, --drop-mode none), B (treatment, --drop-mode hardware) and
+# D (matched software drop, --drop-mode software). Arm C uses
+# configs/online-cx5-eval-noassist.toml, which is this file with dyn_hardware_assist = false.
+#
+# Everything except dyn_hardware_assist must be byte-identical across arms, or the comparison is
+# confounded. Do not tune one arm.
+#
+# Core assignment: the CX-5 at 0000:3b:00.0 is on NUMA node 0 (CPUs 0-17, 36-53), so every core
+# here is node-0 local. Cores 1-8 are RX; pass `--worker-cores 9` to hw_assist_eval for the
+# off-datapath rte_flow install worker. 9's hyperthread sibling is 45, which is left idle so the
+# worker cannot steal issue slots from an RX core.
+
+main_core = 0
+nb_memory_channels = 6
+
+[mempool]
+capacity = 8_388_608
+cache_size = 512
+
+[online]
+duration = 120
+nb_rxd = 32768
+promiscuous = true
+mtu = 1500
+# The static offload filter is off: we are measuring the *dynamic* per-connection path, and the
+# two are mutually exclusive (dyn_hardware_assist takes the earlier branch in start_ports).
+hardware_assist = false
+# Installs the group-0 -> group-1 jump and the catch-all RSS rule on group 1, which is what makes
+# group 1 usable as a per-connection blocklist. Left true even in the control arm so that arm A
+# and arm B differ *only* in whether drop rules get installed.
+dyn_hardware_assist = true
+
+[[online.ports]]
+device = "0000:3b:00.0"
+cores = [ 1, 2, 3, 4, 5, 6, 7, 8 ]
+
+# Uncomment to sweep offered load downward: `nb_buckets` fills only the first N of the 512 RSS
+# redirection-table entries, so 256 delivers ~50% of flows and the rest go to the sink core. This
+# is the knob for producing (load, duty cycle) points across a range within one stable traffic
+# window, and the knob zlt.py sweeps for zero-loss throughput.
+# [online.ports.sink]
+# core = 10
+# nb_buckets = 512
+
+[conntrack]
+max_connections = 10000000
+max_out_of_order = 500
+timeout_resolution = 100
+udp_inactivity_timeout = 60000
+tcp_inactivity_timeout = 300000
+tcp_reassembly_timeout = 10000
+tcp_establish_timeout = 5000
+
+[online.monitor.display]
+throughput = true
+mempool_usage = true
+port_stats = [ "rx_good_packets", "rx_good_bytes", "rx_phy_packets", "rx_phy_bytes", "rx_mbuf_allocation_errors", "rx_phy_discard_packets", "rx_missed_errors",]
+
+# Required for the load regression: writes cycle_budget.csv, one row per interval pairing the
+# datapath cycle budget with the offered load over that same interval.
+[online.monitor.log]
+directory = "./log/"
+interval = 1000
+port_stats = [ "rx" ]

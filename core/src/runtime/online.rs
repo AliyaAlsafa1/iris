@@ -91,6 +91,7 @@ where
                 rxqueues,
                 options.conntrack.clone(),
                 options.flow_table.clone(),
+                options.online.budget_sample_stride,
                 #[cfg(feature = "prometheus")]
                 options.online.prometheus.is_some(),
                 Arc::clone(&subscription),
@@ -112,6 +113,17 @@ where
 
     pub(crate) fn run(&mut self) {
         self.start_ports();
+
+        // Declare the cycle-budget denominator up front. Sink cores are excluded: they run
+        // `rx_sink`, which does no pipeline work and publishes no budget. Setting this before
+        // launch (rather than counting cores as they exit) is what lets the monitor report a
+        // per-core duty cycle while the run is still going.
+        let budget_cores = self
+            .rx_cores
+            .values()
+            .filter(|rx_core| rx_core.rxqueues.first().map(|q| q.ty) != Some(RxQueueType::Sink))
+            .count();
+        crate::stats::set_datapath_cores(budget_cores as u64);
 
         log::info!("Launching RX cores...");
         for core_id in self.rx_cores.keys() {

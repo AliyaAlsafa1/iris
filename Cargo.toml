@@ -16,7 +16,11 @@ members = [
     "examples/flow_collect", "examples/flow_features", "examples/flow_test", "examples/flow_labels",
     # "examples/loss_test", "examples/timeout_test", "examples/tls_quic",
     # "examples/tls_quic_drop",
-    # "examples/tls_quic_measure",
+    # Software oracle for how much live traffic the drop rules could address — the
+    # "fraction droppable" input to the predicted-savings model.
+    "examples/tls_quic_measure",
+    # Cycle-budget A/B harness for dyn_hardware_assist.
+    "examples/hw_assist_eval",
 ]
 resolver = "2"
 

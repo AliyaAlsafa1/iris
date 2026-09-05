@@ -27,6 +27,9 @@ where
     pub(crate) rxqueues: Vec<RxQueue>,
     pub(crate) conntrack: ConnTrackConfig,
     pub(crate) flow_table: Option<FlowTableConfig>,
+    /// Attribute cycles on one in every this many loop iterations. See
+    /// `config::OnlineConfig::budget_sample_stride`.
+    pub(crate) budget_sample_stride: u64,
     #[cfg(feature = "prometheus")]
     pub(crate) is_prometheus_enabled: bool,
     pub(crate) subscription: Arc<Subscription<S>>,
@@ -42,6 +45,7 @@ where
         rxqueues: Vec<RxQueue>,
         conntrack: ConnTrackConfig,
         flow_table: Option<FlowTableConfig>,
+        budget_sample_stride: u64,
         #[cfg(feature = "prometheus")] is_prometheus_enabled: bool,
         subscription: Arc<Subscription<S>>,
         is_running: Arc<AtomicBool>,
@@ -51,6 +55,7 @@ where
             rxqueues,
             conntrack,
             flow_table,
+            budget_sample_stride,
             #[cfg(feature = "prometheus")]
             is_prometheus_enabled,
             subscription,
@@ -113,18 +118,90 @@ where
 
         let mut now = Instant::now();
 
-        // rte_rdtsc-based per-packet cost: accumulate cycles only for non-empty
-        // bursts (idle poll-spin excluded), divided by received packets.
-        let mut busy_cycles: u64 = 0;
-        let mut busy_pkts: u64 = 0;
+        // Cycle budget for this lcore (see `stats::DatapathBudget` for the full rationale).
+        //
+        // Cheap counters (`wall`, `bursts`, `idle_polls`, `recv_pkts`) are exact. The *cycle*
+        // attribution is sampled, on one in every `sample_stride` outer iterations, because
+        // bracketing every iteration costs an `rte_rdtsc` per empty poll — roughly a tenth of an
+        // empty poll's cost, and the inflation scales with the idle-poll count, which is exactly
+        // what differs between the arms of an ingress-shedding experiment. Measuring exactly would
+        // bias the headline number in favour of the hypothesis.
+        //
+        // Within a sampled iteration, timestamps are *chained*: each read closes one bucket and
+        // opens the next, so the buckets sum to that iteration's span by construction and
+        // `residual_fraction` is a genuine self-check rather than a formality.
+        //
+        // Sampling alone is not enough to make the buckets unbiased. Inside a sampled iteration
+        // every span still absorbs the latency of the read that closes it, and since an empty poll
+        // is by far the cheapest event, `poll_idle` is inflated the most in relative terms — the
+        // exact bias sampling was supposed to remove. So the calibrated per-read cost is subtracted
+        // from each span, and the same total from the iteration's own span, which keeps the buckets
+        // summing to `sampled_wall`. Calibration is per-core because it is cheap and the cores may
+        // not be identical.
+        let sample_stride = self.budget_sample_stride.max(1);
+        let rdtsc_cost = crate::stats::measure_rdtsc_overhead(4096).round() as u64;
+        let mut budget = crate::stats::DatapathBudget {
+            sample_stride,
+            rdtsc_cost,
+            ..Default::default()
+        };
+        let loop_start = unsafe { dpdk::rte_rdtsc() };
+        let mut rdtsc_reads: u64 = 1;
+        // Last snapshot pushed to the global atomics. The budget is published incrementally so the
+        // monitor can log a duty cycle next to each interval's ingress rate: regressing duty cycle
+        // on offered load is what makes the A/B comparison robust to non-stationary live traffic,
+        // and it needs many (load, duty) points rather than one per run.
+        let mut published = crate::stats::DatapathBudget::default();
+        // Countdown rather than `iter % stride`: `stride` is a runtime value, so the modulo would
+        // compile to a u64 division costing about as much as the `rte_rdtsc` this is meant to
+        // avoid. A decrement and compare is a couple of cycles.
+        let mut countdown: u64 = 1;
 
         while self.is_running.load(Ordering::Relaxed) {
+            // Sample decision for this whole iteration, taken once so every bucket within it is
+            // either attributed or not — a partially sampled iteration would not sum to its span.
+            countdown -= 1;
+            let sampled = countdown == 0;
+            if sampled {
+                countdown = sample_stride;
+            }
+            let mut t_cursor = if sampled {
+                rdtsc_reads += 1;
+                unsafe { dpdk::rte_rdtsc() }
+            } else {
+                0
+            };
+            let iter_start = t_cursor;
+            // Spans closed within this iteration, i.e. how many read latencies its own span
+            // absorbed, so the same correction can be taken off `sampled_wall`.
+            let mut spans_closed: u64 = 0;
+
             for rxqueue in self.rxqueues.iter() {
-                let t_start = unsafe { dpdk::rte_rdtsc() };
                 let mbufs: Vec<Mbuf> = self.rx_burst(rxqueue, 32);
                 let n_recv = mbufs.len();
-                if mbufs.is_empty() {
+
+                // Close the poll bucket. An empty burst is charged to `poll_idle` — the pool of
+                // cycles an ingress-shedding mechanism frees up for application logic.
+                if sampled {
+                    let t_after_poll = unsafe { dpdk::rte_rdtsc() };
+                    rdtsc_reads += 1;
+                    spans_closed += 1;
+                    let poll_span = t_after_poll
+                        .wrapping_sub(t_cursor)
+                        .saturating_sub(rdtsc_cost);
+                    t_cursor = t_after_poll;
+                    if n_recv == 0 {
+                        budget.poll_idle += poll_span;
+                    } else {
+                        budget.poll_busy += poll_span;
+                    }
+                }
+                if n_recv == 0 {
+                    budget.idle_polls += 1;
                     IDLE_CYCLES.inc();
+                } else {
+                    budget.bursts += 1;
+                    budget.recv_pkts += n_recv as u64;
                 }
 
                 // Apply any pending flow rules pushed by the control plane.
@@ -179,16 +256,51 @@ where
                     }
                 }
 
-                // Charge this burst's cycles to per-packet cost (skip idle polls).
-                if n_recv > 0 {
-                    busy_cycles += unsafe { dpdk::rte_rdtsc() } - t_start;
-                    busy_pkts += n_recv as u64;
+                // Close the pipeline bucket. Skipped on an empty burst: there was no pipeline, so
+                // the loop bookkeeping above smears into the next poll span rather than costing
+                // another read. The buckets still sum to the iteration's span.
+                if sampled && n_recv > 0 {
+                    let t_after_pipeline = unsafe { dpdk::rte_rdtsc() };
+                    rdtsc_reads += 1;
+                    spans_closed += 1;
+                    budget.pipeline += t_after_pipeline
+                        .wrapping_sub(t_cursor)
+                        .saturating_sub(rdtsc_cost);
+                    t_cursor = t_after_pipeline;
                 }
             }
             conn_table.check_inactive(&self.subscription, now);
+
+            if sampled {
+                // Close the maintenance bucket (timer-wheel expiry). Unlike the previous
+                // instrumentation, this is inside the accounting rather than outside it.
+                let t_after_maint = unsafe { dpdk::rte_rdtsc() };
+                rdtsc_reads += 1;
+                spans_closed += 1;
+                budget.maint += t_after_maint
+                    .wrapping_sub(t_cursor)
+                    .saturating_sub(rdtsc_cost);
+                // Same total correction, so the buckets still sum to `sampled_wall`.
+                budget.sampled_wall += t_after_maint
+                    .wrapping_sub(iter_start)
+                    .saturating_sub(spans_closed * rdtsc_cost);
+                budget.sampled_iters += 1;
+
+                // Publish the delta periodically so the monitor can log a duty cycle beside each
+                // interval's ingress rate. Only done on sampled iterations, where a fresh
+                // timestamp is already in hand.
+                if TOTAL_CYCLES.get() & 1023 == 256 {
+                    budget.wall = t_after_maint.wrapping_sub(loop_start);
+                    budget.rdtsc_reads = rdtsc_reads;
+                    crate::stats::publish_datapath_delta(&budget, &mut published);
+                }
+            }
         }
 
-        crate::stats::add_datapath_busy(busy_cycles, busy_pkts);
+        budget.wall = unsafe { dpdk::rte_rdtsc() }.wrapping_sub(loop_start);
+        budget.rdtsc_reads = rdtsc_reads + 1;
+        // Final flush of the not-yet-published remainder.
+        crate::stats::publish_datapath_delta(&budget, &mut published);
 
         // // Deliver remaining data in table from unfinished connections
         conn_table.drain(&self.subscription);

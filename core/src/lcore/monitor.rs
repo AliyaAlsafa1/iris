@@ -81,11 +81,17 @@ impl Monitor {
                         let wtr = Writer::from_path(&fname).expect("create portstat log");
                         port_wtrs.insert(*port_id, wtr);
                     }
+                    let budget_wtr = Writer::from_path(path.join("cycle_budget.csv"))
+                        .expect("create cycle budget log");
                     return Some(Logger {
                         interval: Duration::from_millis(log_cfg.interval),
                         path,
                         port_wtrs,
                         keywords: log_cfg.port_stats.clone(),
+                        budget_wtr,
+                        last_budget: Default::default(),
+                        last_ingress_pkts: 0,
+                        last_ingress_bytes: 0,
                     });
                 }
             }
@@ -111,6 +117,7 @@ impl Monitor {
     pub(crate) async fn run(&mut self) {
         if let Some(logger) = &mut self.logger {
             logger.init_port_wtrs().expect("port logger init");
+            logger.init_budget_wtr().expect("cycle budget logger init");
         }
         // ts of run start
         let start_ts = Instant::now();
@@ -264,6 +271,16 @@ struct Logger {
     path: PathBuf,
     port_wtrs: HashMap<PortId, Writer<std::fs::File>>,
     keywords: Vec<String>,
+    /// Per-interval datapath cycle budget paired with the offered load in the same row.
+    ///
+    /// This pairing is the point: on live, non-stationary traffic two runs never see the same
+    /// load, so the robust comparison is to regress duty cycle on offered load per arm and
+    /// compare slopes. That needs many (load, duty) samples, which one row per second delivers
+    /// from a handful of runs instead of dozens.
+    budget_wtr: Writer<std::fs::File>,
+    last_budget: crate::stats::DatapathBudget,
+    last_ingress_pkts: u64,
+    last_ingress_bytes: u64,
 }
 
 impl Logger {
@@ -316,6 +333,111 @@ impl Logger {
         for wtr in self.port_wtrs.values_mut() {
             wtr.flush()?;
         }
+        self.log_cycle_budget(elapsed)?;
+        Ok(())
+    }
+
+    /// Write the header for `cycle_budget.csv`. Separate from the port CSVs because the budget is
+    /// per-datapath, not per-port.
+    fn init_budget_wtr(&mut self) -> Result<()> {
+        for field in [
+            "ts_ms",
+            // Interval deltas, in TSC cycles. The four buckets are attributed over sampled
+            // iterations only and sum to d_sampled_wall; d_wall is the exact interval span.
+            // Fractions must therefore be taken against d_sampled_wall, and absolute cycle
+            // totals reconstructed as fraction * d_wall.
+            "d_poll_busy",
+            "d_poll_idle",
+            "d_pipeline",
+            "d_maint",
+            "d_sampled_wall",
+            "d_wall",
+            "d_bursts",
+            "d_idle_polls",
+            "d_recv_pkts",
+            // Offered load over the same interval: what the NIC saw, before any drop rule.
+            "d_ingress_pkts",
+            "d_ingress_bytes",
+            "rx_cores",
+            // Derived, for convenience; recomputable from the columns above.
+            "idle_fraction",
+            "busy_fraction",
+            "cycles_per_ingress_pkt",
+        ] {
+            self.budget_wtr.write_field(field)?;
+        }
+        self.budget_wtr.write_record(None::<&[u8]>)?;
+        self.budget_wtr.flush()?;
+        Ok(())
+    }
+
+    fn log_cycle_budget(&mut self, elapsed: Duration) -> Result<()> {
+        let now = crate::stats::datapath_budget();
+
+        // Offered load over this interval, summed across ports.
+        let (mut phy_pkts, mut phy_bytes) = (0u64, 0u64);
+        for port_id in self.port_wtrs.keys() {
+            if let Ok(c) = crate::port::ingress_counters(*port_id) {
+                phy_pkts += c.phy_packets;
+                phy_bytes += c.phy_bytes;
+            }
+        }
+
+        let prev = self.last_budget;
+        let d = |cur: u64, old: u64| cur.saturating_sub(old);
+        let d_poll_busy = d(now.poll_busy, prev.poll_busy);
+        let d_poll_idle = d(now.poll_idle, prev.poll_idle);
+        let d_pipeline = d(now.pipeline, prev.pipeline);
+        let d_maint = d(now.maint, prev.maint);
+        let d_sampled_wall = d(now.sampled_wall, prev.sampled_wall);
+        let d_wall = d(now.wall, prev.wall);
+        let d_ingress_pkts = d(phy_pkts, self.last_ingress_pkts);
+        let d_ingress_bytes = d(phy_bytes, self.last_ingress_bytes);
+
+        // Fractions come from the sample; absolute cycles are the fraction scaled by the exact
+        // interval span.
+        let frac = |part: u64| {
+            if d_sampled_wall == 0 {
+                0.0
+            } else {
+                part as f64 / d_sampled_wall as f64
+            }
+        };
+        let busy_fraction = frac(d_poll_busy + d_pipeline + d_maint);
+        let work = busy_fraction * d_wall as f64;
+        let cycles_per_ingress_pkt = if d_ingress_pkts == 0 {
+            0.0
+        } else {
+            work / d_ingress_pkts as f64
+        };
+
+        let row = [
+            elapsed.as_millis().to_string(),
+            d_poll_busy.to_string(),
+            d_poll_idle.to_string(),
+            d_pipeline.to_string(),
+            d_maint.to_string(),
+            d_sampled_wall.to_string(),
+            d_wall.to_string(),
+            d(now.bursts, prev.bursts).to_string(),
+            d(now.idle_polls, prev.idle_polls).to_string(),
+            d(now.recv_pkts, prev.recv_pkts).to_string(),
+            d_ingress_pkts.to_string(),
+            d_ingress_bytes.to_string(),
+            now.cores.to_string(),
+            format!("{:.6}", frac(d_poll_idle)),
+            format!("{:.6}", busy_fraction),
+            format!("{:.3}", cycles_per_ingress_pkt),
+        ];
+        for field in row {
+            self.budget_wtr.write_field(field)?;
+        }
+        self.budget_wtr.write_record(None::<&[u8]>)?;
+        self.budget_wtr.flush()?;
+
+        self.last_budget = now;
+        self.last_ingress_pkts = phy_pkts;
+        self.last_ingress_bytes = phy_bytes;
         Ok(())
     }
 }

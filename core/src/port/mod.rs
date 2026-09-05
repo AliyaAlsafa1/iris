@@ -591,3 +591,51 @@ impl fmt::Display for RxQueue {
         write!(f, "p{}q{}{}", self.pid, self.qid, self.ty)
     }
 }
+
+/// NIC-side ingress counters, as read from `rte_eth_xstats`.
+///
+/// The distinction between `phy` and `good` is what makes an ingress-shedding mechanism such as
+/// `dyn_hardware_assist` measurable: `phy_packets` counts what arrived at the port, `good_packets`
+/// counts what was actually delivered to a queue. A working drop rule widens the gap between them
+/// while leaving `phy_packets` untouched — so `phy_packets` is the load-normalisation denominator
+/// that stays fixed across an A/B comparison, and `good_packets` is what the CPU had to touch.
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+pub struct IngressCounters {
+    pub phy_packets: u64,
+    pub phy_bytes: u64,
+    pub good_packets: u64,
+    pub good_bytes: u64,
+    /// Packets the NIC discarded, e.g. by a flow rule or for lack of buffer.
+    pub phy_discard_packets: u64,
+    /// Packets dropped because no descriptor was available (software could not keep up).
+    pub missed_errors: u64,
+    /// False when the PMD does not expose `rx_phy_*` (ICE, for instance, does not). The `phy_*`
+    /// fields then fall back to the `good_*` values, which makes shed traffic invisible — so a
+    /// report carrying `phy_available: false` cannot be used for the ingress-normalised metric.
+    pub phy_available: bool,
+}
+
+/// Read the ingress counters for one port.
+///
+/// Must be called after the port has been started. Missing keys read as zero rather than failing,
+/// because the set of xstats a PMD exposes is driver-specific; `phy_available` records whether the
+/// counters that matter were actually present.
+pub fn ingress_counters(port_id: PortId) -> Result<IngressCounters> {
+    let port_stats = self::statistics::PortStats::collect(port_id)?;
+    let get = |key: &str| port_stats.stats.get(key).copied();
+
+    let good_packets = get("rx_good_packets").unwrap_or(0);
+    let good_bytes = get("rx_good_bytes").unwrap_or(0);
+    let phy_packets = get("rx_phy_packets");
+    let phy_bytes = get("rx_phy_bytes");
+
+    Ok(IngressCounters {
+        phy_packets: phy_packets.unwrap_or(good_packets),
+        phy_bytes: phy_bytes.unwrap_or(good_bytes),
+        good_packets,
+        good_bytes,
+        phy_discard_packets: get("rx_phy_discard_packets").unwrap_or(0),
+        missed_errors: get("rx_missed_errors").unwrap_or(0),
+        phy_available: phy_packets.is_some() && phy_bytes.is_some(),
+    })
+}

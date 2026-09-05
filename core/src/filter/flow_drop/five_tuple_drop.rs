@@ -33,6 +33,32 @@ const UDP: u8 = 17;
 pub static DISCARDED_PACKETS: AtomicU64 = AtomicU64::new(0);
 pub static DISCARDED_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Cost of the control plane, so hardware offload can be charged for its own overhead rather than
+/// only credited for the packets it sheds.
+///
+/// `rte_flow_create` is expensive and its cost scales with *connection arrival rate*, not byte
+/// rate — at high connection churn the install cost can exceed the datapath cycles saved, which is
+/// the main way ingress offload fails to pay off. These counters make that visible instead of
+/// leaving it as an assumption. They are accumulated rather than printed per rule: printing per
+/// `rte_flow_create` would itself dominate the measurement.
+pub static RULE_INSTALL_CYCLES: AtomicU64 = AtomicU64::new(0);
+pub static RULE_INSTALLS: AtomicU64 = AtomicU64::new(0);
+pub static RULE_INSTALL_FAILURES: AtomicU64 = AtomicU64::new(0);
+pub static RULE_DESTROY_CYCLES: AtomicU64 = AtomicU64::new(0);
+pub static RULE_DESTROYS: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the control-plane cost: (install cycles, installs, install failures, destroy
+/// cycles, destroys).
+pub fn rule_control_cost() -> (u64, u64, u64, u64, u64) {
+    (
+        RULE_INSTALL_CYCLES.load(Ordering::Relaxed),
+        RULE_INSTALLS.load(Ordering::Relaxed),
+        RULE_INSTALL_FAILURES.load(Ordering::Relaxed),
+        RULE_DESTROY_CYCLES.load(Ordering::Relaxed),
+        RULE_DESTROYS.load(Ordering::Relaxed),
+    )
+}
+
 /// Returns a table in [2..=14] using dest port low nibble for TCP/UDP.
 /// Non-TCP/UDP fall back to BASE_GROUP.
 /// CURRENTLY UNUSED FOR TESTING ! Kept, with the consts above, as scaffolding for
@@ -251,11 +277,11 @@ where
             )
         };
 
-        // Latency Calculation
-        //let duration = unsafe { dpdk::rte_rdtsc() } - start;
-        //println!("Latency (cycles): {}", duration);
+        RULE_INSTALL_CYCLES
+            .fetch_add(unsafe { dpdk::rte_rdtsc() }.wrapping_sub(start), Ordering::Relaxed);
 
         if flow.is_null() {
+            RULE_INSTALL_FAILURES.fetch_add(1, Ordering::Relaxed);
             let msg = unsafe { CStr::from_ptr(error.message).to_string_lossy().into_owned() };
             // Clean up the handle we just created since the rule failed.
             let mut derr: rte_flow_error = unsafe { mem::zeroed() };
@@ -263,6 +289,7 @@ where
             anyhow::bail!("Failed to install flow on port {}: {}", port_id.raw(), msg);
         }
 
+        RULE_INSTALLS.fetch_add(1, Ordering::Relaxed);
         flows.push(flow);
         handles.push(handle);
     }
@@ -296,11 +323,11 @@ where
             )
         };
 
-        // Latency Calculation
-        //let duration = unsafe { dpdk::rte_rdtsc() } - start;
-        //println!("[REV] Latency (cycles): {}", duration);
+        RULE_INSTALL_CYCLES
+            .fetch_add(unsafe { dpdk::rte_rdtsc() }.wrapping_sub(start), Ordering::Relaxed);
 
         if flow_rev.is_null() {
+            RULE_INSTALL_FAILURES.fetch_add(1, Ordering::Relaxed);
             let msg = unsafe {
                 CStr::from_ptr(error_rev.message)
                     .to_string_lossy()
@@ -311,6 +338,7 @@ where
             anyhow::bail!("Failed to install flow on port {}: {}", port_id.raw(), msg);
         }
 
+        RULE_INSTALLS.fetch_add(1, Ordering::Relaxed);
         flows.push(flow_rev);
         handles.push(handle);
     }
@@ -425,9 +453,9 @@ pub fn uninstall_flow(
         let start = unsafe { dpdk::rte_rdtsc() };
         let ret = unsafe { rte_flow_destroy(port_id.raw(), *flow, &mut error) };
 
-        // Latency Calculation
-        //let duration = unsafe { dpdk::rte_rdtsc() } - start;
-        //println!("Uninstall latency (cycles): {}", duration);
+        RULE_DESTROY_CYCLES
+            .fetch_add(unsafe { dpdk::rte_rdtsc() }.wrapping_sub(start), Ordering::Relaxed);
+        RULE_DESTROYS.fetch_add(1, Ordering::Relaxed);
 
         if ret != 0 {
             let msg = unsafe { CStr::from_ptr(error.message).to_string_lossy().into_owned() };
