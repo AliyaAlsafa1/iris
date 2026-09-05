@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
-"""Synthesize a pcap of one SSH connection: TCP handshake, banner exchange, then a data tail.
+"""Synthesize a pcap of one SSH connection: TCP handshake, banners, NEWKEYS, then a data tail.
 
 No committed trace has SSH, and Iris rejects TCP connections that do not start with a bare SYN, so
-this builds the full three-way handshake before the banners. The ssh probe only needs the first
-four payload bytes to be "SSH-", so the banner exchange is enough to get the connection identified
-and the `ssh` filter to match.
+this builds the full three-way handshake before the banners.
+
+Two different bars have to be cleared, which is why the NEWKEYS exchange is here:
+
+  * The `ssh` *filter* matches as soon as the probe sees "SSH-" in the first four payload bytes,
+    i.e. on the banner alone.
+  * An `SshHandshake` *datatype* only exists once the parser returns `HeadersDone`, which it does
+    only after both sides have sent SSH_MSG_NEWKEYS (see core/src/protocols/stream/ssh/parser.rs).
+
+So a callback that takes `ssh: &SshHandshake` needs the NEWKEYS packets; one that does not would
+fire on the banner. The NEWKEYS packets below are minimal but well-formed per RFC 4253: a 16-byte
+binary packet carrying the single payload byte 21, padded so the total is a multiple of 8.
 """
 import struct
 import sys
@@ -14,6 +23,28 @@ SERVER_IP = bytes([10, 0, 0, 2])
 CLIENT_PORT = 51000
 SERVER_PORT = 22
 BANNER = b"SSH-2.0-OpenSSH_9.0p1\r\n"
+
+SSH_MSG_NEWKEYS = 21
+
+
+def ssh_binary_packet(payload: bytes) -> bytes:
+    """One unencrypted SSH binary packet (RFC 4253 s6).
+
+    Layout is uint32 packet_length, byte padding_length, payload, padding -- where packet_length
+    covers everything after itself. Padding is at least 4 bytes and the whole packet must be a
+    multiple of 8, so pad up to that.
+    """
+    # 4 (length) + 1 (padding_length) + payload + padding, rounded up to a multiple of 8 with at
+    # least 4 bytes of padding.
+    unpadded = 4 + 1 + len(payload)
+    padding_len = 8 - (unpadded % 8)
+    while padding_len < 4:
+        padding_len += 8
+    packet_len = 1 + len(payload) + padding_len
+    return struct.pack("!IB", packet_len, padding_len) + payload + b"\x00" * padding_len
+
+
+NEWKEYS = ssh_binary_packet(bytes([SSH_MSG_NEWKEYS]))
 TAIL_PKTS = 24  # enough for pkts.total() to pass the offload threshold
 TAIL_LEN = 200
 
@@ -76,6 +107,13 @@ def main(path):
     c_seq += len(BANNER)
     add(SERVER_IP, CLIENT_IP, SERVER_PORT, CLIENT_PORT, s_seq, c_seq, PSH | ACK, BANNER)
     s_seq += len(BANNER)
+
+    # NEWKEYS from both sides. This is what makes the parser emit a session, and so what makes an
+    # `SshHandshake` datatype available to a callback.
+    add(CLIENT_IP, SERVER_IP, CLIENT_PORT, SERVER_PORT, c_seq, s_seq, PSH | ACK, NEWKEYS)
+    c_seq += len(NEWKEYS)
+    add(SERVER_IP, CLIENT_IP, SERVER_PORT, CLIENT_PORT, s_seq, c_seq, PSH | ACK, NEWKEYS)
+    s_seq += len(NEWKEYS)
 
     # Opaque tail, standing in for the encrypted body of the session.
     for i in range(TAIL_PKTS):

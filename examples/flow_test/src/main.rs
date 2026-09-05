@@ -1,6 +1,6 @@
 use clap::{ArgAction, Parser, ValueEnum};
 use iris_datatypes::conn_fts::InterArrivals;
-use iris_datatypes::{ConnRecord, PktCount, TlsHandshake};
+use iris_datatypes::{ConnRecord, PktCount, QuicStream, SshHandshake, TlsHandshake};
 use lazy_static::lazy_static;
 use serde::Serialize;
 
@@ -84,6 +84,19 @@ static DISPATCHED: [AtomicUsize; 4] = [
     AtomicUsize::new(0),
 ];
 static INSTALLED_BY_KIND: [AtomicUsize; 4] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
+/// Offload candidates that arrived with a usefully populated handshake, per kind.
+///
+/// Worth counting because requesting the handshake as a callback parameter is not free: it raises
+/// the bar for admission from "a parser identified the protocol" to "the handshake parsed far
+/// enough to produce a session". SSH in particular only yields a session after NEWKEYS, so a
+/// connection observed mid-stream, or one using a key exchange Iris cannot parse, is no longer
+/// offered at all. Comparing this against `dispatched` shows how much that costs on real traffic.
+static HANDSHAKE_POPULATED: [AtomicUsize; 4] = [
     AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),
@@ -366,14 +379,36 @@ fn tls_cb(
     true
 }
 
+// `ssh` is requested so the handshake is in hand at the admission point, matching `tls_cb`: an
+// admission policy for SSH would be built from these fields (software version, negotiated key
+// exchange). Not free -- an `SshHandshake` only exists after NEWKEYS from both sides, a strictly
+// higher bar than the `ssh` filter, which matches on the banner alone. `HANDSHAKE_POPULATED`
+// measures that gap rather than leaving it implicit.
 #[callback("ssh,level=InL4Conn")]
-fn ssh_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> bool {
+fn ssh_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount, ssh: &SshHandshake) -> bool {
+    // Bail before touching the handshake: this callback runs on every packet of a matched
+    // connection, and only the threshold packet does any work.
+    if pkts.total() != offload_after_pkts() {
+        return true;
+    }
+    if !ssh.software_version_ctos().is_empty() {
+        HANDSHAKE_POPULATED[FlowKind::Ssh.idx()].fetch_add(1, Ordering::Relaxed);
+    }
     offer_for_offload(FlowKind::Ssh, five_tuple, rx_core, pkts.total());
     true
 }
 
+// `quic` is requested for the same reason as `ssh`: the parsed inner `Tls` is right here, which is
+// where a QUIC admission policy would come from. The elephant model is not applied to it -- whether
+// a TLS-trained predictor transfers to QUIC is an open question, not a refactor.
 #[callback("quic,level=InL4Conn")]
-fn quic_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> bool {
+fn quic_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount, quic: &QuicStream) -> bool {
+    if pkts.total() != offload_after_pkts() {
+        return true;
+    }
+    if !quic.tls.sni().is_empty() {
+        HANDSHAKE_POPULATED[FlowKind::Quic.idx()].fetch_add(1, Ordering::Relaxed);
+    }
     offer_for_offload(FlowKind::Quic, five_tuple, rx_core, pkts.total());
     true
 }
@@ -387,6 +422,11 @@ fn maybe_quic_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> b
 #[input_files("$IRIS_HOME/datatypes/data.txt")]
 #[iris_end_macros]
 fn main() {
+    // Without this no `log::` output is emitted at all -- not from this binary and not from
+    // iris_core, whose rule install/uninstall failures are reported through `log::warn!`. The
+    // dependency was present but never initialized.
+    env_logger::init();
+
     // Parse CLI args
     let args = Args::parse();
     if args.show_args {
@@ -651,15 +691,18 @@ fn main() {
 
     println!("=== Offload by protocol ===");
     println!(
-        "{:<12}{:>12}{:>12}{:>10}",
-        "kind", "dispatched", "installed", "enabled"
+        "{:<12}{:>12}{:>12}{:>12}{:>10}",
+        "kind", "dispatched", "installed", "handshake", "enabled"
     );
     for kind in FlowKind::all() {
+        // `handshake` counts candidates whose handshake parameter carried usable data. Only the
+        // ssh and quic arms request one, so it reads 0 for tls and maybe_quic by construction.
         println!(
-            "{:<12}{:>12}{:>12}{:>10}",
+            "{:<12}{:>12}{:>12}{:>12}{:>10}",
             kind.label(),
             DISPATCHED[kind.idx()].load(Ordering::Relaxed),
             INSTALLED_BY_KIND[kind.idx()].load(Ordering::Relaxed),
+            HANDSHAKE_POPULATED[kind.idx()].load(Ordering::Relaxed),
             offload_enabled(kind),
         );
     }
