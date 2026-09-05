@@ -665,7 +665,10 @@ fn fdiv(num: f64, den: f64) -> f64 {
 }
 
 fn print_summary(r: &Report) {
-    println!("\n=== hw_assist_eval: arm {} ({:?}) ===", r.arm, r.drop_mode);
+    println!(
+        "\n=== hw_assist_eval: arm {} ({:?}) ===",
+        r.arm, r.drop_mode
+    );
     println!(
         "TLS callbacks:            {}  (must match across arms)",
         r.tls_callbacks
@@ -703,7 +706,8 @@ fn print_summary(r: &Report) {
     );
     println!(
         "  instrumentation:        {:>7.4}%  ({:.1} cyc/rdtsc)",
-        100.0 * r.budget.instrumentation_fraction, r.budget.cycles_per_rdtsc_read
+        100.0 * r.budget.instrumentation_fraction,
+        r.budget.cycles_per_rdtsc_read
     );
     println!(
         "  sampling:               1 in {} iters, {} sampled, {:.2}% of cycles covered",

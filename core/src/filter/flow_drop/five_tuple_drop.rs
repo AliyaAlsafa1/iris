@@ -277,8 +277,10 @@ where
             )
         };
 
-        RULE_INSTALL_CYCLES
-            .fetch_add(unsafe { dpdk::rte_rdtsc() }.wrapping_sub(start), Ordering::Relaxed);
+        RULE_INSTALL_CYCLES.fetch_add(
+            unsafe { dpdk::rte_rdtsc() }.wrapping_sub(start),
+            Ordering::Relaxed,
+        );
 
         if flow.is_null() {
             RULE_INSTALL_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -323,8 +325,10 @@ where
             )
         };
 
-        RULE_INSTALL_CYCLES
-            .fetch_add(unsafe { dpdk::rte_rdtsc() }.wrapping_sub(start), Ordering::Relaxed);
+        RULE_INSTALL_CYCLES.fetch_add(
+            unsafe { dpdk::rte_rdtsc() }.wrapping_sub(start),
+            Ordering::Relaxed,
+        );
 
         if flow_rev.is_null() {
             RULE_INSTALL_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -453,8 +457,10 @@ pub fn uninstall_flow(
         let start = unsafe { dpdk::rte_rdtsc() };
         let ret = unsafe { rte_flow_destroy(port_id.raw(), *flow, &mut error) };
 
-        RULE_DESTROY_CYCLES
-            .fetch_add(unsafe { dpdk::rte_rdtsc() }.wrapping_sub(start), Ordering::Relaxed);
+        RULE_DESTROY_CYCLES.fetch_add(
+            unsafe { dpdk::rte_rdtsc() }.wrapping_sub(start),
+            Ordering::Relaxed,
+        );
         RULE_DESTROYS.fetch_add(1, Ordering::Relaxed);
 
         if ret != 0 {

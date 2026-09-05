@@ -30,7 +30,12 @@ struct Args {
     config: PathBuf,
 
     /// CSV output path for the classifier results (overwritten each run).
-    #[clap(long, parse(from_os_str), value_name = "FILE", default_value = "./measure.csv")]
+    #[clap(
+        long,
+        parse(from_os_str),
+        value_name = "FILE",
+        default_value = "./measure.csv"
+    )]
     csv: PathBuf,
 }
 
@@ -186,7 +191,13 @@ fn write_csv(path: &std::path::Path) {
     let gb = |i: usize| BYTES[i].load(Ordering::Relaxed);
     let total_p = gp(cat::TOTAL);
     let total_b = gb(cat::TOTAL);
-    let pct = |n: u64, d: u64| if d == 0 { 0.0 } else { 100.0 * n as f64 / d as f64 };
+    let pct = |n: u64, d: u64| {
+        if d == 0 {
+            0.0
+        } else {
+            100.0 * n as f64 / d as f64
+        }
+    };
 
     let mut out = String::from("metric,packets,bytes,pct_packets,pct_bytes\n");
     let mut row = |out: &mut String, label: &str, p: u64, b: u64| {

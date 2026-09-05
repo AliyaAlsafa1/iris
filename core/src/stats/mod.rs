@@ -148,7 +148,10 @@ impl DatapathBudget {
     /// value means a sampled iteration had an unbracketed path and the budget cannot be trusted.
     pub fn residual_fraction(&self) -> f64 {
         let accounted = self.poll_busy + self.poll_idle + self.pipeline + self.maint;
-        ratio(self.sampled_wall.saturating_sub(accounted), self.sampled_wall)
+        ratio(
+            self.sampled_wall.saturating_sub(accounted),
+            self.sampled_wall,
+        )
     }
 
     /// Share of `wall` consumed by the instrumentation's own `rte_rdtsc()` calls, given the
