@@ -31,6 +31,11 @@ hardware_assist = false
 # group 1 usable as a per-connection blocklist. Left true even in the control arm so that arm A
 # and arm B differ *only* in whether drop rules get installed.
 dyn_hardware_assist = true
+# Read by flow_test to decide whether to install rules at all; `standard` installs nothing.
+# hw_assist_eval ignores this and takes its arm from `--drop-mode` instead. Safe to leave set for
+# both: `drop` and `standard` differ only in whether the app installs rules, not in how the port
+# is configured (only `split` changes port setup), so this does not confound the A/B arms.
+flow_mode = "drop"
 
 [[online.ports]]
 device = "0000:3b:00.0"

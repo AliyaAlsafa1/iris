@@ -1,11 +1,15 @@
 # Arm C of the dyn_hardware_assist cycle-budget evaluation: flow-engine configuration cost.
 #
-# Identical to configs/online-cx5-eval.toml except dyn_hardware_assist = false. Run with
+# Byte-identical to configs/online-cx5-eval.toml except dyn_hardware_assist. Run with
 # --drop-mode none. C vs A isolates what the group-0 -> group-1 jump and the explicit catch-all
-# RSS rule cost on their own, independent of any packets being dropped — so that cost is reported
-# separately rather than being credited to (or charged against) the shedding mechanism.
+# RSS rule cost on their own, independent of any packets being dropped, so that cost is reported
+# separately rather than credited to (or charged against) the shedding mechanism.
 #
-# This is *not* the baseline for the main comparison. Use arm A for that.
+# This is *not* the baseline for the main comparison — use arm A for that.
+#
+# Regenerate after editing arm A, so the two cannot drift:
+#   sed 's/^dyn_hardware_assist = true$/dyn_hardware_assist = false/' \
+#     configs/online-cx5-eval.toml > configs/online-cx5-eval-noassist.toml
 #
 # Everything except dyn_hardware_assist must be byte-identical across arms, or the comparison is
 # confounded. Do not tune one arm.
@@ -34,6 +38,11 @@ hardware_assist = false
 # group 1 usable as a per-connection blocklist. Left true even in the control arm so that arm A
 # and arm B differ *only* in whether drop rules get installed.
 dyn_hardware_assist = false
+# Read by flow_test to decide whether to install rules at all; `standard` installs nothing.
+# hw_assist_eval ignores this and takes its arm from `--drop-mode` instead. Safe to leave set for
+# both: `drop` and `standard` differ only in whether the app installs rules, not in how the port
+# is configured (only `split` changes port setup), so this does not confound the A/B arms.
+flow_mode = "drop"
 
 [[online.ports]]
 device = "0000:3b:00.0"
