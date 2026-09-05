@@ -528,25 +528,36 @@ fn main() {
     let cycles_per_rdtsc_read = iris_core::stats::measure_rdtsc_overhead(100_000);
     let tsc_hz = unsafe { iris_core::rte_get_tsc_hz() };
 
-    runtime.run();
-
-    if let Some(h) = worker_handle {
-        h.shutdown(None);
-    }
-
-    // Read the NIC-side ground truth. Do this before the ports are torn down.
-    drain_rules(!args.keep_rules);
-
-    let ingress: Vec<IngressCounters> = port_ids
-        .iter()
-        .filter_map(|pid| match ingress_counters(*pid) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                log::warn!("could not read ingress counters for port {pid}: {e:?}");
-                None
+    // Everything that touches the NIC has to happen in the pre-stop hook, i.e. after the RX cores
+    // have exited but before the ports are stopped. `stop_ports` calls `rte_flow_flush` and
+    // `rte_eth_dev_stop`, which free every rule and indirect COUNT handle installed during the
+    // run; doing this work after `run` returns queried freed handles and died with SIGBUS, so the
+    // hardware arm could never write a report. The order within the hook matters too: the install
+    // worker must be joined first, or it keeps calling `rte_flow_create` on a port about to stop.
+    let mut ingress: Vec<IngressCounters> = Vec::new();
+    {
+        let mut worker_handle = worker_handle;
+        let mut pre_stop = || {
+            if let Some(h) = worker_handle.take() {
+                h.shutdown(None);
             }
-        })
-        .collect();
+
+            // Read the NIC-side ground truth while the rules are still resident.
+            drain_rules(!args.keep_rules);
+
+            ingress = port_ids
+                .iter()
+                .filter_map(|pid| match ingress_counters(*pid) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        log::warn!("could not read ingress counters for port {pid}: {e:?}");
+                        None
+                    }
+                })
+                .collect();
+        };
+        runtime.run_with_pre_stop(&mut pre_stop);
+    }
 
     let report = build_report(&args, &ingress, cycles_per_rdtsc_read, tsc_hz);
     print_summary(&report);

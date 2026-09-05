@@ -151,10 +151,36 @@ where
     ///
     /// runtime.run();
     pub fn run(&mut self) {
+        self.run_hooked(None);
+    }
+
+    /// Like [`Runtime::run`], but invokes `pre_stop` after the RX cores have exited and before the
+    /// ports are stopped.
+    ///
+    /// Stopping a port flushes its hardware flow rules and calls `rte_eth_dev_stop`, which frees
+    /// every `rte_flow` and indirect action handle the port owns. An application that installed
+    /// rules and wants to read their counters back, or that runs a worker still issuing
+    /// `rte_flow_create`, must therefore finish that work *before* the stop — after `run` returns
+    /// the handles are already dangling and touching them is a use-after-free. This hook is that
+    /// window.
+    ///
+    /// Offline mode has no ports to stop, so the hook simply runs after the replay finishes.
+    ///
+    /// # Example
+    ///
+    /// runtime.run_with_pre_stop(|| read_back_flow_counters());
+    pub fn run_with_pre_stop(&mut self, mut pre_stop: impl FnMut()) {
+        self.run_hooked(Some(&mut pre_stop));
+    }
+
+    fn run_hooked(&mut self, pre_stop: Option<&mut dyn FnMut()>) {
         if let Some(online) = &mut self.online {
-            online.run();
+            online.run(pre_stop);
         } else if let Some(offline) = &self.offline {
             offline.run();
+            if let Some(pre_stop) = pre_stop {
+                pre_stop();
+            }
         } else {
             log::error!("No runtime");
         }
