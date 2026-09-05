@@ -147,6 +147,9 @@ fn uninstall_entry(entry: &FlowEntry) {
 /// global `TCP_BYTES`/`UDP_BYTES` totals at `L4Terminated`. This runs independently of the
 /// TLS flow-handling path above; it counts every TCP/UDP frame's full `mbuf.data_len()`,
 /// headers included, regardless of whether the connection was ever admitted or installed.
+///
+/// Each frame is also fed to the per-core transport meter in iris_core so the monitor can
+/// print live per-second TCP/UDP throughput; that path is lock-free (thread-local).
 #[datatype]
 struct TransportBytes {
     tcp_bytes: usize,
@@ -158,8 +161,14 @@ impl TransportBytes {
     fn update(&mut self, pdu: &L4Pdu) {
         let len = pdu.mbuf.data_len();
         match pdu.ctxt.proto {
-            TCP_PROTOCOL => self.tcp_bytes += len,
-            UDP_PROTOCOL => self.udp_bytes += len,
+            TCP_PROTOCOL => {
+                self.tcp_bytes += len;
+                iris_core::lcore::transport_meter::add_tcp(len);
+            }
+            UDP_PROTOCOL => {
+                self.udp_bytes += len;
+                iris_core::lcore::transport_meter::add_udp(len);
+            }
             _ => {}
         }
     }
@@ -496,13 +505,6 @@ fn main() {
     let discarded_packets = DISCARDED_PACKETS.load(std::sync::atomic::Ordering::Relaxed);
     let discarded_bytes = DISCARDED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
     println!("{discarded_packets} packets and {discarded_bytes} bytes discarded");
-
-    let tcp_bytes = TCP_BYTES.load(Ordering::Relaxed);
-    let udp_bytes = UDP_BYTES.load(Ordering::Relaxed);
-    println!(
-        "Transport bytes seen: TCP {tcp_bytes} bytes, UDP {udp_bytes} bytes, total {} bytes",
-        tcp_bytes + udp_bytes,
-    );
 
     if *MODE.read().unwrap() == FlowMode::Standard {
         let tls_bytes = TLS_BYTES.load(Ordering::Relaxed);
