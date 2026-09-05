@@ -32,6 +32,8 @@ pub(crate) struct Monitor {
     logger: Option<Logger>,
     ports: BTreeMap<PortId, Vec<RxQueue>>,
     is_running: Arc<AtomicBool>,
+    prev_tcp_bytes: u64,
+    prev_udp_bytes: u64,
 }
 
 impl Monitor {
@@ -101,6 +103,8 @@ impl Monitor {
             logger,
             ports: monitor_ports,
             is_running,
+            prev_tcp_bytes: 0,
+            prev_udp_bytes: 0,
         }
     }
 
@@ -133,11 +137,19 @@ impl Monitor {
                 }
             }
 
-            if let Some(display) = &self.display {
+            if self.display.is_some() {
                 display_ticker.tick().await;
                 let curr_ts = Instant::now();
                 let delta = curr_ts - prev_ts;
-                match AggRxStats::collect(&self.ports, &display.keywords) {
+
+                // Snapshot what we need off `display`, then release the borrow so
+                // we can mutate self.prev_* below without a borrow conflict.
+                let (show_throughput, keywords) = {
+                    let display = self.display.as_ref().unwrap();
+                    (display.throughput, display.keywords.clone())
+                };
+
+                match AggRxStats::collect(&self.ports, &keywords) {
                     Ok(curr_rx) => {
                         #[cfg(feature = "prometheus")]
                         curr_rx.update_prometheus_stats();
@@ -147,16 +159,37 @@ impl Monitor {
                             init_ts = curr_ts;
                             init = false;
                         }
-                        if display.throughput {
+                        if show_throughput {
                             let elapsed_ts = curr_ts - start_ts;
                             println!("----------------------------------------------");
                             println!("Current time: {}", pretty_print_duration(elapsed_ts));
-                            display.mempool_usage(&self.ports);
+                            // Takes &self.ports (and &self.display); no self mutation here.
+                            self.display.as_ref().unwrap().mempool_usage(&self.ports);
                             AggRxStats::display_rates(curr_rx, prev_rx, nms);
                             AggRxStats::display_dropped(curr_rx, init_rx);
                         }
                         prev_rx = curr_rx;
                         prev_ts = curr_ts;
+
+                        // Per-second on-wire TCP/UDP acquired (live, per-core summed).
+                        if show_throughput {
+                            let (tcp, udp) = crate::lcore::transport_meter::totals();
+                            let d_tcp = tcp.saturating_sub(self.prev_tcp_bytes);
+                            let d_udp = udp.saturating_sub(self.prev_udp_bytes);
+                            self.prev_tcp_bytes = tcp;
+                            self.prev_udp_bytes = udp;
+                            let secs = nms / 1000.0;
+                            if secs > 0.0 {
+                                let tcp_bps = (d_tcp as f64) * 8.0 / secs;
+                                let udp_bps = (d_udp as f64) * 8.0 / secs;
+                                println!(
+                                    "Transport: TCP {} / UDP {} / total {}",
+                                    pretty_print_unit(tcp_bps, "bps"),
+                                    pretty_print_unit(udp_bps, "bps"),
+                                    pretty_print_unit(tcp_bps + udp_bps, "bps"),
+                                );
+                            }
+                        }
                     }
                     Err(error) => {
                         log::error!("Monitor display error: {}", error);
@@ -177,6 +210,15 @@ impl Monitor {
         println!("----------------------------------------------");
         let tputs = Throughputs::new(prev_rx, init_rx, (prev_ts - init_ts).as_millis() as f64);
         println!("{}", tputs);
+
+        // Final cumulative on-wire transport totals.
+        let (tcp_total, udp_total) = crate::lcore::transport_meter::totals();
+        println!(
+            "Transport (cumulative on-wire): TCP {} / UDP {} / total {}",
+            pretty_print_unit(tcp_total as f64, "B"),
+            pretty_print_unit(udp_total as f64, "B"),
+            pretty_print_unit((tcp_total + udp_total) as f64, "B"),
+        );
 
         if let Some(logger) = &self.logger {
             let json_fname = logger.path.join("throughputs.json");

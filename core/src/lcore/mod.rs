@@ -3,6 +3,7 @@
 pub(crate) mod monitor;
 // pub(crate) mod ring;
 pub(crate) mod rx_core;
+pub mod transport_meter;
 
 use crate::dpdk;
 
