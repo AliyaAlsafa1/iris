@@ -27,7 +27,7 @@
 //! Iris processes packets in a connection as they arrive, advancing connections through a set
 //! of protocol state machines. Developers can hook into states and state transitions to extract
 //! data, perform additional computation, or attach state for later use.
-//! The currently-supported states are documented in [`crate::conntrack::conn_state::StateTransition`].
+//! The currently-supported states are documented in [`crate::conntrack::StateTransition`].
 //! Developers indicate that a struct, type, or function should hook into Iris using the macros exported by
 //! the Iris compiler crate.
 //!
@@ -79,9 +79,9 @@ pub use self::lcore::CoreId;
 pub use self::memory::mbuf::Mbuf;
 pub use self::runtime::Runtime;
 
+pub use dpdk::rte_flow;
 pub use dpdk::rte_lcore_id;
 pub use dpdk::rte_rdtsc;
-pub use dpdk::rte_flow;
 
 #[macro_use]
 extern crate pest_derive;

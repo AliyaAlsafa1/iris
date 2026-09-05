@@ -4,7 +4,7 @@
 //! Every Iris subscription requires a callback, a filter, and one or more data types.
 //! Many simple applications can get by with just the [fn@callback] macro, leveraging
 //! Iris' filter DSL (which can filter on protocols and protocol fields) and the
-//! sample data types in [crate::datatypes].
+//! sample data types in the [`iris_datatypes` crate](https://github.com/stanford-esrg/iris/tree/main/datatypes).
 //!
 //! For more complex use-cases, developers can define custom filters with [fn@filter] and
 //! data types with [fn@datatypes]. Stateful callbacks, filters, and data types --- i.e.,
@@ -37,7 +37,7 @@
 //! a callback group (i.e., a struct method) returns false, the entire callback (all struct methods)
 //! is considered "unsubscribed".
 //!
-//! Filter functions must return a [crate::core::subscription::FilterResult].
+//! Filter functions must return an [`iris_core::subscription::FilterResult`].
 //!
 //! ## Filter DSL
 //!
@@ -61,7 +61,7 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use syn::{Item, parse_macro_input};
 
 mod parse;
@@ -79,7 +79,7 @@ use subscription::SubscriptionDecoder;
 /// Example usage:
 ///
 /// ```rust,ignore
-/// #[datatype("L7EndHdrs,parsers=dns"))]
+/// #[datatype("L7EndHdrs,parsers=dns")]
 /// pub type DnsTransaction = Box<Dns>;
 /// ```
 ///
@@ -266,7 +266,7 @@ pub fn filter_fn(args: TokenStream, input: TokenStream) -> TokenStream {
 /// or target, it must specify a file to cache parsed data in.
 /// Other crates or targets access these exported types using [fn@input_files].
 /// Rust macros can't maintain local state across targets, and this is a simple workaround.
-/// See [crate::datatypes] for an example of using `cache_file``, and see [crate::examples] for
+/// See the [`iris_datatypes` crate source](https://github.com/stanford-esrg/iris/tree/main/datatypes) for an example of using `cache_file`, and see the [examples directory](https://github.com/stanford-esrg/iris/tree/main/examples) for
 /// applications that use [fn@input_files] to import definitions from other crates or targets.
 ///
 /// Note: if you get an error such as "Can't find data type", but the data type is defined, you
@@ -314,7 +314,8 @@ pub fn iris_end_macros(_args: TokenStream, input: TokenStream) -> TokenStream {
     let packet_filter = packet_filter::gen_packet_filter(&packet_tree);
     let filter_str = packet_tree.to_filter_string();
 
-    let mut statics: HashMap<String, (String, proc_macro2::TokenStream)> = HashMap::new();
+    // Ordered so that the generated `lazy_static!` block is stable across builds.
+    let mut statics: BTreeMap<String, (String, proc_macro2::TokenStream)> = BTreeMap::new();
     let (state_tx_main, state_fns) = state_filters::gen_state_filters(&decoder, &mut statics);
     let lazy_statics = if statics.is_empty() {
         quote! {}
@@ -390,7 +391,8 @@ pub fn iris_end_macros(_args: TokenStream, input: TokenStream) -> TokenStream {
             }
 
             fn state_tx(conn: &mut ConnInfo<TrackedWrapper>,
-                    tx: &iris_core::StateTransition) {
+                    tx: &iris_core::StateTransition,
+                    pdu: Option<&iris_core::L4Pdu>) {
                 #state_tx_main
             }
 

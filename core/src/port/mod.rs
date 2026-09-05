@@ -326,9 +326,14 @@ impl Port {
             }
             port_conf.rx_adv_conf.rss_conf.rss_key = SYMMETRIC_RSS_KEY.as_ptr() as *mut u8;
             port_conf.rx_adv_conf.rss_conf.rss_key_len = dev_info.hash_key_size;
-            port_conf.rx_adv_conf.rss_conf.rss_hf =
-                (dpdk::ETH_RSS_IP | dpdk::ETH_RSS_TCP | dpdk::ETH_RSS_UDP) as u64
-                    & dev_info.flow_type_rss_offloads;
+            // The cast is redundant on DPDK >= 23.11, where dpdk::ETH_RSS_* are u64
+            // consts, but required on older versions where bindgen widths differ.
+            #[allow(clippy::unnecessary_cast)]
+            {
+                port_conf.rx_adv_conf.rss_conf.rss_hf =
+                    (dpdk::ETH_RSS_IP | dpdk::ETH_RSS_TCP | dpdk::ETH_RSS_UDP) as u64
+                        & dev_info.flow_type_rss_offloads;
+            }
         }
 
         // In newer DPDKs setting only mtu with `dpdk::rte_eth_dev_set_mtu` is enough

@@ -416,11 +416,25 @@ impl Predicate {
     // Returns `true` if `self` and `pred` are entirely mutually exclusive
     // (i.e., could be correctly represented by "if `a` {} else if `b` {}"...)
     pub(super) fn is_excl(&self, pred: &Predicate) -> bool {
-        // Unary predicates at the same layer are mutually exclusive
-        // E.g.: `ipv4 | ipv6`, `tcp | udp`
-        if self.is_unary() && pred.is_unary() {
-            return true;
+        if self == pred {
+            return false;
         }
+
+        // Custom filters, callbacks, and layer states carry no protocol
+        // and are never mutually exclusive with one.
+        if (self.get_protocol() == ProtocolName::none())
+            != (pred.get_protocol() == ProtocolName::none())
+        {
+            return false;
+        }
+
+        // Different protocols are mutually exclusive if a connection, by our definitions,
+        // can't have both at the same time.
+        if self.get_protocol() != pred.get_protocol() {
+            return !has_path(self.get_protocol(), pred.get_protocol())
+                && !has_path(pred.get_protocol(), self.get_protocol());
+        }
+
         // A binary and unary predicate at the same layer will not be mutually excl.
         // E.g.: `ipv4 -> ipv4.src_addr = x.x.x.x` | `ipv4 -> tcp`
         if self.is_unary() != pred.is_unary() {
@@ -802,10 +816,8 @@ pub(super) fn is_parent_ipv4(
     parent_op: &BinOp,
 ) -> bool {
     match child_op {
-        BinOp::Eq | BinOp::In => {
-            if matches!(parent_op, BinOp::Eq) || matches!(parent_op, BinOp::In) {
-                return parent_ipv4.contains(child_ipv4);
-            }
+        BinOp::Eq | BinOp::In if matches!(parent_op, BinOp::Eq | BinOp::In) => {
+            return parent_ipv4.contains(child_ipv4);
         }
         BinOp::Ne => {
             if matches!(parent_op, BinOp::Ne) {
@@ -1561,5 +1573,30 @@ mod tests {
         };
         assert!(ssh_eq_byte2.is_excl(&ssh_contains_byte));
         assert!(ssh_contains_byte.is_excl(&ssh_eq_byte2));
+
+        // A custom filter carries no protocol, so it can co-occur with any protocol
+        // predicate and must never be reported as mutually exclusive with one.
+        let custom = Predicate::Custom {
+            name: filterfunc!("MaybeQuic"),
+            levels: vec![vec![StateTransition::InL4Conn]],
+            matched: true,
+            filtered_data: vec![],
+        };
+        let ipv4 = Predicate::Unary {
+            protocol: protocol!("ipv4"),
+        };
+        let ipv6 = Predicate::Unary {
+            protocol: protocol!("ipv6"),
+        };
+        assert!(!custom.is_excl(&ipv4));
+        assert!(!ipv4.is_excl(&custom));
+        assert!(!custom.is_excl(&ipv6));
+        assert!(!ipv6.is_excl(&custom));
+        assert!(!custom.is_excl(&tcp_80));
+        assert!(!tcp_80.is_excl(&custom));
+
+        // ipv4/ipv6 remain mutually exclusive with each other.
+        assert!(ipv4.is_excl(&ipv6));
+        assert!(ipv6.is_excl(&ipv4));
     }
 }

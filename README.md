@@ -1,16 +1,17 @@
-# Iris: Expressive Traffic Analysis for the Modern Internet
+# Iris
+
+[![build-status](https://github.com/stanford-esrg/iris/actions/workflows/ci.yml/badge.svg)](https://github.com/stanford-esrg/iris/actions)
+[![doc-status](https://github.com/stanford-esrg/iris/actions/workflows/rustdoc.yml/badge.svg)](https://stanford-esrg.github.io/iris/iris_core)
 
 Iris is an open-source development framework for traffic analysis research.
 
-Iris provides high-level abstractions, like [Zeek](https://zeek.org), alongside low-level, performant access to connection data. Iris absorbs the common, tedious tasks associated with traffic analysis, leaving researchers to focus on what is relevant to their use-cases. In experiments on the Stanford University network, we find that Iris can execute multiple concurrent, complex analsysis tasks at 100Gbps+ on a single commodity server.
+Iris provides high-level abstractions, like [Zeek](https://zeek.org), alongside low-level, performant access to connection data. Iris absorbs the common, tedious tasks associated with traffic analysis, leaving researchers to focus on what is relevant to their use-cases. In experiments on the Stanford University network, we find that Iris can execute multiple concurrent, complex analysis tasks at 100Gbps+ using just a few cores on a single commodity server.
 
-## Note for Artifact Evaluation
+## Documentation
 
-Meaningfully replicating the experiments in the Iris paper requires access to live traffic.
-However, Iris supports offline development and evaluation using packet captures.
-Additionally, the Iris *compiler*---which translates user-defined code and specifications into an end-to-end analysis pipeline---is a key aspect of the system.
+A detailed description of Iris's architecture and its performance can be found in our NSDI'26 paper: [Iris: Expressive Traffic Analysis for the Modern Internet](https://thearossman.github.io/files/iris.pdf).
 
-Full Rust crate documentation for using and developing against Iris will be improved and released in the coming weeks.
+Documentation for developing Iris applications can be found [here](https://stanford-esrg.github.io/iris/iris_core/).
 
 ## Installation and Setup
 
@@ -96,13 +97,11 @@ The compiler will throw an error if a StateTransition is required and missing.
 
 #### Built-In Data Type Wrappers
 
-Iris' ["built-in" data types](compiler/src/subscription.rs:#L16) are: `L4Pdu`, `StateTxData`, `StateTransition`, `StateTxData`, `Session`, `SessionProto`, `CoreId`, and `StateTransition`.
-
-These are
+Iris' ["built-in" data types](compiler/src/subscription.rs:#L16) are: `L4Pdu`, `StateTxData`, `StateTransition`, `StateTxData`, `Session`, `SessionProto`, `CoreId`, and `StateTransition`. 
 
 ### Filters
 
-Iris supports a Wireshark-like filter syntax that builds on that introduced by [Retina](https://stanford-esrg.github.io/retina/retina_filtergen/index.html) for filtering on protocols and protocol fields.
+Iris supports a Wireshark-like filter syntax similar to [Retina](https://stanford-esrg.github.io/retina/retina_filtergen/index.html) for filtering on protocols and protocol fields.
 
 Iris also supports defining custom (stateful or stateless) filters, similar to data types. Custom filter functions must return a `FilterResult` (Accept, Drop, or Continue). Stateful filters (i.e., those associated with a struct) must implement the [StatefulFilter](./core/src/subscription/filter.rs) trait.
 
@@ -261,3 +260,9 @@ After all macros, you must tag some function or struct with:
 ```
 
 This tells Iris that it has read all macro inputs and can begin generating code. This must go in the main file of every application. Generally, putting it on the `main` function makes sense.
+
+
+## Contributing
+
+Contributions welcome! Please run cargo fmt and cargo clippy before making a pull request.
+If you're not sure where to start, we appreciate contributions to documentation, testing, and open [issues and feature requests](https://github.com/stanford-esrg/iris/issues).

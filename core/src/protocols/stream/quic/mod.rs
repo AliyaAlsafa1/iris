@@ -1,11 +1,11 @@
 //! QUIC protocol parser.
 //!
 //! ## Remarks
-//! [QUIC-INVARIANTS] https://datatracker.ietf.org/doc/rfc8999/
-//! [QUIC-RFC9000] https://datatracker.ietf.org/doc/rfc9000/ (Quic V1)
-//! Iris currently only parses Quic Long and Short Headers and does not attempt to parse TLS or HTTP/3 out of
-//! Quic packets. The Quic protocol parser makes several assumptions about the way that quic
-//! packets will behave:
+//! - [QUIC-INVARIANTS](https://datatracker.ietf.org/doc/rfc8999/)
+//! - [QUIC-RFC9000](https://datatracker.ietf.org/doc/rfc9000/) (Quic V1)
+//!   Iris currently only parses Quic Long and Short Headers and does not attempt to parse TLS or HTTP/3 out of
+//!   Quic packets. The Quic protocol parser makes several assumptions about the way that quic
+//!   packets will behave:
 //! - Assume that the Quic version is one as listed in the QuicVersion Enum in the quic/parser.rs file
 //! - Assume that the dcid of a short header is a maximum of 20 bytes.
 //! - Assume that the packet will not try to grease the fixed bit.
@@ -25,6 +25,7 @@ pub(crate) mod parser;
 use std::collections::{BTreeMap, HashSet};
 
 pub use self::header::{QuicLongHeader, QuicShortHeader};
+pub use self::parser::{is_quic_version, QuicVersion};
 use crypto::Open;
 use frame::QuicFrame;
 use header::LongHeaderPacketType;
@@ -155,13 +156,8 @@ impl QuicPacket {
     /// Returns the source connection ID of the Quic packet or an empty string if it does not exist
     pub fn scid(&self) -> &str {
         match &self.long_header {
-            Some(long_header) => {
-                if long_header.scid_len > 0 {
-                    &long_header.scid
-                } else {
-                    ""
-                }
-            }
+            Some(long_header) if long_header.scid_len > 0 => &long_header.scid,
+            Some(_) => "",
             None => "",
         }
     }

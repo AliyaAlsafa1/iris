@@ -1,18 +1,19 @@
 use std::ffi::CStr;
 use std::mem;
+use std::net::IpAddr;
 use std::ptr;
-use std::net::{IpAddr};
 
-use anyhow::{bail, Result};
-use crate::FiveTuple;
 use crate::port::PortId;
 use crate::protocols::packet::tcp::TCP_PROTOCOL;
 use crate::protocols::packet::udp::UDP_PROTOCOL;
+use crate::FiveTuple;
+use anyhow::{bail, Result};
 
 use crate::dpdk;
-use crate::dpdk::{rte_flow, rte_flow_item, rte_flow_attr, rte_flow_error, rte_flow_create,
-    rte_flow_destroy, rte_flow_action, rte_flow_item_ipv4, rte_flow_item_ipv6,
-    rte_flow_item_tcp, rte_flow_item_udp};
+use crate::dpdk::{
+    rte_flow, rte_flow_action, rte_flow_attr, rte_flow_create, rte_flow_destroy, rte_flow_error,
+    rte_flow_item, rte_flow_item_ipv4, rte_flow_item_ipv6, rte_flow_item_tcp, rte_flow_item_udp,
+};
 
 const BASE_GROUP: u32 = 2;
 const LAST_GROUP: u32 = 2;
@@ -24,7 +25,10 @@ const UDP: u8 = 17;
 
 /// Returns a table in [2..=14] using dest port low nibble for TCP/UDP.
 /// Non-TCP/UDP fall back to BASE_GROUP.
-/// CURRENTLY UNUSED FOR TESTING !
+/// CURRENTLY UNUSED FOR TESTING ! Kept (with the consts above) as scaffolding for
+/// spreading drop rules across groups; `NUM_GROUPS` is 1 until LAST_GROUP moves.
+#[allow(dead_code)]
+#[allow(clippy::modulo_one)]
 fn find_table(tuple: &FiveTuple) -> u32 {
     let nibble_u32 = match tuple.proto as u8 {
         TCP | UDP => u32::from(tuple.resp.port() & L4_LSB_MASK),
@@ -34,6 +38,11 @@ fn find_table(tuple: &FiveTuple) -> u32 {
 }
 
 // Take in vector of PortIds, FiveTuple to block, and returns a vector of flow pointers
+//
+// `unused_assignments` is allowed because the reverse-direction block below writes into
+// the same *_spec structs that `pattern` already holds raw pointers to. rte_flow_create
+// reads them through those pointers, which rustc cannot see.
+#[allow(unused_assignments)]
 pub fn install_drop_flow(port_ids: Vec<PortId>, tuple: &FiveTuple) -> Result<Vec<*mut rte_flow>> {
     let mut flows = Vec::with_capacity(port_ids.len());
 
@@ -169,7 +178,7 @@ pub fn install_drop_flow(port_ids: Vec<PortId>, tuple: &FiveTuple) -> Result<Vec
     for port_id in port_ids.iter() {
         let mut error: rte_flow_error = unsafe { mem::zeroed() };
 
-        let start = unsafe { dpdk::rte_rdtsc() };
+        //let start = unsafe { dpdk::rte_rdtsc() };
         let flow = unsafe {
             rte_flow_create(
                 port_id.raw(),
@@ -185,29 +194,16 @@ pub fn install_drop_flow(port_ids: Vec<PortId>, tuple: &FiveTuple) -> Result<Vec
         //println!("Latency (cycles): {}", duration);
 
         if flow.is_null() {
-            let msg = unsafe {
-                CStr::from_ptr(error.message)
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            anyhow::bail!(
-                "Failed to install flow on port {}: {}",
-                port_id.raw(),
-                msg
-            );
+            let msg = unsafe { CStr::from_ptr(error.message).to_string_lossy().into_owned() };
+            anyhow::bail!("Failed to install flow on port {}: {}", port_id.raw(), msg);
         }
 
         flows.push(flow);
     }
 
     // -------- REVERSE FLOW (resp -> orig) --------
-    let rev = FiveTuple {
-        orig: tuple.resp,
-        resp: tuple.orig,
-        proto: tuple.proto,
-    };
+    // No new FiveTuple is needed: the specs `pattern` points at are swapped in place below.
     attr.group = 1;
-
 
     // Swap addresses/ports in the SAME specs, then call create again
     match (src_ip, dst_ip) {
@@ -236,7 +232,7 @@ pub fn install_drop_flow(port_ids: Vec<PortId>, tuple: &FiveTuple) -> Result<Vec
 
     for port_id in port_ids.iter() {
         let mut error_rev: rte_flow_error = unsafe { mem::zeroed() };
-        let start = unsafe { dpdk::rte_rdtsc() };
+        //let start = unsafe { dpdk::rte_rdtsc() };
         let flow_rev = unsafe {
             rte_flow_create(
                 port_id.raw(),
@@ -258,11 +254,7 @@ pub fn install_drop_flow(port_ids: Vec<PortId>, tuple: &FiveTuple) -> Result<Vec
                     .into_owned()
             };
 
-            anyhow::bail!(
-                "Failed to install flow on port {}: {}",
-                port_id.raw(),
-                msg
-            );
+            anyhow::bail!("Failed to install flow on port {}: {}", port_id.raw(), msg);
         }
 
         flows.push(flow_rev);
@@ -273,7 +265,8 @@ pub fn install_drop_flow(port_ids: Vec<PortId>, tuple: &FiveTuple) -> Result<Vec
 
 /// Uninstall DROP flow rules previously installed with `install_drop_flow`
 pub fn uninstall_drop_flow(port_ids: Vec<PortId>, flows: Vec<*mut rte_flow>) -> Result<()> {
-    if (port_ids.len() * 2) != flows.len() { // Must double length of port_ids to account for forward/rev flows
+    if (port_ids.len() * 2) != flows.len() {
+        // Must double length of port_ids to account for forward/rev flows
         bail!(
             "Mismatched lengths: {} ports but {} flows",
             port_ids.len(),
@@ -288,7 +281,7 @@ pub fn uninstall_drop_flow(port_ids: Vec<PortId>, flows: Vec<*mut rte_flow>) -> 
         }
 
         let mut error: rte_flow_error = unsafe { mem::zeroed() };
-        let start = unsafe { dpdk::rte_rdtsc() };
+        //let start = unsafe { dpdk::rte_rdtsc() };
         let ret = unsafe { rte_flow_destroy(port_id.raw(), *flow, &mut error) };
 
         // Latency Calculation
@@ -296,9 +289,7 @@ pub fn uninstall_drop_flow(port_ids: Vec<PortId>, flows: Vec<*mut rte_flow>) -> 
         //println!("Uninstall latency (cycles): {}", duration);
 
         if ret != 0 {
-            let msg = unsafe {
-                CStr::from_ptr(error.message).to_string_lossy().into_owned()
-            };
+            let msg = unsafe { CStr::from_ptr(error.message).to_string_lossy().into_owned() };
             bail!(
                 "Failed to uninstall DROP flow on port {}: {}",
                 port_id.raw(),

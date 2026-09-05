@@ -2,21 +2,21 @@
 use clap::Parser;
 use lazy_static::lazy_static;
 
+use iris_compiler::{callback, input_files, iris_end_macros};
 use iris_core::{
+    //    CoreId,
+    FiveTuple,
+    Runtime,
     config::{default_config, load_config},
     filter::flow_drop::{install_drop_flow, uninstall_drop_flow},
     port::PortId,
     rte_flow,
-//    CoreId,
-    FiveTuple,
-    Runtime,
 };
 use iris_datatypes::TlsHandshake;
-use iris_compiler::{callback, input_files, iris_end_macros};
 
 use rand::Rng;
 use std::{
-    collections::{HashSet},
+    collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::{Mutex, RwLock},
@@ -164,7 +164,7 @@ fn main() {
                     });
                     installed += 1;
                     if installed % 10000 == 0 || installed == num_flows {
-                       // eprintln!("[loss_test] installed {} / {} flows", installed, num_flows);
+                        // eprintln!("[loss_test] installed {} / {} flows", installed, num_flows);
                     }
                 }
                 Err(e) => eprintln!("[loss_test] install failed at {}: {:?}", i, e),
@@ -196,8 +196,7 @@ fn main() {
         );
         let mut inst = INSTALLED.lock().unwrap();
         for entry in inst.drain(..) {
-            let raw_ptrs: Vec<*mut rte_flow> =
-                entry.flow_ptrs.iter().map(|fp| fp.0).collect();
+            let raw_ptrs: Vec<*mut rte_flow> = entry.flow_ptrs.iter().map(|fp| fp.0).collect();
             if let Err(e) = uninstall_drop_flow(entry.ports.clone(), raw_ptrs) {
                 eprintln!("[loss_test] uninstall error: {:?}", e);
             }

@@ -74,7 +74,7 @@ where
         log::info!("Initializing RX Cores...");
         let mut rx_cores: BTreeMap<CoreId, RxCore<S>> = BTreeMap::new();
         let mut core_map: BTreeMap<CoreId, Vec<RxQueue>> = BTreeMap::new();
-        for (_port_id, port) in ports.iter() {
+        for port in ports.values() {
             for (rxqueue, core_id) in port.queue_map.iter() {
                 core_map.entry(*core_id).or_default().push(*rxqueue);
             }
@@ -107,7 +107,7 @@ where
         self.start_ports();
 
         log::info!("Launching RX cores...");
-        for (core_id, _rx_core) in self.rx_cores.iter() {
+        for core_id in self.rx_cores.keys() {
             let role = unsafe { dpdk::rte_eal_lcore_role(core_id.raw()) };
             if role != dpdk::rte_lcore_role_t_ROLE_RTE {
                 log::error!("Attempted to launch non-DPDK core");
@@ -185,10 +185,12 @@ where
                 log::info!("Applying dynamic hardware filters...");
                 self.filter
                     .set_dynamic_hardware_filters(port)
-                    .expect(&format!(
-                        "Dynamic hardware filter install failed on Port {}",
-                        port.id
-                    ));
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "Dynamic hardware filter install failed on Port {}: {}",
+                            port.id, e
+                        )
+                    });
             } else if self.options.online.hardware_assist {
                 log::info!("Applying hardware filters...");
                 let res = self.filter.set_hardware_filter(port);
@@ -213,10 +215,7 @@ where
                 }
             }
             if self.options.online.drop_quic_raw {
-                log::info!(
-                    "Installing QUIC short-header raw drop on port {}",
-                    port.id
-                );
+                log::info!("Installing QUIC short-header raw drop on port {}", port.id);
                 if let Err(e) = crate::filter::flow_drop::install_quic_short_drop(port.id) {
                     log::warn!(
                         "QUIC short-header raw drop install failed on port {}: {:?}",

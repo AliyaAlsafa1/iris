@@ -189,11 +189,7 @@ fn create_raw_drop(
     Ok(flow)
 }
 
-fn install_tls_appdata_drop_variant(
-    port_id: PortId,
-    ip_ver: u8,
-    ihl: u8,
-) -> Result<*mut rte_flow> {
+fn install_tls_appdata_drop_variant(port_id: PortId, ip_ver: u8, ihl: u8) -> Result<*mut rte_flow> {
     let ip_off = 14usize;
     let ip_hlen = if ip_ver == 4 { ihl as usize * 4 } else { 40 };
     let tcp_off = ip_off + ip_hlen;

@@ -15,7 +15,7 @@ use iris_core::filter::ptree::PNode;
 
 use heck::CamelCase;
 use regex::{Regex, bytes::Regex as BytesRegex};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use syn::LitInt;
 use syn::LitStr;
 
@@ -644,11 +644,17 @@ pub(crate) fn custom_pred_to_tokens(
 }
 
 /// Custom streaming (stateful or stateless) callback predicate to tokens
-/// in a filter PTree. This checks whether a callback is currently active,
-/// but it does not invoke the callback.
+/// in a filter PTree. This guards the actions a callback still needs, but it does
+/// not invoke the callback.
+///
+/// This tests "has not unsubscribed" rather than `is_active`. A callback node in a
+/// pre-match subtree (e.g. under InL4Conn, before the L7 protocol is known) carries the
+/// actions -- L4 `PassThrough`, L7 `Parse` -- that let the callback's filter match at
+/// all. Gating those on `is_active` is circular: the callback only becomes active at
+/// `L7OnDisc`, which is unreachable without them.
 pub(crate) fn callback_pred_to_tokens(name: &str) -> proc_macro2::TokenStream {
     let ident = Ident::new(&name.to_lowercase(), Span::call_site());
-    quote! { conn.tracked.#ident.is_active() }
+    quote! { conn.tracked.#ident.is_subscribed() }
 }
 
 pub(crate) fn layerstate_to_tokens(
@@ -685,7 +691,7 @@ pub(crate) fn binary_to_tokens(
     field: &FieldName,
     op: &BinOp,
     value: &Value,
-    statics: &mut HashMap<String, (String, proc_macro2::TokenStream)>,
+    statics: &mut BTreeMap<String, (String, proc_macro2::TokenStream)>,
 ) -> proc_macro2::TokenStream {
     assert!(!field.is_combined()); // should have been split when building tree
     let proto = Ident::new(protocol.name(), Span::call_site());
@@ -873,7 +879,7 @@ pub(crate) fn binary_to_tokens(
 }
 
 fn static_ident_re(
-    statics: &mut HashMap<String, (String, proc_macro2::TokenStream)>,
+    statics: &mut BTreeMap<String, (String, proc_macro2::TokenStream)>,
     text: &String,
     val_lit: syn::LitStr,
     kind: proc_macro2::TokenStream,
@@ -894,7 +900,7 @@ fn static_ident_re(
 }
 
 fn static_ident_memchr(
-    statics: &mut HashMap<String, (String, proc_macro2::TokenStream)>,
+    statics: &mut BTreeMap<String, (String, proc_macro2::TokenStream)>,
     text: &String,
     val_lit: proc_macro2::TokenStream,
 ) -> Ident {
