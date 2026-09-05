@@ -185,10 +185,12 @@ where
                 log::info!("Applying dynamic hardware filters...");
                 self.filter
                     .set_dynamic_hardware_filters(port)
-                    .expect(&format!(
-                        "Dynamic hardware filter install failed on Port {}",
-                        port.id
-                    ));
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "Dynamic hardware filter install failed on Port {}: {}",
+                            port.id, e
+                        )
+                    });
             } else if self.options.online.hardware_assist {
                 log::info!("Applying hardware filters...");
                 let res = self.filter.set_hardware_filter(port);
@@ -213,10 +215,7 @@ where
                 }
             }
             if self.options.online.drop_quic_raw {
-                log::info!(
-                    "Installing QUIC short-header raw drop on port {}",
-                    port.id
-                );
+                log::info!("Installing QUIC short-header raw drop on port {}", port.id);
                 if let Err(e) = crate::filter::flow_drop::install_quic_short_drop(port.id) {
                     log::warn!(
                         "QUIC short-header raw drop install failed on port {}: {:?}",

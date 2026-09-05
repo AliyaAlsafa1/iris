@@ -4,17 +4,15 @@ use lazy_static::lazy_static;
 use serde::Serialize;
 
 use iris_core::{
+    CoreId, FiveTuple, Runtime,
     config::{default_config, load_config},
     filter::flow_drop::{install_drop_flow, uninstall_drop_flow},
     multicore::{ChannelDispatcher, ChannelMode, SharedWorkerThreadSpawner},
     port::PortId,
-    CoreId,
-    FiveTuple,
-    Runtime,
 };
 
-use iris_core::dpdk::rte_flow;
 use iris_compiler::{callback, input_files, iris_end_macros};
+use iris_core::dpdk::rte_flow;
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -62,7 +60,6 @@ enum ChannelModeArg {
     Shared,
 }
 
-
 #[derive(Parser, Debug)]
 struct Args {
     #[clap(short, long, value_parser, value_name = "FILE")]
@@ -104,8 +101,6 @@ struct Args {
     show_args: bool,
 }
 
-
-
 // ===== Helpers =====
 
 /// Expire and uninstall any rules whose deadlines have passed.
@@ -133,7 +128,9 @@ fn expire_flows_now() {
 // Try for all TCP
 #[callback("tcp,level=InL4Conn")]
 fn tls_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> bool {
-    if pkts.total() < 10 { return true; }
+    if pkts.total() < 10 {
+        return true;
+    }
 
     let tuple = five_tuple.clone();
 
@@ -148,7 +145,6 @@ fn tls_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> bool {
     }
     true
 }
-
 
 // ===== Main =====
 
@@ -211,7 +207,6 @@ fn main() {
                         // Record when we installed the drop rule for this tuple
                         targets.insert(tuple.clone(), Instant::now());
                     }
-
 
                     // Install, if we have ports
                     let maybe_ports = PORT_IDS.read().unwrap().clone();

@@ -4,17 +4,15 @@ use lazy_static::lazy_static;
 use serde::Serialize;
 
 use iris_core::{
+    CoreId, FiveTuple, Runtime,
     config::{default_config, load_config},
     filter::flow_drop::{install_drop_flow, uninstall_drop_flow},
     multicore::{ChannelDispatcher, ChannelMode, SharedWorkerThreadSpawner},
     port::PortId,
-    CoreId,
-    FiveTuple,
-    Runtime,
 };
 
-use iris_core::dpdk::rte_flow;
 use iris_compiler::{callback, input_files, iris_end_macros};
+use iris_core::dpdk::rte_flow;
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -52,7 +50,7 @@ enum FlowEvent {
     TlsSeen { tuple: FiveTuple, rx_core: CoreId },
 }
 
-const TIMEOUT_SECS: u64 = 120;  // 2 minutes
+const TIMEOUT_SECS: u64 = 120; // 2 minutes
 const NUM_FLOWS: usize = 1000000; // how many flows to install for
 
 // ===== CLI =====
@@ -61,7 +59,6 @@ enum ChannelModeArg {
     PerCore,
     Shared,
 }
-
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -104,8 +101,6 @@ struct Args {
     show_args: bool,
 }
 
-
-
 // ===== Helpers =====
 
 /// Expire and uninstall any rules whose deadlines have passed.
@@ -137,7 +132,9 @@ fn expire_flows_now() {
 fn tls_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> bool {
     #[cfg(feature = "tls-callbacks")]
     {
-        if pkts.total() < 10 { return true; }
+        if pkts.total() < 10 {
+            return true;
+        }
 
         let tuple = five_tuple.clone();
 
@@ -153,7 +150,6 @@ fn tls_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> bool {
     }
     true
 }
-
 
 // ===== Main =====
 

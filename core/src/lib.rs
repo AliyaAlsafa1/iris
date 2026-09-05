@@ -79,9 +79,9 @@ pub use self::lcore::CoreId;
 pub use self::memory::mbuf::Mbuf;
 pub use self::runtime::Runtime;
 
+pub use dpdk::rte_flow;
 pub use dpdk::rte_lcore_id;
 pub use dpdk::rte_rdtsc;
-pub use dpdk::rte_flow;
 
 #[macro_use]
 extern crate pest_derive;

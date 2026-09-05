@@ -13,12 +13,10 @@ use super::Filter;
 
 use crate::dpdk;
 use crate::port::*;
-use crate::dpdk::rte_flow_item;
 
 use std::ffi::{c_void, CStr};
 use std::fmt;
 use std::mem;
-use std::ptr;
 
 use anyhow::{bail, Result};
 use log::{debug, error, info, warn};
@@ -482,7 +480,6 @@ pub(crate) fn flush_rules(port: &Port) {
     }
 }
 
-
 /*
 // DECLARING CONSTS HERE FOR EASE... will move up later
 const BASE_GROUP: u32 = 2;
@@ -722,7 +719,6 @@ pub fn install_dyn_hardware_rules(port: &Port) -> Result<()> {
                 lpattern: LayeredPattern::new(),
                 reason: msg.to_str().unwrap().to_string()
             });
-            println!("Validation succeeded\n");
         } else {
             let ret = dpdk::rte_flow_create(
                 port.id.raw(),

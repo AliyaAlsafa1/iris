@@ -174,7 +174,7 @@ pub use rte_eth_rx_mq_mode_RTE_ETH_MQ_RX_RSS as rte_eth_rx_mq_mode_ETH_MQ_RX_RSS
 #[cfg(dpdk_ge_2311)]
 pub use RTE_ETH_RETA_GROUP_SIZE as RTE_RETA_GROUP_SIZE;
 
-// Changed dpdk v23.11 to use 64-bit values for RSS hash types, 
+// Changed dpdk v23.11 to use 64-bit values for RSS hash types,
 // so we need to redefine these constants here.
 #[cfg(dpdk_ge_2311)]
 pub const ETH_RSS_IP: u64 = 1 << 2;

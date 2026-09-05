@@ -59,6 +59,7 @@ pub(super) fn append_end(rules: &mut PatternRules) {
 }
 
 // ADDED
+#[allow(dead_code)]
 pub(super) fn build_tcp_port_mask(val: u16, mask: u16) -> FlowItem<dpdk::rte_flow_item_tcp> {
     let mut tcp_spec: dpdk::rte_flow_item_tcp = unsafe { mem::zeroed() };
     let mut tcp_mask: dpdk::rte_flow_item_tcp = unsafe { mem::zeroed() };
@@ -74,6 +75,7 @@ pub(super) fn build_tcp_port_mask(val: u16, mask: u16) -> FlowItem<dpdk::rte_flo
 }
 
 // ADDED ... not utilized yet
+#[allow(dead_code)]
 pub(super) fn build_udp_port_mask(val: u16, mask: u16) -> FlowItem<dpdk::rte_flow_item_udp> {
     let mut udp_spec: dpdk::rte_flow_item_udp = unsafe { mem::zeroed() };
     let mut udp_mask: dpdk::rte_flow_item_udp = unsafe { mem::zeroed() };
