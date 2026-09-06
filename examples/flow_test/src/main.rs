@@ -69,6 +69,13 @@ static SPLIT_QUEUES: RwLock<Option<HashMap<CoreId, u16>>> = RwLock::new(None);
 static NUM_FLOWS: OnceLock<usize> = OnceLock::new();
 static USE_MODEL: OnceLock<bool> = OnceLock::new();
 
+static OFFLOAD_AFTER_PKTS: OnceLock<usize> = OnceLock::new();
+
+#[inline]
+fn offload_after_pkts() -> usize {
+    *OFFLOAD_AFTER_PKTS.get().unwrap_or(&20)
+}
+
 #[derive(Clone, Serialize)]
 enum FlowEvent {
     /// Minimal payload to keep cloning cheap
@@ -127,7 +134,12 @@ struct Args {
 
     #[clap(long, value_name = "COUNT", default_value = "100")]
     num_flows: usize,
+
+    #[clap(long, value_name = "COUNT", default_value = "20")]
+    offload_after_pkts: usize,
 }
+
+const MODEL_FEATURE_PKTS: usize = 20;
 
 // ===== Helpers =====
 
@@ -236,7 +248,7 @@ fn tls_cb(
     iat: &InterArrivals,
     tls: &TlsHandshake,
 ) -> bool {
-    if pkts.total() != 20 {
+    if pkts.total() != offload_after_pkts() {
         return true;
     }
 
@@ -250,7 +262,7 @@ fn tls_cb(
         let inv = ConnInvariants::from_conn(conn, conn_hash, first_seen_ts);
 
         match (
-            ConnFeatures::from_conn_at(conn, iat, 20, &inv),
+            ConnFeatures::from_conn_at(conn, iat, MODEL_FEATURE_PKTS as u64, &inv),
             TlsFeatures::from_tls(tls),
         ) {
             (Some(conn_features), Some(tls_features)) => {
@@ -293,10 +305,21 @@ fn main() {
 
     NUM_FLOWS.set(args.num_flows).unwrap();
 
+    OFFLOAD_AFTER_PKTS.set(args.offload_after_pkts).unwrap();
+
     // Load the LightGBM model before starting the runtime, if one was provided.
     // With no model, every qualifying TLS flow is admitted (admit-all mode).
     let use_model = match &args.model {
         Some(path) => {
+            // The model's features are snapshotted at a fixed packet count, so moving the
+            // threshold would feed it features from the wrong point in the connection. That is a
+            // silent correctness bug, not a tuning choice.
+            assert_eq!(
+                args.offload_after_pkts, MODEL_FEATURE_PKTS,
+                "--model requires --offload-after-pkts {MODEL_FEATURE_PKTS} (the packet count the \
+                 model's features were trained at); got {}",
+                args.offload_after_pkts,
+            );
             model::load_model(path.to_str().expect("Invalid model path"));
             true
         }
