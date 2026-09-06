@@ -66,7 +66,7 @@ use iris_core::{CoreId, FiveTuple, Runtime};
 use iris_datatypes::TlsHandshake;
 use lazy_static::lazy_static;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -80,6 +80,7 @@ static APP_CYCLES: OnceLock<u64> = OnceLock::new();
 static PORT_IDS: OnceLock<Vec<PortId>> = OnceLock::new();
 static FLOW_DISPATCHER: OnceLock<Arc<ChannelDispatcher<FlowEvent>>> = OnceLock::new();
 static MAX_RULES: OnceLock<usize> = OnceLock::new();
+static TABLE_FULL_POLICY: OnceLock<TableFullPolicy> = OnceLock::new();
 
 /// Once per TLS connection at the ciphertext transition. The arm-equivalence check: this must
 /// match across arms, otherwise they did not do the same work.
@@ -90,6 +91,8 @@ static APP_CYCLES_BURNED: AtomicU64 = AtomicU64::new(0);
 static SHED_CONNS: AtomicU64 = AtomicU64::new(0);
 /// Offload requests refused because the rule table was already at `--max-rules`.
 static OFFLOAD_REFUSED: AtomicU64 = AtomicU64::new(0);
+/// Rules evicted to make room, under `--table-full-policy evict`.
+static RULE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(ArgEnum, Copy, Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -100,6 +103,19 @@ enum DropMode {
     Software,
     /// Shed the tail in the NIC via a per-connection `rte_flow` DROP rule.
     Hardware,
+}
+
+/// What to do when the rule table is already at `--max-rules`.
+#[derive(ArgEnum, Copy, Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum TableFullPolicy {
+    /// Decline the offload and count it in `offload_refused`. The rule set is then whichever
+    /// connections happened to arrive first, which are disproportionately long-lived — a biased
+    /// sample, but a stable one.
+    Refuse,
+    /// Evict the least recently *added* rule (FIFO) and install the new one. Bounds the table the
+    /// same way, but keeps it tracking current traffic rather than freezing on the first arrivals.
+    Evict,
 }
 
 // ---------------------------------------------------------------------------
@@ -117,18 +133,32 @@ struct HandlePtr(*mut rte_flow_action_handle);
 unsafe impl Send for HandlePtr {}
 unsafe impl Sync for HandlePtr {}
 
-/// One installed rule set, retained so its COUNT handles can be read back at shutdown.
+/// One installed rule set, retained so its COUNT handles can be read back — on eviction, or at
+/// shutdown for whatever is still resident.
 struct FlowEntry {
+    tuple: FiveTuple,
     ports: Vec<PortId>,
     flow_ptrs: Vec<FlowPtr>,
     handle_ptrs: Vec<HandlePtr>,
 }
 
+/// The offloaded rule set: dedup membership and FIFO order, under one lock.
+///
+/// One mutex rather than two, because the two facts have to agree. With more than one
+/// `--worker-cores` thread, separate locks would let two workers both observe a full table and
+/// both evict, or both pass the dedup check for the same tuple and both install — the second
+/// leaking a NIC rule that nothing subsequently uninstalls or counts.
+#[derive(Default)]
+struct RuleTable {
+    /// Tuples with a rule installed *or an install in flight*. Installs are counted so that
+    /// `--max-rules` bounds what the NIC holds, not merely what has finished installing.
+    resident: HashSet<FiveTuple>,
+    /// Installed rule sets in install order, so the front is the least recently added.
+    fifo: VecDeque<FlowEntry>,
+}
+
 lazy_static! {
-    /// Tuples already offloaded, for dedup. Also bounds the rule count.
-    static ref INSTALLED: Mutex<HashMap<FiveTuple, ()>> = Mutex::new(HashMap::new());
-    /// Installed rule sets, kept for the shutdown counter read.
-    static ref RULES: Mutex<Vec<FlowEntry>> = Mutex::new(Vec::new());
+    static ref RULES: Mutex<RuleTable> = Mutex::new(RuleTable::default());
 }
 
 /// Sent from the RX datapath to the install worker. `rte_flow_create` takes far too long to run
@@ -138,21 +168,9 @@ enum FlowEvent {
     DropFlow { tuple: FiveTuple },
 }
 
-/// Worker-side install. Deduped, and capped at `--max-rules` so a run cannot silently become a
-/// rule-table capacity experiment.
+/// Worker-side install. Deduped, and bounded at `--max-rules` so a run cannot silently become a
+/// rule-table capacity experiment. `--table-full-policy` decides what happens at the bound.
 fn install_hw_drop(tuple: &FiveTuple) {
-    {
-        let installed = INSTALLED.lock().unwrap();
-        if installed.contains_key(tuple) {
-            return;
-        }
-        let cap = *MAX_RULES.get().unwrap_or(&0);
-        if cap != 0 && installed.len() >= cap {
-            OFFLOAD_REFUSED.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-    }
-
     let ports = match PORT_IDS.get() {
         Some(p) => p,
         None => {
@@ -161,14 +179,66 @@ fn install_hw_drop(tuple: &FiveTuple) {
         }
     };
 
-    // Reserve before installing so a concurrent worker cannot double-install.
-    INSTALLED.lock().unwrap().insert(*tuple, ());
+    let cap = *MAX_RULES.get().unwrap_or(&0);
+    let policy = *TABLE_FULL_POLICY.get().unwrap_or(&TableFullPolicy::Refuse);
+
+    // Decide and reserve under the lock; do no rte_flow work while holding it. A create or a
+    // destroy is on the order of 12 us, and every other worker would serialise behind it.
+    let victim = {
+        let mut table = RULES.lock().unwrap();
+        if table.resident.contains(tuple) {
+            return;
+        }
+
+        let mut victim = None;
+        if cap != 0 && table.resident.len() >= cap {
+            match policy {
+                TableFullPolicy::Refuse => {
+                    OFFLOAD_REFUSED.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                TableFullPolicy::Evict => match table.fifo.pop_front() {
+                    // Release the victim's reservation along with its rule, so that tuple can be
+                    // offered again later.
+                    Some(old) => {
+                        table.resident.remove(&old.tuple);
+                        victim = Some(old);
+                    }
+                    // Nothing installed yet to evict: every resident tuple is an install still in
+                    // flight. Refuse rather than let the table exceed the cap.
+                    None => {
+                        OFFLOAD_REFUSED.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                },
+            }
+        }
+
+        // Reserve before installing so a concurrent worker cannot double-install.
+        table.resident.insert(*tuple);
+        victim
+    };
+
+    // Evict before installing rather than after: against a real table limit the install would
+    // otherwise fail with the victim still resident. `uninstall_flow` queries each COUNT handle
+    // before destroying it, so an evicted rule's drops stay in the ground-truth totals and its
+    // teardown is charged to `destroy_cycles`.
+    if let Some(old) = victim {
+        let flows: Vec<*mut rte_flow> = old.flow_ptrs.iter().map(|p| p.0).collect();
+        let handles: Vec<*mut rte_flow_action_handle> =
+            old.handle_ptrs.iter().map(|p| p.0).collect();
+        if let Err(e) = uninstall_flow(old.ports.clone(), flows, handles) {
+            log::warn!("failed to evict HW flow {:?}: {e:?}", old.tuple);
+        }
+        RULE_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+    }
 
     // `install_drop_flow` installs both directions and attaches an indirect COUNT action to each
     // rule, which is how the report proves the rules actually matched traffic.
     match install_drop_flow(ports.clone(), tuple) {
         Ok((flows, handles)) => {
-            RULES.lock().unwrap().push(FlowEntry {
+            RULES.lock().unwrap().fifo.push_back(FlowEntry {
+                tuple: *tuple,
                 ports: ports.clone(),
                 flow_ptrs: flows.into_iter().map(FlowPtr).collect(),
                 handle_ptrs: handles.into_iter().map(HandlePtr).collect(),
@@ -176,7 +246,7 @@ fn install_hw_drop(tuple: &FiveTuple) {
         }
         Err(e) => {
             log::warn!("HW drop rule install failed for {tuple:?}: {e:?}");
-            INSTALLED.lock().unwrap().remove(tuple);
+            RULES.lock().unwrap().resident.remove(tuple);
         }
     }
 }
@@ -185,7 +255,11 @@ fn install_hw_drop(tuple: &FiveTuple) {
 /// into `DISCARDED_PACKETS`/`DISCARDED_BYTES`, giving the NIC-side ground truth for how much
 /// traffic was shed.
 fn drain_rules(uninstall: bool) {
-    let entries: Vec<FlowEntry> = RULES.lock().unwrap().drain(..).collect();
+    let entries: Vec<FlowEntry> = {
+        let mut table = RULES.lock().unwrap();
+        table.resident.clear();
+        table.fifo.drain(..).collect()
+    };
     for entry in entries {
         let flows: Vec<*mut rte_flow> = entry.flow_ptrs.iter().map(|p| p.0).collect();
         let handles: Vec<*mut rte_flow_action_handle> =
@@ -363,6 +437,10 @@ struct ControlPlaneCost {
     mean_install_cycles: f64,
     /// Rules the app declined to install because `--max-rules` was reached.
     offload_refused: u64,
+    /// Rules evicted to make room under `--table-full-policy evict`. Their drops are still in
+    /// `ground_truth.discarded_packets` and their teardown in `destroy_cycles`, so eviction churn
+    /// is charged to the mechanism rather than hidden.
+    evictions: u64,
     /// Install cycles as a share of one RX core's `wall`. If this approaches the datapath saving,
     /// the mechanism does not pay for itself at this connection arrival rate.
     install_cycles_vs_core_wall: f64,
@@ -385,6 +463,7 @@ struct Report {
     drop_mode: DropMode,
     app_cycles_requested: u64,
     max_rules: usize,
+    table_full_policy: TableFullPolicy,
     config_path: String,
     /// Arm-equivalence check: must match across arms.
     tls_callbacks: u64,
@@ -429,6 +508,14 @@ struct Args {
     #[clap(long, default_value = "0")]
     max_rules: usize,
 
+    /// What to do once `--max-rules` is reached: `refuse` the offload, or `evict` the least
+    /// recently added rule to make room.
+    ///
+    /// Defaults to `refuse`, which is what earlier runs did — switching the default would silently
+    /// change what `--max-rules N` means and break comparison with reports already collected.
+    #[clap(long, arg_enum, default_value = "refuse")]
+    table_full_policy: TableFullPolicy,
+
     /// Cores for the off-datapath rule-install worker (comma-separated). Must not overlap the RX
     /// cores in the config.
     #[clap(long, value_delimiter = ',', default_value = "17")]
@@ -459,6 +546,7 @@ fn main() {
     let _ = DROP_MODE.set(args.drop_mode);
     let _ = APP_CYCLES.set(args.app_cycles);
     let _ = MAX_RULES.set(args.max_rules);
+    let _ = TABLE_FULL_POLICY.set(args.table_full_policy);
 
     let mut config = load_config(&args.config);
 
@@ -604,6 +692,7 @@ fn build_report(
         drop_mode: args.drop_mode,
         app_cycles_requested: args.app_cycles,
         max_rules: args.max_rules,
+        table_full_policy: args.table_full_policy,
         config_path: args.config.display().to_string(),
         tls_callbacks: TLS_CALLBACKS.load(Ordering::Relaxed),
         app_cycles_burned: APP_CYCLES_BURNED.load(Ordering::Relaxed),
@@ -651,6 +740,7 @@ fn build_report(
             destroys,
             mean_install_cycles: div(install_cycles, installs),
             offload_refused: OFFLOAD_REFUSED.load(Ordering::Relaxed),
+            evictions: RULE_EVICTIONS.load(Ordering::Relaxed),
             install_cycles_vs_core_wall: div(install_cycles, per_core_wall),
         },
         ground_truth: GroundTruth {
@@ -764,6 +854,14 @@ fn print_summary(r: &Report) {
         "  install cycles:         {} ({:.4}% of one RX core)",
         r.control_plane.install_cycles,
         100.0 * r.control_plane.install_cycles_vs_core_wall
+    );
+    println!(
+        "  table {:?} at max_rules {}: {} evicted, {} destroy cycles over {} destroys",
+        r.table_full_policy,
+        r.max_rules,
+        r.control_plane.evictions,
+        r.control_plane.destroy_cycles,
+        r.control_plane.destroys
     );
     println!(
         "  ingress reconciliation gap: {} pkts (should be ~0)",
