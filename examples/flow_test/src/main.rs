@@ -24,7 +24,7 @@ use iris_core::dpdk::{rte_flow, rte_flow_action_handle};
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     path::PathBuf,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::{Arc, Mutex, OnceLock, RwLock},
 };
 
@@ -69,17 +69,91 @@ static SPLIT_QUEUES: RwLock<Option<HashMap<CoreId, u16>>> = RwLock::new(None);
 static NUM_FLOWS: OnceLock<usize> = OnceLock::new();
 static USE_MODEL: OnceLock<bool> = OnceLock::new();
 
+static OFFLOAD_ENABLED: [AtomicBool; 4] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
 static OFFLOAD_AFTER_PKTS: OnceLock<usize> = OnceLock::new();
+
+static DISPATCHED: [AtomicUsize; 4] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
+static INSTALLED_BY_KIND: [AtomicUsize; 4] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
+
+#[inline]
+fn offload_enabled(kind: FlowKind) -> bool {
+    OFFLOAD_ENABLED[kind.idx()].load(Ordering::Relaxed)
+}
 
 #[inline]
 fn offload_after_pkts() -> usize {
     *OFFLOAD_AFTER_PKTS.get().unwrap_or(&20)
 }
 
+#[inline]
+fn offer_for_offload(kind: FlowKind, five_tuple: &FiveTuple, rx_core: &CoreId, total_pkts: usize) {
+    if total_pkts != offload_after_pkts() || !offload_enabled(kind) {
+        return;
+    }
+    if let Some(dispatcher) = FLOW_DISPATCHER.get() {
+        let _ = dispatcher.dispatch(
+            FlowEvent::FlowSeen {
+                tuple: *five_tuple,
+                rx_core: *rx_core,
+                kind,
+            },
+            Some(rx_core),
+        );
+        DISPATCHED[kind.idx()].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, ValueEnum)]
+enum FlowKind {
+    Tls,
+    Ssh,
+    Quic,
+    MaybeQuic,
+}
+
+impl FlowKind {
+    fn label(self) -> &'static str {
+        match self {
+            FlowKind::Tls => "tls",
+            FlowKind::Ssh => "ssh",
+            FlowKind::Quic => "quic",
+            FlowKind::MaybeQuic => "maybe_quic",
+        }
+    }
+
+    fn all() -> [FlowKind; 4] {
+        [
+            FlowKind::Tls,
+            FlowKind::Ssh,
+            FlowKind::Quic,
+            FlowKind::MaybeQuic,
+        ]
+    }
+
+    const fn idx(self) -> usize {
+        self as usize
+    }
+}
+
 #[derive(Clone, Serialize)]
 enum FlowEvent {
     /// Minimal payload to keep cloning cheap
-    TlsSeen { tuple: FiveTuple, rx_core: CoreId },
+    FlowSeen { tuple: FiveTuple, rx_core: CoreId, kind: FlowKind },
 }
 
 // ===== CLI =====
@@ -134,6 +208,15 @@ struct Args {
 
     #[clap(long, value_name = "COUNT", default_value = "100")]
     num_flows: usize,
+
+    #[clap(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        value_name = "KINDS",
+        default_value = "tls,ssh,quic,maybe-quic"
+    )]
+    offload_protos: Vec<FlowKind>,
 
     #[clap(long, value_name = "COUNT", default_value = "20")]
     offload_after_pkts: usize,
@@ -277,22 +360,29 @@ fn tls_cb(
     };
 
     if is_elephant {
-        let tuple = five_tuple.clone();
-        if let Some(dispatcher) = FLOW_DISPATCHER.get() {
-            let _ = dispatcher.dispatch(
-                FlowEvent::TlsSeen {
-                    tuple,
-                    rx_core: *rx_core,
-                },
-                Some(rx_core), // preserve affinity when in PerCore mode
-            );
-        }
+        offer_for_offload(FlowKind::Tls, five_tuple, rx_core, pkts.total());
     }
 
     true
 }
 
-// ===== Main =====
+#[callback("ssh,level=InL4Conn")]
+fn ssh_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> bool {
+    offer_for_offload(FlowKind::Ssh, five_tuple, rx_core, pkts.total());
+    true
+}
+
+#[callback("quic,level=InL4Conn")]
+fn quic_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> bool {
+    offer_for_offload(FlowKind::Quic, five_tuple, rx_core, pkts.total());
+    true
+}
+
+#[callback("MaybeQuic,level=InL4Conn")]
+fn maybe_quic_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> bool {
+    offer_for_offload(FlowKind::MaybeQuic, five_tuple, rx_core, pkts.total());
+    true
+}
 
 #[input_files("$IRIS_HOME/datatypes/data.txt")]
 #[iris_end_macros]
@@ -305,10 +395,33 @@ fn main() {
 
     NUM_FLOWS.set(args.num_flows).unwrap();
 
+    for kind in &args.offload_protos {
+        OFFLOAD_ENABLED[kind.idx()].store(true, Ordering::Relaxed);
+    }
     OFFLOAD_AFTER_PKTS.set(args.offload_after_pkts).unwrap();
+    println!(
+        "offloading: [{}] at {} packets",
+        FlowKind::all()
+            .iter()
+            .filter(|k| offload_enabled(**k))
+            .map(|k| k.label())
+            .collect::<Vec<_>>()
+            .join(", "),
+        args.offload_after_pkts,
+    );
 
-    // Load the LightGBM model before starting the runtime, if one was provided.
-    // With no model, every qualifying TLS flow is admitted (admit-all mode).
+    if offload_enabled(FlowKind::MaybeQuic)
+        && args.offload_after_pkts <= iris_datatypes::MAYBE_QUIC_WINDOW
+    {
+        eprintln!(
+            "warning: --offload-after-pkts {} does not exceed the MaybeQuic evidence window ({} \
+             payload-bearing packets); connections carrying any non-payload packets will accept \
+             too late to be offered, so the maybe_quic arm will under-report.",
+            args.offload_after_pkts,
+            iris_datatypes::MAYBE_QUIC_WINDOW,
+        );
+    }
+
     let use_model = match &args.model {
         Some(path) => {
             // The model's features are snapshotted at a fixed packet count, so moving the
@@ -329,6 +442,12 @@ fn main() {
         }
     };
     USE_MODEL.set(use_model).unwrap();
+    if use_model {
+        println!(
+            "note: the elephant model gates the tls arm only; ssh/quic/maybe_quic admit all \
+             matched connections at the threshold."
+        );
+    }
 
     let config = if let Some(path) = args.config.clone() {
         load_config(path)
@@ -404,7 +523,7 @@ fn main() {
         .set_batch_size(args.batch_size)
         .add_dispatcher(flow_dispatcher.clone(), |event: FlowEvent| {
             match event {
-                FlowEvent::TlsSeen { tuple, rx_core } => {
+                FlowEvent::FlowSeen { tuple, rx_core, kind } => {
                     let mode = *MODE.read().unwrap();
                     if mode == FlowMode::Standard {
                         return;
@@ -470,6 +589,7 @@ fn main() {
                                 };
                                 TARGET_FLOWS.lock().unwrap().insert(tuple.clone());
                                 FLOW_QUEUE.lock().unwrap().push_back(entry);
+                                INSTALLED_BY_KIND[kind.idx()].fetch_add(1, Ordering::Relaxed);
                             }
                             Err(e) => eprintln!("install flow failed: {e:?}"),
                         }
@@ -528,6 +648,21 @@ fn main() {
     let discarded_packets = DISCARDED_PACKETS.load(std::sync::atomic::Ordering::Relaxed);
     let discarded_bytes = DISCARDED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
     println!("{discarded_packets} packets and {discarded_bytes} bytes discarded");
+
+    println!("=== Offload by protocol ===");
+    println!(
+        "{:<12}{:>12}{:>12}{:>10}",
+        "kind", "dispatched", "installed", "enabled"
+    );
+    for kind in FlowKind::all() {
+        println!(
+            "{:<12}{:>12}{:>12}{:>10}",
+            kind.label(),
+            DISPATCHED[kind.idx()].load(Ordering::Relaxed),
+            INSTALLED_BY_KIND[kind.idx()].load(Ordering::Relaxed),
+            offload_enabled(kind),
+        );
+    }
 
     if *MODE.read().unwrap() == FlowMode::Standard {
         let tls_bytes = TLS_BYTES.load(Ordering::Relaxed);
