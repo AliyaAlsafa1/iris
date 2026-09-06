@@ -79,6 +79,10 @@ def parse_args():
                         "fraction (default: 0.10)")
     p.add_argument("--plot", action="store_true", help="write the M3 regression plot (matplotlib)")
     p.add_argument("--dry-run", action="store_true", help="print commands, run nothing")
+    p.add_argument("--quiet", action="store_true",
+                   help="capture each run's output instead of streaming it to the terminal, and "
+                        "print only the tail on failure. Useful for long unattended batches; the "
+                        "default streams so a run's progress is visible.")
     p.add_argument("--analyze-only", action="store_true",
                    help="skip the runs and re-analyze reports already in --out-dir")
     return p.parse_args()
@@ -107,11 +111,22 @@ def run_one(arm, index, args):
     if args.dry_run:
         return None
 
-    proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
-    if proc.returncode != 0:
-        print(f"  !! exit {proc.returncode}\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}",
-              file=sys.stderr)
-        return None
+    # Stream by default: a run is `duration` seconds long and captured output means a silent
+    # terminal for all of it, with no way to tell a healthy run from a hang. Inheriting the
+    # terminal rather than piping also keeps DPDK's own C-buffered output line-prompt, which a
+    # pipe would hold back in 4 KB blocks.
+    if args.quiet:
+        proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+        if proc.returncode != 0:
+            print(f"  !! exit {proc.returncode}\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}",
+                  file=sys.stderr)
+            return None
+    else:
+        proc = subprocess.run(cmd, cwd=REPO_ROOT)
+        if proc.returncode != 0:
+            # No tail to reprint: the run's output already went to the terminal above.
+            print(f"  !! exit {proc.returncode} (output above)", file=sys.stderr)
+            return None
     if not report_path.exists():
         print(f"  !! no report written to {report_path}", file=sys.stderr)
         return None
