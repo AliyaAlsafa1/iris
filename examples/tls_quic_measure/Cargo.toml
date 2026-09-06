@@ -1,0 +1,12 @@
+[package]
+name = "tls_quic_measure"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+env_logger = "0.8.4"
+iris-core = { path = "../../core" }
+iris-compiler = { path = "../../compiler" }
+iris-datatypes = { path = "../../datatypes" }
+clap = { version = "3.2.23", features = ["derive"] }
+lazy_static = "1.4"

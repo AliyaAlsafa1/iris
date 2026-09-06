@@ -1,0 +1,9 @@
+[package]
+name = "flow_features"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iris-core = { path = "../../core" }
+iris-datatypes = { path = "../../datatypes" }
+serde = "1.0.228"

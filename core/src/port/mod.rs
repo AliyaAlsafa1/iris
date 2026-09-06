@@ -2,10 +2,10 @@
 mod info;
 pub(crate) mod statistics;
 
-use crate::config::PortMap;
+use crate::config::{FlowMode, PortMap};
 use crate::dpdk;
 use crate::lcore::{CoreId, SocketId};
-use crate::memory::mempool::Mempool;
+use crate::memory::mempool::{Mempool, SplitMempool};
 
 use self::info::PortInfo;
 
@@ -34,8 +34,12 @@ impl PortId {
     pub fn new_from_device(device: String) -> PortId {
         let mut port_id: u16 = 0;
         let _device = device.clone();
+        // The registered ethdev name is the bare PCI address; EAL strips any
+        // devargs (e.g. "0000:51:00.0,txq_mem_algn=0") after probe. Look the
+        // port up by the address alone so devargs in the config still work.
+        let dev_addr = device.split(',').next().unwrap_or(&device).to_owned();
         let ret = unsafe {
-            let dev_name = CString::new(device).unwrap();
+            let dev_name = CString::new(dev_addr).unwrap();
             dpdk::rte_eth_dev_get_port_by_name(dev_name.as_ptr(), &mut port_id)
         };
         if ret != 0 {
@@ -110,7 +114,7 @@ pub(crate) struct Port {
 }
 
 impl Port {
-    pub(crate) fn new(port_map: &PortMap) -> Port {
+    pub(crate) fn new(port_map: &PortMap, flow_mode: FlowMode) -> Port {
         let port_id = PortId::new_from_device(port_map.device.clone());
 
         let mut queue_map: BTreeMap<RxQueue, CoreId> = BTreeMap::new();
@@ -121,14 +125,27 @@ impl Port {
         // NICE-TO-HAVE: error handling
         // - Display warning if cores do not match port socket
         // - Display warning and handle duplicate cores per port and across ports
+        // Queue ids are assigned in allocation order from 0. Sinks are
+        // allocated before the Receive queues below, so when any sink is
+        // configured it takes qid 0 (additional sinks take 1, 2, ...). That
+        // ordering is what lets RSS sampling work: the RETA (further down) is
+        // default-initialized to RxQueueId(0), and `nb_buckets` (from the first
+        // sink) controls how many buckets get overwritten with Receive queues.
+        // With the default nb_buckets == RSS_RETA_SIZE every bucket maps to a
+        // Receive queue, so NO RSS traffic reaches a sink — sinks then receive
+        // only flow-steered packets (the measurement case). Only an explicit
+        // nb_buckets < RSS_RETA_SIZE leaves leftover buckets at the qid-0
+        // default, sampling that fraction of RSS traffic into the first sink.
         let mut q: u16 = 0;
-        let nb_buckets = if let Some(sink) = &port_map.sink {
-            queue_map.insert(
-                RxQueue::new(port_id, RxQueueId(q), RxQueueType::Sink),
-                CoreId(sink.core),
-            );
-            q += 1;
-            sink.nb_buckets
+        let nb_buckets = if let Some(first_sink) = port_map.sinks.first() {
+            for sink in &port_map.sinks {
+                queue_map.insert(
+                    RxQueue::new(port_id, RxQueueId(q), RxQueueType::Sink),
+                    CoreId(sink.core),
+                );
+                q += 1;
+            }
+            first_sink.nb_buckets
         } else {
             RSS_RETA_SIZE
         };
@@ -139,6 +156,13 @@ impl Port {
                 CoreId(*core_id),
             );
             q += 1;
+            if flow_mode == FlowMode::Split {
+                queue_map.insert(
+                    RxQueue::new(port_id, RxQueueId(q), RxQueueType::Split),
+                    CoreId(*core_id),
+                );
+                q += 1;
+            }
         }
 
         if nb_buckets < rx_core_ids.len() {
@@ -178,15 +202,17 @@ impl Port {
     /// Configure port and setup RX queues.
     pub(crate) fn init(
         &self,
-        mempools: &mut BTreeMap<SocketId, Mempool>,
+        standard_mempools: &mut BTreeMap<SocketId, Mempool>,
+        split_mempools: &mut BTreeMap<SocketId, SplitMempool>,
         nb_rxd: usize,
         mtu: usize,
         promiscuous: bool,
     ) -> Result<()> {
         self.configure(promiscuous, mtu)?;
 
-        let mempool = mempools.get_mut(&self.id.socket_id()).unwrap();
-        self.setup_queues(mempool, nb_rxd)?;
+        let standard_mempool = standard_mempools.get_mut(&self.id.socket_id()).unwrap();
+        let split_mempool = split_mempools.get_mut(&self.id.socket_id()).unwrap();
+        self.setup_queues(standard_mempool, split_mempool, nb_rxd)?;
         self.display_info();
         Ok(())
     }
@@ -348,6 +374,18 @@ impl Port {
             port_conf.rxmode.offloads |= dpdk::DEV_RX_OFFLOAD_VLAN_STRIP as u64;
         }
 
+        // turns on buffer split if supported and actually used
+        let has_split_queues = self
+            .queue_map
+            .keys()
+            .any(|rxq| rxq.ty == RxQueueType::Split);
+        if has_split_queues
+            && dev_info.rx_offload_capa & dpdk::RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT as u64 != 0
+        {
+            port_conf.rxmode.offloads |= dpdk::RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT as u64;
+            port_conf.rxmode.offloads |= dpdk::RTE_ETH_RX_OFFLOAD_SCATTER as u64;
+        }
+
         {
             let nb_queues = self.queue_map.len() as u16;
             let ret = unsafe {
@@ -400,22 +438,81 @@ impl Port {
         Ok(())
     }
 
-    fn setup_queues(&self, mempool: &mut Mempool, nb_rxd: usize) -> Result<()> {
+    fn setup_queues(
+        &self,
+        standard_mempool: &mut Mempool,
+        split_mempool: &mut SplitMempool,
+        nb_rxd: usize,
+    ) -> Result<()> {
         for rxqueue in self.queue_map.keys() {
-            let ret = unsafe {
-                dpdk::rte_eth_rx_queue_setup(
-                    self.id.raw(),
-                    rxqueue.qid.raw(),
-                    nb_rxd as u16,
-                    self.id.socket_id().raw(),
-                    ptr::null(),
-                    mempool.raw_mut(),
-                )
+            match rxqueue.ty {
+                RxQueueType::Split => self.setup_split_queue(rxqueue, split_mempool, nb_rxd)?,
+                _ => self.setup_standard_queue(rxqueue, standard_mempool, nb_rxd)?,
             };
-            if ret < 0 {
-                bail!("Failed to setup up RX queue {}", rxqueue);
-            }
         }
+
+        Ok(())
+    }
+
+    fn setup_split_queue(
+        &self,
+        rxqueue: &RxQueue,
+        split_mempool: &mut SplitMempool,
+        nb_rxd: usize,
+    ) -> Result<()> {
+        let mut rx_segs: [dpdk::rte_eth_rxseg; 2] = unsafe { mem::zeroed() };
+
+        rx_segs[0].split.length = split_mempool.hdr_len;
+        rx_segs[0].split.mp = split_mempool.header.raw_mut();
+
+        rx_segs[1].split.length = 0;
+        rx_segs[1].split.mp = split_mempool.remainder.raw_mut();
+
+        let mut rxq_conf: dpdk::rte_eth_rxconf = unsafe { mem::zeroed() };
+        rxq_conf.offloads =
+            dpdk::RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT as u64 | dpdk::RTE_ETH_RX_OFFLOAD_SCATTER as u64;
+        rxq_conf.rx_nseg = 2;
+        rxq_conf.rx_seg = rx_segs.as_mut_ptr();
+
+        let ret = unsafe {
+            dpdk::rte_eth_rx_queue_setup(
+                self.id.raw(),
+                rxqueue.qid.raw(),
+                nb_rxd as u16,
+                self.id.socket_id().raw(),
+                &rxq_conf,
+                ptr::null_mut(),
+            )
+        };
+
+        if ret < 0 {
+            bail!("Failed to setup split RX queue {}", rxqueue);
+        }
+
+        Ok(())
+    }
+
+    fn setup_standard_queue(
+        &self,
+        rxqueue: &RxQueue,
+        standard_mempool: &mut Mempool,
+        nb_rxd: usize,
+    ) -> Result<()> {
+        let ret = unsafe {
+            dpdk::rte_eth_rx_queue_setup(
+                self.id.raw(),
+                rxqueue.qid.raw(),
+                nb_rxd as u16,
+                self.id.socket_id().raw(),
+                ptr::null(),
+                standard_mempool.raw_mut(),
+            )
+        };
+
+        if ret < 0 {
+            bail!("Failed to setup standard RX queue {}", rxqueue);
+        }
+
         Ok(())
     }
 }
@@ -446,12 +543,15 @@ pub(crate) enum RxQueueType {
     Receive,
     /// Throwaway
     Sink,
+    /// Packets backed by buffer segmentation
+    Split,
 }
 
 impl fmt::Display for RxQueueType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             RxQueueType::Receive => write!(f, "r"),
+            RxQueueType::Split => write!(f, "x"),
             RxQueueType::Sink => write!(f, "s"),
         }
     }

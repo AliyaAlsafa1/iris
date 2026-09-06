@@ -6,7 +6,7 @@ capacity = 1_048_576
 cache_size = 512
 
 [online]
-duration = 60
+duration = 30
 nb_rxd = 4096
 promiscuous = true
 mtu = 1500
@@ -14,10 +14,21 @@ hardware_assist = true
 dyn_hardware_assist = false
 drop_tls_raw = true
 drop_quic_raw = true
+measure_raw_drop = true
 
 [[online.ports]]
 device = "0000:8a:00.1"
 cores = [ 1, 2, 3, 4 ]
+
+# Two sinks for per-protocol granularity: TLS -> first sink (qid 0, core 5),
+# QUIC -> second sink (qid 1, core 6). nb_buckets defaults to 512 (= full RSS
+# reta), so RSS traffic does NOT land on the sink queues — they only receive the
+# matches we steer to them.
+[[online.ports.sinks]]
+core = 5
+
+[[online.ports.sinks]]
+core = 6
 
 [conntrack]
 max_connections = 1_000_000

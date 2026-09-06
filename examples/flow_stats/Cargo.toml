@@ -1,0 +1,14 @@
+[package]
+name = "flow_stats"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+env_logger = "0.8.4"
+log = "0.4"
+lazy_static = "1.5.0"
+serde = { version = "1", features = ["derive"] }
+iris-core = { path = "../../core" }
+iris-compiler = { path = "../../compiler" }
+iris-datatypes = { path = "../../datatypes" }
+clap = { version = "3.2.23", features = ["derive"] }

@@ -1,0 +1,20 @@
+[package]
+name = "flow_labels"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+iris-core = { path = "../../core" }
+iris-datatypes = { path = "../../datatypes" }
+iris-compiler = { path = "../../compiler" }
+flow_features  = { path = "../flow_features" }
+
+clap         = { version = "4", features = ["derive"] }
+csv          = "1"
+zstd         = "0.13"
+serde        = { version = "1", features = ["derive"] }
+const_format = "0.2"
+
+[[bin]]
+name = "flow_labels"
+path = "src/main.rs"

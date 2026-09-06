@@ -11,24 +11,71 @@ use iris_core::subscription::Tracked;
 
 use serde::ser::{SerializeStruct, Serializer};
 use serde::Serialize;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 
 /// Pure SYN
-pub(crate) const HIST_SYN: u8 = b'S';
+pub const HIST_SYN: u8 = b'S';
 /// Pure SYNACK
-pub(crate) const HIST_SYNACK: u8 = b'H';
+pub const HIST_SYNACK: u8 = b'H';
 /// Pure ACK (no payload)
-pub(crate) const HIST_ACK: u8 = b'A';
+pub const HIST_ACK: u8 = b'A';
 /// Has non-zero payload length
-pub(crate) const HIST_DATA: u8 = b'D';
+pub const HIST_DATA: u8 = b'D';
 /// Has FIN set
-pub(crate) const HIST_FIN: u8 = b'F';
+pub const HIST_FIN: u8 = b'F';
 /// Has RST set
-pub(crate) const HIST_RST: u8 = b'R';
+pub const HIST_RST: u8 = b'R';
+
+/// Monotonic-derived wall clock.
+///
+/// Captures a wall/monotonic anchor pair once, then derives every timestamp by
+/// adding a monotonic elapsed offset to the wall anchor.
+#[derive(Debug, Clone)]
+pub struct MonotonicWallClock {
+    wall_at_start: SystemTime,
+    mono_at_start: Instant,
+}
+
+impl MonotonicWallClock {
+    pub fn new() -> Self {
+        let wall_at_start = SystemTime::now();
+        let mono_at_start = Instant::now();
+        Self {
+            wall_at_start,
+            mono_at_start,
+        }
+    }
+
+    /// Derived wall time for a given monotonic instant, as epoch microseconds.
+    pub fn epoch_micros_at(&self, mono_now: Instant) -> u64 {
+        let elapsed = mono_now.saturating_duration_since(self.mono_at_start);
+        (self.wall_at_start + elapsed)
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64
+    }
+}
+
+impl Default for MonotonicWallClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Process-wide clock anchor, captured once. Shared across all connection records
+/// and cores so every derived timestamp references the same wall/monotonic pair.
+static CLOCK: OnceLock<MonotonicWallClock> = OnceLock::new();
+
+/// Returns the process-wide clock anchor, initializing it on first use. Force this
+/// once at startup (before any flow is stamped) so the anchor precedes all traffic.
+pub fn clock() -> &'static MonotonicWallClock {
+    CLOCK.get_or_init(MonotonicWallClock::new)
+}
 
 impl ConnRecord {
     /// Returns the client (originator) socket address.
@@ -59,6 +106,12 @@ impl ConnRecord {
     #[inline]
     pub fn total_payload_bytes(&self) -> u64 {
         self.orig.nb_payload_bytes + self.resp.nb_payload_bytes
+    }
+
+    /// Wall-clock time of the first packet, in microseconds since the Unix epoch.
+    #[inline]
+    pub fn first_seen_epoch_micros(&self) -> u64 {
+        clock().epoch_micros_at(self.first_seen_ts)
     }
 
     /// Returns the connection history.
@@ -131,6 +184,8 @@ pub struct ConnRecord {
     /// This represents the time Iris observed the first packet in the connection, and does not
     /// reflect timestamps read from a packet capture in offline analysis.
     pub first_seen_ts: Instant,
+    /// Wall-clock time of the first packet (UNIX epoch). Stable for the life of the connection.
+    pub first_seen_wall: SystemTime,
     /// Timestamp of the second packet (approximate).
     pub second_seen_ts: Instant,
     /// Timestamp of the last packet (approximate).
@@ -218,9 +273,11 @@ impl Tracked for ConnRecord {
     fn new(first_pkt: &L4Pdu) -> Self {
         let five_tuple = FiveTuple::from_ctxt(&first_pkt.ctxt);
         let now = Instant::now();
+        let wall = SystemTime::now();
         Self {
             five_tuple,
             first_seen_ts: now,
+            first_seen_wall: wall,
             second_seen_ts: now,
             last_seen_ts: now,
             max_inactivity: Duration::default(),

@@ -90,6 +90,12 @@ pub struct RuntimeConfig {
     /// Connection tracking settings.
     pub conntrack: ConnTrackConfig,
 
+    /// Software flow-table settings. Absent (`None`) means the SW flow table is
+    /// disabled: no table is allocated and `sw_flow` installs are no-ops. Add a
+    /// `[flow_table]` section to enable it.
+    #[serde(default)]
+    pub flow_table: Option<FlowTableConfig>,
+
     #[doc(hidden)]
     /// Runtime filter for testing purposes.
     #[serde(default = "default_filter")]
@@ -103,7 +109,7 @@ impl RuntimeConfig {
         if let Some(online) = &self.online {
             for port in online.ports.iter() {
                 cores.extend(port.cores.iter().map(|c| CoreId(*c)));
-                if let Some(sink) = &port.sink {
+                for sink in &port.sinks {
                     cores.push(CoreId(sink.core));
                 }
             }
@@ -232,6 +238,7 @@ impl Default for RuntimeConfig {
                 init_rst: false,
                 init_data: false,
             },
+            flow_table: None,
             filter: None,
         }
     }
@@ -271,6 +278,24 @@ fn default_capacity() -> usize {
 
 fn default_cache_size() -> usize {
     512
+}
+
+/* --------------------------------------------------------------------------------- */
+
+/// Controls which hardware flow rule action is applied to matched connections.
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum FlowMode {
+    /// No flow rules installed. Split queues are not configured.
+    Standard,
+    /// Drop matched flows in hardware. Split queues are not configured.
+    Drop,
+    /// Steer matched flows to per-core split queues.
+    Split,
+}
+
+fn default_flow_mode() -> FlowMode {
+    FlowMode::Standard
 }
 
 /* --------------------------------------------------------------------------------- */
@@ -349,6 +374,21 @@ pub struct OnlineConfig {
     #[serde(default = "default_drop_quic_raw")]
     pub drop_quic_raw: bool,
 
+    /// Measurement mode for the raw TLS/QUIC rules: instead of dropping matched
+    /// packets in hardware, steer them to the port's sink queue so the sink core
+    /// can count them. Requires `[[online.ports.sinks]]` to be configured (two
+    /// sinks recommended: TLS steers to the first, QUIC to the second). The ICE
+    /// PMD does not support hardware flow counters for raw/parser FDIR rules, so
+    /// this steer-and-count path is how match volume is measured. Defaults to
+    /// `false` (hardware drop).
+    #[serde(default = "default_measure_raw_drop")]
+    pub measure_raw_drop: bool,
+
+    /// Controls whether hardware flow rules are installed for matched connections.
+    /// Defaults to `standard` (no rules installed).
+    #[serde(default = "default_flow_mode")]
+    pub flow_mode: FlowMode,
+
     /// If set, will pass supplementary arguments to DPDK EAL (see DPDK
     /// configuration). For instance `--no-huge`.
     /// Defaults to empty string.
@@ -385,6 +425,10 @@ fn default_drop_tls_raw() -> bool {
 }
 
 fn default_drop_quic_raw() -> bool {
+    false
+}
+
+fn default_measure_raw_drop() -> bool {
     false
 }
 
@@ -426,9 +470,13 @@ fn default_prometheus() -> Option<PrometheusConfig> {
 /// packet loss. However, it can be quite wasteful of system resources, as it requires configuring
 /// one additional core per interface and thrashes the cache.
 ///
+/// Multiple sinks may be configured per port (e.g. one per raw rule in
+/// `measure_raw_drop` mode); each gets its own RX queue (qid 0, 1, ...) and
+/// core. The first sink owns any RSS redirection-table sampling buckets.
+///
 /// ## Example
 /// ```toml
-/// [online.ports.sink]
+/// [[online.ports.sinks]]
 ///     core = 9
 ///     nb_buckets = 384   # drops 25% of 4-tuples
 /// ```
@@ -476,13 +524,14 @@ pub struct PortMap {
     /// the PCI device.
     pub cores: Vec<u32>,
 
-    /// Sink core configuration. Defaults to `None`.
-    #[serde(default = "default_sink")]
-    pub sink: Option<SinkConfig>,
+    /// Sink core configuration. Defaults to empty (no sink queues). Each entry
+    /// creates a dedicated sink RX queue (qid 0, 1, ...) on its own core.
+    #[serde(default = "default_sinks")]
+    pub sinks: Vec<SinkConfig>,
 }
 
-fn default_sink() -> Option<SinkConfig> {
-    None
+fn default_sinks() -> Vec<SinkConfig> {
+    Vec::new()
 }
 
 /* --------------------------------------------------------------------------------- */
@@ -758,6 +807,37 @@ pub struct ConnTrackConfig {
     pub init_data: bool,
 }
 
+/// Software flow-table settings.
+///
+/// The software flow table is a per-core, bounded, set-associative cache of
+/// `rte_flow`-style rules (e.g. drop rules), consulted on the datapath right
+/// after `rx_burst`. When a set fills, the least-recently-accessed rule in that
+/// set is evicted (per-set LRU); eviction is best-effort, so an evicted rule
+/// just means those packets fall through to the normal pipeline.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct FlowTableConfig {
+    /// Maximum number of rules held per core before per-set LRU eviction. The
+    /// true capacity is rounded so the set count is a power of two. Defaults to
+    /// `1_048_576`.
+    #[serde(default = "default_flow_table_capacity")]
+    pub capacity: usize,
+
+    /// Associativity (ways per set). `1` is direct-mapped; higher values
+    /// approach global LRU at the cost of a wider per-lookup scan. Defaults to
+    /// `8`.
+    #[serde(default = "default_flow_table_ways")]
+    pub ways: usize,
+}
+
+impl Default for FlowTableConfig {
+    fn default() -> Self {
+        FlowTableConfig {
+            capacity: default_flow_table_capacity(),
+            ways: default_flow_table_ways(),
+        }
+    }
+}
+
 fn default_max_connections() -> usize {
     10_000_000
 }
@@ -780,6 +860,14 @@ fn default_tcp_inactivity_timeout() -> usize {
 
 fn default_tcp_establish_timeout() -> usize {
     5000
+}
+
+fn default_flow_table_capacity() -> usize {
+    1_048_576
+}
+
+fn default_flow_table_ways() -> usize {
+    8
 }
 
 fn default_init_synack() -> bool {

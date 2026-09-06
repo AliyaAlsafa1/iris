@@ -12,3 +12,9 @@ iris-compiler = { path = "../../compiler" }
 serde = "1.0.228"
 
 clap = { version = "4.5", features = ["derive"] }
+
+env_logger = "0.8.4"
+regex = "1.7.3"
+lightgbm3 = "1"
+
+flow_features = { path = "../flow_features" }

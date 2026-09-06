@@ -2,7 +2,7 @@ use crate::config::RuntimeConfig;
 use crate::dpdk;
 use crate::port::{statistics::PortStats, Port, PortId, RxQueue, RxQueueType};
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::CString;
 use std::fmt;
 use std::fs;
@@ -32,6 +32,8 @@ pub(crate) struct Monitor {
     logger: Option<Logger>,
     ports: BTreeMap<PortId, Vec<RxQueue>>,
     is_running: Arc<AtomicBool>,
+    prev_tcp_bytes: u64,
+    prev_udp_bytes: u64,
 }
 
 impl Monitor {
@@ -101,6 +103,8 @@ impl Monitor {
             logger,
             ports: monitor_ports,
             is_running,
+            prev_tcp_bytes: 0,
+            prev_udp_bytes: 0,
         }
     }
 
@@ -133,11 +137,19 @@ impl Monitor {
                 }
             }
 
-            if let Some(display) = &self.display {
+            if self.display.is_some() {
                 display_ticker.tick().await;
                 let curr_ts = Instant::now();
                 let delta = curr_ts - prev_ts;
-                match AggRxStats::collect(&self.ports, &display.keywords) {
+
+                // Snapshot what we need off `display`, then release the borrow so
+                // we can mutate self.prev_* below without a borrow conflict.
+                let (show_throughput, keywords) = {
+                    let display = self.display.as_ref().unwrap();
+                    (display.throughput, display.keywords.clone())
+                };
+
+                match AggRxStats::collect(&self.ports, &keywords) {
                     Ok(curr_rx) => {
                         #[cfg(feature = "prometheus")]
                         curr_rx.update_prometheus_stats();
@@ -147,16 +159,37 @@ impl Monitor {
                             init_ts = curr_ts;
                             init = false;
                         }
-                        if display.throughput {
+                        if show_throughput {
                             let elapsed_ts = curr_ts - start_ts;
                             println!("----------------------------------------------");
                             println!("Current time: {}", pretty_print_duration(elapsed_ts));
-                            display.mempool_usage(&self.ports);
+                            // Takes &self.ports (and &self.display); no self mutation here.
+                            self.display.as_ref().unwrap().mempool_usage(&self.ports);
                             AggRxStats::display_rates(curr_rx, prev_rx, nms);
                             AggRxStats::display_dropped(curr_rx, init_rx);
                         }
                         prev_rx = curr_rx;
                         prev_ts = curr_ts;
+
+                        // Per-second on-wire TCP/UDP acquired (live, per-core summed).
+                        if show_throughput {
+                            let (tcp, udp) = crate::lcore::transport_meter::totals();
+                            let d_tcp = tcp.saturating_sub(self.prev_tcp_bytes);
+                            let d_udp = udp.saturating_sub(self.prev_udp_bytes);
+                            self.prev_tcp_bytes = tcp;
+                            self.prev_udp_bytes = udp;
+                            let secs = nms / 1000.0;
+                            if secs > 0.0 {
+                                let tcp_bps = (d_tcp as f64) * 8.0 / secs;
+                                let udp_bps = (d_udp as f64) * 8.0 / secs;
+                                println!(
+                                    "Transport: TCP {} / UDP {} / total {}",
+                                    pretty_print_unit(tcp_bps, "bps"),
+                                    pretty_print_unit(udp_bps, "bps"),
+                                    pretty_print_unit(tcp_bps + udp_bps, "bps"),
+                                );
+                            }
+                        }
                     }
                     Err(error) => {
                         log::error!("Monitor display error: {}", error);
@@ -178,6 +211,15 @@ impl Monitor {
         let tputs = Throughputs::new(prev_rx, init_rx, (prev_ts - init_ts).as_millis() as f64);
         println!("{}", tputs);
 
+        // Final cumulative on-wire transport totals.
+        let (tcp_total, udp_total) = crate::lcore::transport_meter::totals();
+        println!(
+            "Transport (cumulative on-wire): TCP {} / UDP {} / total {}",
+            pretty_print_unit(tcp_total as f64, "B"),
+            pretty_print_unit(udp_total as f64, "B"),
+            pretty_print_unit((tcp_total + udp_total) as f64, "B"),
+        );
+
         if let Some(logger) = &self.logger {
             let json_fname = logger.path.join("throughputs.json");
             tputs.dump_json(json_fname).expect("Unable to dump to json");
@@ -194,19 +236,24 @@ struct Display {
 impl Display {
     /// Display mempool usage
     fn mempool_usage(&self, ports: &BTreeMap<PortId, Vec<RxQueue>>) {
-        for name in ports.keys().map(|id| format!("mempool_{}", id.socket_id())) {
-            let cname = CString::new(name.clone()).expect("Invalid CString conversion");
-            let mempool_raw = unsafe { dpdk::rte_mempool_lookup(cname.as_ptr()) };
-            let avail_cnt = unsafe { dpdk::rte_mempool_avail_count(mempool_raw) };
-            let inuse_cnt = unsafe { dpdk::rte_mempool_in_use_count(mempool_raw) };
+        let sockets: BTreeSet<_> = ports.keys().map(|id| id.socket_id()).collect();
 
-            println!(
-                "{} avail: {}, in use: {} ({:.3}%)",
-                name,
-                avail_cnt,
-                inuse_cnt,
-                100.0 * inuse_cnt as f64 / (inuse_cnt + avail_cnt) as f64
-            );
+        for socket in sockets {
+            for prefix in ["standard", "split_header", "split_remainder"] {
+                let name = format!("mempool_{}_{}", prefix, socket);
+                let cname = CString::new(name.clone()).expect("Invalid CString conversion");
+                let mempool_raw = unsafe { dpdk::rte_mempool_lookup(cname.as_ptr()) };
+                let avail_cnt = unsafe { dpdk::rte_mempool_avail_count(mempool_raw) };
+                let inuse_cnt = unsafe { dpdk::rte_mempool_in_use_count(mempool_raw) };
+
+                println!(
+                    "{} avail: {}, in use: {} ({:.3}%)",
+                    name,
+                    avail_cnt,
+                    inuse_cnt,
+                    100.0 * inuse_cnt as f64 / (inuse_cnt + avail_cnt) as f64
+                );
+            }
         }
     }
 }
@@ -257,7 +304,7 @@ impl Logger {
                 }
                 Err(error) => log::error!("{}", error),
             }
-            let name = format!("mempool_{}", port_id.socket_id());
+            let name = format!("mempool_standard_{}", port_id.socket_id());
             let cname = CString::new(name.clone()).expect("Invalid CString conversion");
             let mempool_raw = unsafe { dpdk::rte_mempool_lookup(cname.as_ptr()) };
             let avail_cnt = unsafe { dpdk::rte_mempool_avail_count(mempool_raw) };
@@ -298,12 +345,14 @@ impl AggRxStats {
         let mut hw_dropped_pkts = 0;
         let mut sw_dropped_pkts = 0;
         for (port_id, rx_queues) in ports.iter() {
-            let mut sink_queue = None;
-            for queue in rx_queues {
-                if queue.ty == RxQueueType::Sink {
-                    sink_queue = Some(queue.qid.raw());
-                }
-            }
+            // All sink queues on this port (TLS/QUIC measure sinks, sampling
+            // sink, etc.). Their traffic is excluded from the "reached workers"
+            // stat below.
+            let sink_qids: Vec<u16> = rx_queues
+                .iter()
+                .filter(|queue| queue.ty == RxQueueType::Sink)
+                .map(|queue| queue.qid.raw())
+                .collect();
 
             match PortStats::collect(*port_id) {
                 Ok(port_stats) => {
@@ -341,27 +390,26 @@ impl AggRxStats {
                     good_bytes += good_bytes_temp;
                     good_pkts += good_pkts_temp;
 
-                    // Process (reached workers)
-                    process_bytes += if let Some(sink) = sink_queue {
-                        let label = format!("rx_q{}_bytes", sink);
-                        let sink_bytes = match port_stats.stats.get(&label) {
-                            Some(v) => *v,
-                            None => bail!("Failed retrieving sink_bytes"),
-                        };
-                        good_bytes_temp - sink_bytes
-                    } else {
-                        good_bytes_temp
-                    };
-                    process_pkts += if let Some(sink) = sink_queue {
-                        let label = format!("rx_q{}_packets", sink);
-                        let sink_pkts = match port_stats.stats.get(&label) {
-                            Some(v) => *v,
-                            None => bail!("Failed retrieving sink_pkts"),
-                        };
-                        good_pkts_temp - sink_pkts
-                    } else {
-                        good_pkts_temp
-                    };
+                    // Process (reached workers) = good minus traffic steered to
+                    // every sink queue. Per-queue byte/packet xstats are not
+                    // exposed by all PMDs (e.g. ICE); when missing, fall back to
+                    // the good total rather than failing the whole display.
+                    let mut sink_bytes = 0;
+                    let mut sink_pkts = 0;
+                    for sink in &sink_qids {
+                        match port_stats.stats.get(&format!("rx_q{}_bytes", sink)) {
+                            Some(v) => sink_bytes += *v,
+                            None => log::debug!(
+                                "No per-queue byte xstat for sink queue {}; not excluded from process stats",
+                                sink
+                            ),
+                        }
+                        if let Some(v) = port_stats.stats.get(&format!("rx_q{}_packets", sink)) {
+                            sink_pkts += *v;
+                        }
+                    }
+                    process_bytes += good_bytes_temp.saturating_sub(sink_bytes);
+                    process_pkts += good_pkts_temp.saturating_sub(sink_pkts);
 
                     // dropped
                     hw_dropped_pkts += match port_stats.stats.get("rx_phy_discard_packets") {

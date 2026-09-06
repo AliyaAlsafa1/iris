@@ -18,6 +18,7 @@ pub mod ptree;
 pub mod subscription;
 
 pub mod flow_drop;
+pub mod sw_flow;
 
 use crate::conntrack::{ConnInfo, StateTransition};
 use crate::filter::ast::Predicate;

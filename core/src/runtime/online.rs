@@ -1,11 +1,13 @@
-use crate::config::{ConnTrackConfig, OnlineConfig, RuntimeConfig};
+use crate::config::{ConnTrackConfig, FlowTableConfig, OnlineConfig, RuntimeConfig};
 use crate::dpdk;
+use crate::filter::flow_drop::RawAction;
 use crate::filter::Filter;
 use crate::lcore::monitor::Monitor;
 use crate::lcore::rx_core::RxCore;
 use crate::lcore::{CoreId, SocketId};
-use crate::memory::mempool::Mempool;
+use crate::memory::mempool::{Mempool, SplitMempool};
 use crate::port::*;
+use crate::runtime::SPLIT_HDR_SIZE;
 use crate::subscription::*;
 
 use std::collections::BTreeMap;
@@ -32,7 +34,8 @@ where
     pub(crate) fn new(
         config: &RuntimeConfig,
         options: OnlineOptions,
-        mempools: &mut BTreeMap<SocketId, Mempool>,
+        standard_mempools: &mut BTreeMap<SocketId, Mempool>,
+        split_mempools: &mut BTreeMap<SocketId, SplitMempool>,
         hw_filter_str: String,
         subscription: Arc<Subscription<S>>,
     ) -> Self {
@@ -48,21 +51,24 @@ where
         log::info!("Initializing Ports...");
         let mut ports: BTreeMap<PortId, Port> = BTreeMap::new();
         for port_map in options.online.ports.iter() {
-            let port = Port::new(port_map);
+            let port = Port::new(port_map, options.online.flow_mode);
             let socket_id = port.id.socket_id();
-            mempools.entry(socket_id).or_insert_with(|| {
-                // Create a local mempool if user is not polling the port
-                // from the same socket.
-                let mtu = if let Some(online) = &config.online {
-                    online.mtu
-                } else {
-                    Mempool::default_mtu()
-                };
-                Mempool::new(&config.mempool, socket_id, mtu)
-                    .expect("Unable to initialize local mempool")
+            let mtu = if let Some(online) = &config.online {
+                online.mtu
+            } else {
+                Mempool::default_mtu()
+            };
+            standard_mempools.entry(socket_id).or_insert_with(|| {
+                Mempool::new(&config.mempool, socket_id, mtu, "standard")
+                    .expect("Unable to initialize standard mempool")
+            });
+            split_mempools.entry(socket_id).or_insert_with(|| {
+                SplitMempool::new(&config.mempool, socket_id, SPLIT_HDR_SIZE, mtu)
+                    .expect("Unable to initialize split mempool")
             });
             port.init(
-                mempools,
+                standard_mempools,
+                split_mempools,
                 options.online.nb_rxd,
                 options.online.mtu,
                 options.online.promiscuous,
@@ -84,6 +90,7 @@ where
                 core_id,
                 rxqueues,
                 options.conntrack.clone(),
+                options.flow_table.clone(),
                 #[cfg(feature = "prometheus")]
                 options.online.prometheus.is_some(),
                 Arc::clone(&subscription),
@@ -178,8 +185,50 @@ where
 
     fn start_ports(&self) {
         log::info!("Starting ports...");
+        let measure = self.options.online.measure_raw_drop;
         for port in self.ports.values() {
             port.start();
+
+            // In measurement mode the raw rules steer matches to dedicated sink
+            // queues (counted by the sink core) instead of dropping in hardware.
+            // With two sinks, TLS steers to the first and QUIC to the second so
+            // each protocol is counted separately.
+            let (tls_action, quic_action) = if measure {
+                let sink_qids: Vec<u16> = port
+                    .queue_map
+                    .keys()
+                    .filter(|rxq| rxq.ty == RxQueueType::Sink)
+                    .map(|rxq| rxq.qid.raw())
+                    .collect();
+                match sink_qids.as_slice() {
+                    [] => {
+                        log::warn!(
+                            "measure_raw_drop set but no sink queue on port {}; falling back to hardware drop. Add [[online.ports.sinks]] to count matches.",
+                            port.id
+                        );
+                        (RawAction::Drop, RawAction::Drop)
+                    }
+                    [only] => {
+                        log::warn!(
+                            "measure_raw_drop on port {}: only one sink queue ({}); TLS and QUIC both steer to it (counts combined). Add a second sink for per-protocol granularity.",
+                            port.id,
+                            only
+                        );
+                        (RawAction::Steer(*only), RawAction::Steer(*only))
+                    }
+                    [tls_q, quic_q, ..] => {
+                        log::info!(
+                            "Raw drop MEASURE mode on port {}: TLS -> sink queue {}, QUIC -> sink queue {}",
+                            port.id,
+                            tls_q,
+                            quic_q
+                        );
+                        (RawAction::Steer(*tls_q), RawAction::Steer(*quic_q))
+                    }
+                }
+            } else {
+                (RawAction::Drop, RawAction::Drop)
+            };
 
             if self.options.online.dyn_hardware_assist {
                 log::info!("Applying dynamic hardware filters...");
@@ -203,22 +252,26 @@ where
 
             if self.options.online.drop_tls_raw {
                 log::info!(
-                    "Installing TLS Application-Data raw drop on port {}",
+                    "Installing TLS Application-Data raw rule on port {}",
                     port.id
                 );
-                if let Err(e) = crate::filter::flow_drop::install_tls_appdata_drop(port.id) {
+                if let Err(e) =
+                    crate::filter::flow_drop::install_tls_appdata_drop(port.id, tls_action)
+                {
                     log::warn!(
-                        "TLS Application-Data raw drop install failed on port {}: {:?}",
+                        "TLS Application-Data raw rule install failed on port {}: {:?}",
                         port.id,
                         e
                     );
                 }
             }
             if self.options.online.drop_quic_raw {
-                log::info!("Installing QUIC short-header raw drop on port {}", port.id);
-                if let Err(e) = crate::filter::flow_drop::install_quic_short_drop(port.id) {
+                log::info!("Installing QUIC short-header raw rule on port {}", port.id);
+                if let Err(e) =
+                    crate::filter::flow_drop::install_quic_short_drop(port.id, quic_action)
+                {
                     log::warn!(
-                        "QUIC short-header raw drop install failed on port {}: {:?}",
+                        "QUIC short-header raw rule install failed on port {}: {:?}",
                         port.id,
                         e
                     );
@@ -240,6 +293,7 @@ where
 pub(crate) struct OnlineOptions {
     pub(crate) online: OnlineConfig,
     pub(crate) conntrack: ConnTrackConfig,
+    pub(crate) flow_table: Option<FlowTableConfig>,
 }
 
 extern "C" fn launch_rx<S>(arg: *mut c_void) -> i32

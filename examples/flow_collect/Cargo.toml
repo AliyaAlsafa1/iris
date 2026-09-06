@@ -1,0 +1,19 @@
+[package]
+name = "flow_collect"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iris-core = { path = "../../core" }
+iris-datatypes = { path = "../../datatypes" }
+iris-compiler = { path = "../../compiler" }
+serde = { version = "1", features = ["rc"] }
+
+array-init = "2.1"
+const_format = "0.2"
+
+arrow = "57"
+parquet = "57"
+
+flow_features = { path = "../flow_features" }
+clap = { version = "4.6.1", features = ["derive"] }
