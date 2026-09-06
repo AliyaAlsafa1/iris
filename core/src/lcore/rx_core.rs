@@ -289,7 +289,15 @@ where
                 // Publish the delta periodically so the monitor can log a duty cycle beside each
                 // interval's ingress rate. Only done on sampled iterations, where a fresh
                 // timestamp is already in hand.
-                if TOTAL_CYCLES.get() & 1023 == 256 {
+                //
+                // The cadence has to count *sampled* iterations, not loop iterations. Keying off
+                // TOTAL_CYCLES meant this never fired for any `budget_sample_stride` above 1:
+                // TOTAL_CYCLES increments every iteration, so the trigger wanted iteration
+                // 256 (mod 1024) -- which is always 0 (mod stride) -- while sampled iterations are
+                // 1 (mod stride). The two conditions were mutually exclusive, so online runs
+                // published nothing until the final flush after the loop, and every interval row
+                // in cycle_budget.csv was zeros. M3 had no data.
+                if budget.sampled_iters & 1023 == 0 {
                     budget.wall = t_after_maint.wrapping_sub(loop_start);
                     budget.rdtsc_reads = rdtsc_reads;
                     crate::stats::publish_datapath_delta(&budget, &mut published);
