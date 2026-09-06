@@ -65,6 +65,9 @@ def parse_args():
                    help="synthetic application work per TLS connection, in TSC cycles")
     p.add_argument("--max-rules", type=int, default=0,
                    help="cap on concurrently installed NIC rules (0 = unbounded)")
+    p.add_argument("--table-full-policy", choices=("refuse", "evict"), default="refuse",
+                   help="at --max-rules: refuse further offloads, or evict the least recently "
+                        "added rule (FIFO) to make room (default: refuse)")
     p.add_argument("--worker-cores", default="9",
                    help="cores for the rte_flow install worker (default: 9, NUMA-local to the CX-5)")
     p.add_argument("--out-dir", type=Path, default=Path("results/paired_ab"),
@@ -95,6 +98,7 @@ def run_one(arm, index, args):
         "--drop-mode", spec["drop_mode"],
         "--app-cycles", str(args.app_cycles),
         "--max-rules", str(args.max_rules),
+        "--table-full-policy", args.table_full_policy,
         "--worker-cores", args.worker_cores,
         "--report", str(report_path),
     ]
