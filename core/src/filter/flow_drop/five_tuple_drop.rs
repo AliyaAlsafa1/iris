@@ -263,9 +263,6 @@ where
 
         let mut error: rte_flow_error = unsafe { mem::zeroed() };
 
-        // Read unconditionally: hw-assist-cycle-eval consumes this for its
-        // rule-install/uninstall cycle counters.
-        #[allow(unused_variables)]
         let start = unsafe { dpdk::rte_rdtsc() };
         let flow = unsafe {
             rte_flow_create(
@@ -311,9 +308,6 @@ where
         let actions = make_actions(handle);
 
         let mut error_rev: rte_flow_error = unsafe { mem::zeroed() };
-        // Read unconditionally: hw-assist-cycle-eval consumes this for its
-        // rule-install/uninstall cycle counters.
-        #[allow(unused_variables)]
         let start = unsafe { dpdk::rte_rdtsc() };
         let flow_rev = unsafe {
             rte_flow_create(
@@ -451,9 +445,6 @@ pub fn uninstall_flow(
         }
 
         let mut error: rte_flow_error = unsafe { mem::zeroed() };
-        // Read unconditionally: hw-assist-cycle-eval consumes this for its
-        // rule-install/uninstall cycle counters.
-        #[allow(unused_variables)]
         let start = unsafe { dpdk::rte_rdtsc() };
         let ret = unsafe { rte_flow_destroy(port_id.raw(), *flow, &mut error) };
 
