@@ -97,6 +97,9 @@ def parse_args():
                    help="core to pin the memory sampler to. Required with --mem-sample, and "
                         "must not be an RX core or a --worker-cores core: sampling from a "
                         "measured core steals its cycles and pollutes its LLC occupancy.")
+    p.add_argument("--allow-cross-numa", action="store_true",
+                   help="proceed even though a port's RX cores are not on the port's NUMA node. "
+                        "Only for deliberately measuring the cross-socket case.")
     p.add_argument("--mem-baseline", type=Path, default=None,
                    help="a mem_sample.py --baseline CSV, measured with Iris stopped. Its DRAM "
                         "rate is subtracted from N1, since uncore counters are socket-wide and "
@@ -893,6 +896,16 @@ def main():
                     f"{ARMS[arm]['config']} (RX cores: {layout['rx_cores']}). Sampling from a "
                     "measured core steals its cycles and pollutes its LLC occupancy."
                 )
+            # Cross-socket polling misattributes N2 between sockets rather than adding noise to
+            # it, so refuse the batch here instead of discovering it once per run.
+            numa = mem_sample.check_numa_locality(layout)
+            if numa and not args.allow_cross_numa:
+                print(f"{ARMS[arm]['config']}: core allocation makes N2 unsound:", file=sys.stderr)
+                for p in numa:
+                    print(f"  {p}", file=sys.stderr)
+                print("\nA NUMA-local allocation for this host:\n", file=sys.stderr)
+                print(mem_sample.suggest_allocation(layout), file=sys.stderr)
+                sys.exit("\nFix the config's `cores` lists, or pass --allow-cross-numa.")
 
     if args.analyze_only:
         reports = []

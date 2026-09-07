@@ -92,6 +92,94 @@ def cpu_socket(cpu: int) -> int:
     return int(p.read_text().strip())
 
 
+def device_numa_node(pci_addr: str):
+    """The NUMA node a PCI device is attached to, or None if the platform does not say."""
+    try:
+        node = int((Path("/sys/bus/pci/devices") / pci_addr / "numa_node").read_text().strip())
+    except (OSError, ValueError):
+        return None
+    return None if node < 0 else node
+
+
+def check_numa_locality(layout):
+    """Reasons the core allocation makes the memory measurement unsound.
+
+    This is a hard gate rather than a warning, because cross-socket polling does not merely add
+    noise to N2 — it misattributes it. The decomposition per socket S is
+
+        io_dram[S] = imc_bytes[S] - mbm_total[group S]
+
+    and it assumes socket S's cores are what drive socket S's memory controllers. A core on socket
+    0 polling a NIC whose queues and mbufs live on socket 1 generates traffic that appears in
+    `mbm_total[group 0]` but in `imc[1]`. So io_dram[0] subtracts traffic that never crossed IMC 0
+    and comes out too low (clamped at zero, which hides it), while io_dram[1] credits those remote
+    reads to DDIO. Neither mbm_total nor mbm_local repairs this, because no group's local counter
+    captures another socket's cores hitting this socket's memory.
+
+    Note the ports themselves are what fix the reference: DPDK sets up each port's RX queues and
+    takes its mbufs from the mempool on the *port's* socket, so it is the port's NUMA node the
+    cores must match, not merely each other.
+    """
+    problems = []
+    for port in layout["ports"]:
+        dev = port["device"]
+        node = device_numa_node(dev)
+        sockets = {}
+        for c in port["cores"]:
+            sockets.setdefault(cpu_socket(c), []).append(c)
+        if len(sockets) > 1:
+            problems.append(
+                f"port {dev}: RX cores span sockets "
+                + ", ".join(f"{s}:{cs}" for s, cs in sorted(sockets.items()))
+                + " — its queues and mbufs live on one socket, so the cores on the other read "
+                  "them across UPI"
+            )
+        if node is not None:
+            remote = sorted(c for c in port["cores"] if cpu_socket(c) != node)
+            if remote:
+                problems.append(
+                    f"port {dev} is on NUMA node {node}, but cores {remote} are not — "
+                    "every packet header they touch crosses UPI, and that traffic is attributed "
+                    "to the wrong socket's memory controllers"
+                )
+    return problems
+
+
+def suggest_allocation(layout):
+    """A NUMA-local core allocation for the configured ports, as TOML.
+
+    Keeps each port's core count but draws the cores from the port's own NUMA node, skipping
+    `main_core` and preferring the lowest-numbered physical cores. Hyperthread siblings are
+    avoided: two RX cores sharing a physical core contend for the same L1/L2 and halve the
+    per-core throughput the evaluation is trying to measure.
+    """
+    used = {layout["main_core"]} if layout["main_core"] is not None else set()
+    by_node = {}
+    for cpu_path in sorted(CPU_DIR.glob("cpu[0-9]*"), key=lambda p: int(p.name[3:])):
+        cpu = int(cpu_path.name[3:])
+        try:
+            node = cpu_socket(cpu)
+            siblings = (cpu_path / "topology" / "thread_siblings_list").read_text().strip()
+        except OSError:
+            continue
+        # Keep only the first thread of each physical core.
+        if parse_cpu_list(siblings) and min(parse_cpu_list(siblings)) != cpu:
+            continue
+        by_node.setdefault(node, []).append(cpu)
+
+    lines = []
+    for port in layout["ports"]:
+        node = device_numa_node(port["device"])
+        want = len(port["cores"])
+        pool = [c for c in by_node.get(node, []) if c not in used]
+        take = pool[:want]
+        used.update(take)
+        note = "" if len(take) == want else f"  # only {len(take)} of {want} available on node {node}"
+        lines.append(f"[[online.ports]]\ndevice = \"{port['device']}\"   # NUMA node {node}\n"
+                     f"cores = {take}{note}")
+    return "\n\n".join(lines)
+
+
 def device_root_bus(pci_addr: str) -> str:
     """The PCI root bus a device sits under, e.g. '0000:3a' for '0000:3b:00.0'.
 
@@ -487,6 +575,13 @@ def main():
     ap.add_argument("--selftest", action="store_true",
                     help="sample a few intervals, then report exactly which counters were seen "
                          "and whether they advanced. Run this once after scripts/mem_setup.sh.")
+    ap.add_argument("--show-topology", action="store_true",
+                    help="print the core/NUMA/IIO layout for this host and a NUMA-local core "
+                         "allocation for the configured ports, then exit. Changes nothing.")
+    ap.add_argument("--allow-cross-numa", action="store_true",
+                    help="proceed even though a port's RX cores are not on the port's NUMA node. "
+                         "Only for deliberately measuring the cross-socket case: it misattributes "
+                         "N2 between sockets rather than merely adding noise.")
     args = ap.parse_args()
 
     layout = load_layout(args.config)
@@ -511,9 +606,30 @@ def main():
     for p in layout["ports"]:
         bus = device_root_bus(p["device"])
         loc = stacks.get(bus)
-        print(f"port {p['device']}  root bus {bus} -> "
+        node = device_numa_node(p["device"])
+        core_sockets = sorted({cpu_socket(c) for c in p["cores"]})
+        print(f"port {p['device']}  NUMA node {node}, root bus {bus} -> "
               + (f"uncore_iio_{loc[0]} die{loc[1]}, {iio_scale(loc[0]):.1f} B/count"
-                 if loc else "NO IIO STACK FOUND"))
+                 if loc else "NO IIO STACK FOUND")
+              + f"; its {len(p['cores'])} cores are on socket(s) {core_sockets}")
+
+    # Cross-NUMA polling misattributes N2 between sockets, so this is a gate, not a note.
+    numa_problems = check_numa_locality(layout)
+    if numa_problems or args.show_topology:
+        print()
+        for p in numa_problems:
+            print(f"  NUMA: {p}")
+        if numa_problems:
+            print("\nA NUMA-local allocation for this host:\n")
+            print("    " + suggest_allocation(layout).replace("\n", "\n    "))
+    if args.show_topology:
+        return
+    if numa_problems and not args.allow_cross_numa:
+        raise SystemExit(
+            "\nRefusing to sample: the core allocation makes N2 unsound (see above). Fix the "
+            "config's `cores` lists, or pass --allow-cross-numa to measure the cross-socket case "
+            "deliberately."
+        )
 
     specs, event_args = build_events(layout)
     specs_by_event = {}
