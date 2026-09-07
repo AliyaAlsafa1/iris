@@ -83,7 +83,9 @@ pub struct DatapathBudget {
     /// `rte_rdtsc()` calls the instrumentation itself made. Multiply by the calibrated per-read
     /// cost to bound how much of `wall` is measurement overhead.
     pub rdtsc_reads: u64,
-    /// One in every `sample_stride` loop iterations was attributed. 1 means exact.
+    /// One in every `sample_stride` loop iterations was attributed. 1 means exact; 0 means cycle
+    /// attribution was disabled, in which case the four buckets are empty but the exact counters
+    /// above are still valid.
     pub sample_stride: u64,
     /// Calibrated cost of one `rte_rdtsc()` read, in cycles, measured on the RX core itself.
     ///
@@ -214,12 +216,11 @@ pub fn publish_datapath_delta(running: &DatapathBudget, published: &mut Datapath
     push!(DP_RDTSC_READS, rdtsc_reads);
     push!(DP_SAMPLED_WALL, sampled_wall);
     push!(DP_SAMPLED_ITERS, sampled_iters);
-    if running.sample_stride != 0 {
-        DP_SAMPLE_STRIDE.store(running.sample_stride, Ordering::Relaxed);
-    }
-    if running.rdtsc_cost != 0 {
-        DP_RDTSC_COST.store(running.rdtsc_cost, Ordering::Relaxed);
-    }
+    // Stored unconditionally, including zero: `sample_stride == 0` means attribution is disabled
+    // and `rdtsc_cost == 0` follows from it, so suppressing zeroes here would report a run with no
+    // attribution as if it had been sampled exactly.
+    DP_SAMPLE_STRIDE.store(running.sample_stride, Ordering::Relaxed);
+    DP_RDTSC_COST.store(running.rdtsc_cost, Ordering::Relaxed);
 
     // Keep the legacy pair in step so existing consumers (e.g. examples/flow_stats) keep working:
     // "busy" there means non-empty bursts, i.e. poll_busy + pipeline + maint.

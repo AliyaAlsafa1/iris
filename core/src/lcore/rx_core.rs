@@ -136,10 +136,25 @@ where
         // To further try to unbias, subtract the cost of an `rte_rdtsc` from each.
         // Otherwise, every span would be inflated by the same absolute rte_rdtsc cost, which
         // is a larger fraction of a short span than a long one.
+        // `budget_sample_stride = 0` turns cycle attribution off entirely: the loop issues no
+        // `rte_rdtsc` beyond the two that bracket the whole run, so `wall`, `bursts`, `idle_polls`
+        // and `recv_pkts` stay exact while the four cycle buckets stay empty.
+        //
+        // This is the control condition for the memory evaluation. Cycles and memory are collected
+        // from the same run, so the claim that the cycle instrumentation does not perturb the
+        // memory numbers has to be testable by removing it and seeing them unchanged — not merely
+        // argued from the fact that `rte_rdtsc` touches no memory.
+        let attribute_cycles = self.budget_sample_stride != 0;
         let sample_stride = self.budget_sample_stride.max(1);
-        let rdtsc_cost = crate::stats::measure_rdtsc_overhead(4096).round() as u64;
+        let rdtsc_cost = if attribute_cycles {
+            crate::stats::measure_rdtsc_overhead(4096).round() as u64
+        } else {
+            0
+        };
         let mut budget = crate::stats::DatapathBudget {
-            sample_stride,
+            // The configured value, not the clamped countdown stride, so a report can tell
+            // "attribution off" (0) from "attribution exact" (1).
+            sample_stride: self.budget_sample_stride,
             rdtsc_cost,
             ..Default::default()
         };
@@ -161,10 +176,12 @@ where
             // Sample decision for this whole iteration, taken once so every bucket within it is
             // either attributed or not — a partially sampled iteration would not sum to its span.
             countdown -= 1;
-            let sampled = countdown == 0;
-            if sampled {
+            let due = countdown == 0;
+            if due {
                 countdown = sample_stride;
             }
+            // Let the countdown keep cycling even with attribution off, so it cannot underflow.
+            let sampled = due && attribute_cycles;
             let mut t_cursor = if sampled {
                 rdtsc_reads += 1;
                 unsafe { dpdk::rte_rdtsc() }

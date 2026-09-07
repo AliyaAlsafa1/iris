@@ -17,7 +17,7 @@ use std::fmt;
 use std::mem;
 use std::ptr;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 pub(crate) const SYMMETRIC_RSS_KEY: [u8; 52] = [
     0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A,
@@ -210,11 +210,24 @@ impl Port {
     ) -> Result<()> {
         self.configure(promiscuous, mtu)?;
 
-        let standard_mempool = standard_mempools.get_mut(&self.id.socket_id()).unwrap();
-        let split_mempool = split_mempools.get_mut(&self.id.socket_id()).unwrap();
+        let socket_id = self.id.socket_id();
+        let standard_mempool = standard_mempools.get_mut(&socket_id).unwrap();
+        // Absent unless some port actually runs split queues. The split pools come out the same
+        // size as the standard one (`Mempool::new` floors the data room at
+        // `RTE_MBUF_DEFAULT_BUF_SIZE`), so allocating them unused triples the mbuf footprint for
+        // nothing.
+        let split_mempool = split_mempools.get_mut(&socket_id);
         self.setup_queues(standard_mempool, split_mempool, nb_rxd)?;
         self.display_info();
         Ok(())
+    }
+
+    /// Whether any of this port's queues is a buffer-split queue, and so whether the port needs a
+    /// [`SplitMempool`] on its socket. Only true under [`FlowMode::Split`].
+    pub(crate) fn uses_split_queues(&self) -> bool {
+        self.queue_map
+            .keys()
+            .any(|rxqueue| rxqueue.ty == RxQueueType::Split)
     }
 
     /// Start port
@@ -441,12 +454,17 @@ impl Port {
     fn setup_queues(
         &self,
         standard_mempool: &mut Mempool,
-        split_mempool: &mut SplitMempool,
+        mut split_mempool: Option<&mut SplitMempool>,
         nb_rxd: usize,
     ) -> Result<()> {
         for rxqueue in self.queue_map.keys() {
             match rxqueue.ty {
-                RxQueueType::Split => self.setup_split_queue(rxqueue, split_mempool, nb_rxd)?,
+                RxQueueType::Split => {
+                    let split = split_mempool.as_deref_mut().with_context(|| {
+                        format!("split queue {rxqueue} has no split mempool on its socket")
+                    })?;
+                    self.setup_split_queue(rxqueue, split, nb_rxd)?
+                }
                 _ => self.setup_standard_queue(rxqueue, standard_mempool, nb_rxd)?,
             };
         }
@@ -607,6 +625,10 @@ pub struct IngressCounters {
     pub phy_discard_packets: u64,
     /// Packets dropped because no descriptor was available (software could not keep up).
     pub missed_errors: u64,
+    /// Times the PMD wanted an mbuf and the pool had none (`rx_mbuf_allocation_errors`).
+    /// Non-zero means the mempool was undersized for the offered load, which invalidates any
+    /// claim about the pool's minimum viable capacity.
+    pub mbuf_allocation_errors: u64,
     /// False when the PMD does not expose `rx_phy_*` (ICE, for instance). The `phy_*`
     /// fields then fall back to the `good_*` values, which makes shed traffic invisible — so a
     /// report carrying `phy_available: false` cannot be used for the ingress-normalised metric.
@@ -634,6 +656,7 @@ pub fn ingress_counters(port_id: PortId) -> Result<IngressCounters> {
         good_bytes,
         phy_discard_packets: get("rx_phy_discard_packets").unwrap_or(0),
         missed_errors: get("rx_missed_errors").unwrap_or(0),
+        mbuf_allocation_errors: get("rx_mbuf_allocation_errors").unwrap_or(0),
         phy_available: phy_packets.is_some() && phy_bytes.is_some(),
     })
 }

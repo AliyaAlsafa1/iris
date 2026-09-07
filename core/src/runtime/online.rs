@@ -62,10 +62,14 @@ where
                 Mempool::new(&config.mempool, socket_id, mtu, "standard")
                     .expect("Unable to initialize standard mempool")
             });
-            split_mempools.entry(socket_id).or_insert_with(|| {
-                SplitMempool::new(&config.mempool, socket_id, SPLIT_HDR_SIZE, mtu)
-                    .expect("Unable to initialize split mempool")
-            });
+            // Only when this port actually has split queues; see the note in `Runtime::new`. An
+            // unused split pool is the same size as the standard one, not smaller.
+            if port.uses_split_queues() {
+                split_mempools.entry(socket_id).or_insert_with(|| {
+                    SplitMempool::new(&config.mempool, socket_id, SPLIT_HDR_SIZE, mtu)
+                        .expect("Unable to initialize split mempool")
+                });
+            }
             port.init(
                 standard_mempools,
                 split_mempools,

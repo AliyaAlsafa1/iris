@@ -35,10 +35,11 @@ impl Mempool {
 
         let name = format!("mempool_{}_{}", prefix, socket_id);
         let cname = CString::new(name.clone()).expect("Invalid CString conversion");
+        let capacity = config.capacity_for(prefix);
         let mempool = unsafe {
             dpdk::rte_pktmbuf_pool_create(
                 cname.as_ptr(),
-                config.capacity as c_uint,
+                capacity as c_uint,
                 config.cache_size as c_uint,
                 0,
                 mbuf_size.try_into().with_context(|| {

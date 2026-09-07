@@ -217,6 +217,7 @@ impl Default for RuntimeConfig {
             mempool: MempoolConfig {
                 capacity: 8192,
                 cache_size: 512,
+                capacity_overrides: Default::default(),
             },
             online: None,
             offline: Some(OfflineConfig {
@@ -270,6 +271,34 @@ pub struct MempoolConfig {
     /// `capacity`. Defaults to `512`.
     #[serde(default = "default_cache_size")]
     pub cache_size: usize,
+
+    /// Per-pool overrides of `capacity`, keyed by mempool prefix — `standard`, `split_header` or
+    /// `split_remainder`. A prefix that is absent here uses `capacity`.
+    ///
+    /// This exists because the pools have very different requirements and only one knob used to
+    /// size all of them. The standard pool must cover the pre-filled RX descriptor rings
+    /// (`nb_rxd` x queues x ports) plus whatever reassembly retains; the split pools, when they
+    /// exist at all, are sized by the same rings but hold no reassembly backlog. Sizing them
+    /// together forces the maximum of the two on all of them.
+    ///
+    /// ```toml
+    /// [mempool]
+    ///     capacity = 4_000_000
+    ///     [mempool.capacity_overrides]
+    ///     standard = 524_288
+    /// ```
+    #[serde(default)]
+    pub capacity_overrides: std::collections::BTreeMap<String, usize>,
+}
+
+impl MempoolConfig {
+    /// Objects to allocate for the pool named `prefix`, honouring `capacity_overrides`.
+    pub(crate) fn capacity_for(&self, prefix: &str) -> usize {
+        self.capacity_overrides
+            .get(prefix)
+            .copied()
+            .unwrap_or(self.capacity)
+    }
 }
 
 fn default_capacity() -> usize {

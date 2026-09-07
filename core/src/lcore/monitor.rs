@@ -1,9 +1,7 @@
 use crate::config::RuntimeConfig;
-use crate::dpdk;
 use crate::port::{statistics::PortStats, Port, PortId, RxQueue, RxQueueType};
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::CString;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs;
 use std::io::Write;
@@ -16,6 +14,18 @@ use anyhow::{bail, Result};
 use chrono::Local;
 use csv::Writer;
 use serde::Serialize;
+
+/// Milliseconds since the Unix epoch.
+///
+/// The log CSVs carry this alongside the monitor-relative `ts_ms` so their rows can be joined
+/// against samples taken outside this process — the memory counters (uncore IMC/IIO, resctrl) are
+/// collected by a separate sampler and have no other common time base.
+fn unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
 
 /// Preamble + Start Frame Delimiter
 const PSFD_SIZE: u64 = 8;
@@ -83,6 +93,8 @@ impl Monitor {
                     }
                     let budget_wtr = Writer::from_path(path.join("cycle_budget.csv"))
                         .expect("create cycle budget log");
+                    let mempool_wtr =
+                        Writer::from_path(path.join("mempool.csv")).expect("create mempool log");
                     return Some(Logger {
                         interval: Duration::from_millis(log_cfg.interval),
                         path,
@@ -92,6 +104,7 @@ impl Monitor {
                         last_budget: Default::default(),
                         last_ingress_pkts: 0,
                         last_ingress_bytes: 0,
+                        mempool_wtr,
                     });
                 }
             }
@@ -118,6 +131,7 @@ impl Monitor {
         if let Some(logger) = &mut self.logger {
             logger.init_port_wtrs().expect("port logger init");
             logger.init_budget_wtr().expect("cycle budget logger init");
+            logger.init_mempool_wtr().expect("mempool logger init");
         }
         // ts of run start
         let start_ts = Instant::now();
@@ -171,7 +185,7 @@ impl Monitor {
                             println!("----------------------------------------------");
                             println!("Current time: {}", pretty_print_duration(elapsed_ts));
                             // Takes &self.ports (and &self.display); no self mutation here.
-                            self.display.as_ref().unwrap().mempool_usage(&self.ports);
+                            self.display.as_ref().unwrap().mempool_usage();
                             AggRxStats::display_rates(curr_rx, prev_rx, nms);
                             AggRxStats::display_dropped(curr_rx, init_rx);
                         }
@@ -241,26 +255,29 @@ struct Display {
 }
 
 impl Display {
-    /// Display mempool usage
-    fn mempool_usage(&self, ports: &BTreeMap<PortId, Vec<RxQueue>>) {
-        let sockets: BTreeSet<_> = ports.keys().map(|id| id.socket_id()).collect();
-
-        for socket in sockets {
-            for prefix in ["standard", "split_header", "split_remainder"] {
-                let name = format!("mempool_{}_{}", prefix, socket);
-                let cname = CString::new(name.clone()).expect("Invalid CString conversion");
-                let mempool_raw = unsafe { dpdk::rte_mempool_lookup(cname.as_ptr()) };
-                let avail_cnt = unsafe { dpdk::rte_mempool_avail_count(mempool_raw) };
-                let inuse_cnt = unsafe { dpdk::rte_mempool_in_use_count(mempool_raw) };
-
-                println!(
-                    "{} avail: {}, in use: {} ({:.3}%)",
-                    name,
-                    avail_cnt,
-                    inuse_cnt,
-                    100.0 * inuse_cnt as f64 / (inuse_cnt + avail_cnt) as f64
-                );
-            }
+    /// Display mempool usage, and what each pool costs in hugepage memory.
+    ///
+    /// Pools are enumerated rather than looked up by `mempool_{prefix}_{socket}` name, so this
+    /// shows exactly the pools that exist — it cannot invent a row for one that was never
+    /// allocated, nor miss one created elsewhere.
+    fn mempool_usage(&self) {
+        let stats = crate::memory::accounting::all_mempool_stats();
+        for s in &stats {
+            println!(
+                "{} avail: {}, in use: {} ({:.3}%), {:.2} GiB allocated",
+                s.name,
+                s.avail,
+                s.in_use,
+                100.0 * s.utilisation(),
+                s.allocated_bytes as f64 / (1 << 30) as f64,
+            );
+        }
+        if stats.len() > 1 {
+            println!(
+                "mempool total: {:.2} GiB allocated across {} pools",
+                crate::memory::accounting::total_allocated_bytes(&stats) as f64 / (1 << 30) as f64,
+                stats.len(),
+            );
         }
     }
 }
@@ -278,6 +295,12 @@ struct Logger {
     last_budget: crate::stats::DatapathBudget,
     last_ingress_pkts: u64,
     last_ingress_bytes: u64,
+    /// Per-interval mbuf pool occupancy, one row per pool per interval.
+    ///
+    /// Separate from the port CSVs because pools are per *socket*, not per port: the previous
+    /// per-port columns reported the same socket's pool once per port on that socket, and only
+    /// ever the `standard` prefix.
+    mempool_wtr: Writer<std::fs::File>,
 }
 
 impl Logger {
@@ -291,11 +314,65 @@ impl Logger {
                     wtr.write_field(label)?;
                 }
             }
-            wtr.write_field("mempool_avail_cnt")?;
-            wtr.write_field("mempool_inuse_cnt")?;
             wtr.write_record(None::<&[u8]>)?;
             wtr.flush()?;
         }
+        Ok(())
+    }
+
+    /// Write the header for `mempool.csv`. One row per pool per interval, so a run with three
+    /// pools writes three rows per interval.
+    fn init_mempool_wtr(&mut self) -> Result<()> {
+        for field in [
+            "ts_ms",
+            "unix_ms",
+            "name",
+            "socket_id",
+            // Pool geometry, constant across the run but recorded per row so a single file is
+            // self-describing.
+            "size",
+            "obj_bytes",
+            "allocated_bytes",
+            "cache_size",
+            // The gauge: what the datapath actually held at this instant.
+            "avail",
+            "in_use",
+            "in_use_bytes",
+            "utilisation",
+        ] {
+            self.mempool_wtr.write_field(field)?;
+        }
+        self.mempool_wtr.write_record(None::<&[u8]>)?;
+        self.mempool_wtr.flush()?;
+        Ok(())
+    }
+
+    /// Sample every live pool's occupancy, both into `mempool.csv` and into the run-long
+    /// peak/mean accumulator that the eval report reads.
+    fn log_mempool(&mut self, elapsed: Duration) -> Result<()> {
+        crate::memory::accounting::sample_mempool_high_water();
+        let unix_ms = unix_millis();
+        for s in crate::memory::accounting::all_mempool_stats() {
+            let row = [
+                elapsed.as_millis().to_string(),
+                unix_ms.to_string(),
+                s.name.clone(),
+                s.socket_id.to_string(),
+                s.size.to_string(),
+                s.obj_bytes.to_string(),
+                s.allocated_bytes.to_string(),
+                s.cache_size.to_string(),
+                s.avail.to_string(),
+                s.in_use.to_string(),
+                s.in_use_bytes().to_string(),
+                format!("{:.6}", s.utilisation()),
+            ];
+            for field in row {
+                self.mempool_wtr.write_field(field)?;
+            }
+            self.mempool_wtr.write_record(None::<&[u8]>)?;
+        }
+        self.mempool_wtr.flush()?;
         Ok(())
     }
 
@@ -318,19 +395,13 @@ impl Logger {
                 }
                 Err(error) => log::error!("{}", error),
             }
-            let name = format!("mempool_standard_{}", port_id.socket_id());
-            let cname = CString::new(name.clone()).expect("Invalid CString conversion");
-            let mempool_raw = unsafe { dpdk::rte_mempool_lookup(cname.as_ptr()) };
-            let avail_cnt = unsafe { dpdk::rte_mempool_avail_count(mempool_raw) };
-            let inuse_cnt = unsafe { dpdk::rte_mempool_in_use_count(mempool_raw) };
-            wtr.write_field(avail_cnt.to_string())?;
-            wtr.write_field(inuse_cnt.to_string())?;
             wtr.write_record(None::<&[u8]>)?;
         }
         for wtr in self.port_wtrs.values_mut() {
             wtr.flush()?;
         }
         self.log_cycle_budget(elapsed)?;
+        self.log_mempool(elapsed)?;
         Ok(())
     }
 
@@ -339,6 +410,10 @@ impl Logger {
     fn init_budget_wtr(&mut self) -> Result<()> {
         for field in [
             "ts_ms",
+            // Absolute wall clock. `ts_ms` is monitor-relative, so it cannot be joined against
+            // anything sampled outside this process — which is how the memory counters
+            // (uncore IMC/IIO, resctrl) are collected.
+            "unix_ms",
             // Interval deltas, in TSC cycles. The four buckets are attributed over sampled
             // iterations only and sum to d_sampled_wall; d_wall is the exact interval span.
             // Fractions must therefore be taken against d_sampled_wall, and absolute cycle
@@ -410,6 +485,7 @@ impl Logger {
 
         let row = [
             elapsed.as_millis().to_string(),
+            unix_millis().to_string(),
             d_poll_busy.to_string(),
             d_poll_idle.to_string(),
             d_pipeline.to_string(),

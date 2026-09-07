@@ -438,6 +438,44 @@ struct GroundTruth {
     ingress_reconciliation_gap: i64,
 }
 
+/// What the run cost in mbuf-pool memory, and how much of it was ever needed.
+///
+/// The mbuf pools are the largest allocation Iris makes, so this is most of the answer to "how much
+/// memory does Iris need". Two quantities, and they say different things:
+///
+/// * `allocated_bytes` is what `[mempool] capacity` actually reserved in hugepages. It is a config
+///   choice, identical in both arms.
+/// * `peak_in_use_bytes` is what the datapath ever held. The gap between them is memory that could
+///   be given to application data structures instead.
+///
+/// Note the peak is dominated by the pre-filled RX descriptor rings (`nb_rxd` x queues x ports),
+/// which do not depend on what the NIC dropped — so most of the headroom this exposes is available
+/// to *both* arms, and is a right-sizing finding rather than an effect of the mechanism. The
+/// arm-sensitive part is the mbufs retained for TCP reassembly. Reporting both keeps the two from
+/// being conflated.
+#[derive(Serialize)]
+struct MemoryReport {
+    /// Per-pool geometry and final occupancy, one entry per live pool.
+    pools: Vec<iris_core::memory::accounting::MempoolStats>,
+    /// Per-pool peak and mean occupancy over the run, sampled by the monitor. Empty when the
+    /// config has no `[online.monitor.log]` section, since nothing then samples the gauge.
+    high_water: Vec<iris_core::memory::accounting::MempoolHighWater>,
+    /// Hugepage bytes held by all mbuf pools together.
+    total_allocated_bytes: u64,
+    /// Peak bytes actually held, summed over pools. Compare against `total_allocated_bytes`.
+    total_peak_in_use_bytes: u64,
+    /// `total_peak_in_use_bytes / total_allocated_bytes`. A small value means the pools are
+    /// oversized by its reciprocal.
+    peak_utilisation: f64,
+    /// mbuf allocation failures, summed over ports: the NIC wanted a buffer and the pool had
+    /// none. Non-zero invalidates any claim that the pool was large enough, and is the signal
+    /// `tools/mempool_bisect.py` bisects against.
+    mbuf_allocation_errors: u64,
+    /// Packets dropped for want of an RX descriptor, summed over ports. Rises alongside
+    /// `mbuf_allocation_errors` when the pool is undersized, and is the other bisection signal.
+    missed_errors: u64,
+}
+
 #[derive(Serialize)]
 struct Report {
     arm: String,
@@ -454,6 +492,7 @@ struct Report {
     normalised: NormalisedMetrics,
     control_plane: ControlPlaneCost,
     ground_truth: GroundTruth,
+    memory: MemoryReport,
     ingress: Vec<IngressCounters>,
     tsc_hz: u64,
 }
@@ -725,8 +764,35 @@ fn build_report(
             discarded_bytes: DISCARDED_BYTES.load(Ordering::Relaxed),
             ingress_reconciliation_gap: phy_pkts as i64 - good_pkts as i64 - phy_discard as i64,
         },
+        memory: build_memory_report(ingress),
         ingress: ingress.to_vec(),
         tsc_hz,
+    }
+}
+
+/// Read the mbuf pools back at shutdown and pair them with the run's peak occupancy.
+///
+/// Called from the pre-stop hook's aftermath rather than during the run, because the final
+/// `pools` snapshot should reflect a quiesced datapath; the interesting *peak* comes from the
+/// monitor's periodic sampling, not from this one reading.
+fn build_memory_report(ingress: &[IngressCounters]) -> MemoryReport {
+    use iris_core::memory::accounting::{
+        all_mempool_stats, mempool_high_water, total_allocated_bytes,
+    };
+
+    let pools = all_mempool_stats();
+    let high_water = mempool_high_water();
+    let total_allocated = total_allocated_bytes(&pools);
+    let total_peak: u64 = high_water.iter().map(|h| h.peak_in_use_bytes).sum();
+
+    MemoryReport {
+        total_allocated_bytes: total_allocated,
+        total_peak_in_use_bytes: total_peak,
+        peak_utilisation: fdiv(total_peak as f64, total_allocated as f64),
+        mbuf_allocation_errors: ingress.iter().map(|c| c.mbuf_allocation_errors).sum(),
+        missed_errors: ingress.iter().map(|c| c.missed_errors).sum(),
+        pools,
+        high_water,
     }
 }
 
@@ -844,4 +910,50 @@ fn print_summary(r: &Report) {
         "  ingress reconciliation gap: {} pkts (should be ~0)",
         r.ground_truth.ingress_reconciliation_gap
     );
+    print_memory_summary(&r.memory);
+}
+
+const GIB: f64 = (1u64 << 30) as f64;
+
+fn print_memory_summary(m: &MemoryReport) {
+    println!("--- mbuf pool memory ---");
+    for p in &m.pools {
+        // Find this pool's peak; absent when nothing sampled the gauge (no monitor log section).
+        let peak = m.high_water.iter().find(|h| h.name == p.name);
+        print!(
+            "  {:<26} {:>7.2} GiB for {} x {} B",
+            p.name,
+            p.allocated_bytes as f64 / GIB,
+            p.size,
+            p.obj_bytes
+        );
+        match peak {
+            Some(h) => println!(
+                ", peak {} in use ({:.2}%, {:.2} GiB) over {} samples",
+                h.peak_in_use,
+                100.0 * h.peak_utilisation,
+                h.peak_in_use_bytes as f64 / GIB,
+                h.samples
+            ),
+            None => println!(", no occupancy samples (no [online.monitor.log] section)"),
+        }
+    }
+    println!(
+        "  total:                   {:>7.2} GiB allocated, peak {:.2} GiB in use ({:.2}%)",
+        m.total_allocated_bytes as f64 / GIB,
+        m.total_peak_in_use_bytes as f64 / GIB,
+        100.0 * m.peak_utilisation
+    );
+    // The peak is mostly the pre-filled RX rings, which are identical in both arms. Say so here
+    // rather than letting a large headroom figure read as an effect of the mechanism.
+    println!(
+        "  ^ headroom is mostly arm-independent (RX rings dominate the peak); the A/B delta is \
+         the reassembly-held share"
+    );
+    if m.mbuf_allocation_errors > 0 || m.missed_errors > 0 {
+        println!(
+            "  UNDERSIZED: {} mbuf allocation errors, {} missed (no-descriptor) errors",
+            m.mbuf_allocation_errors, m.missed_errors
+        );
+    }
 }
