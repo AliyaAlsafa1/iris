@@ -7,3 +7,5 @@ Cargo.lock
 *.jsonl
 *.DS_Store
 /hists
+.claude/
+*__pycache__
