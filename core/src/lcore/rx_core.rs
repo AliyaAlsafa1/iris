@@ -17,6 +17,10 @@ use std::time::Instant;
 
 use itertools::Itertools;
 
+/// Number of mbufs requested per `rte_eth_rx_burst` call, and the unit in which datapath
+/// maintenance is amortised.
+const RX_BURST_SIZE: u16 = 32;
+
 /// A RxCore polls from `rxqueues` and reduces the stream of packets into
 /// a stream of higher-level network events to be processed by the user.
 pub(crate) struct RxCore<S>
@@ -150,6 +154,8 @@ where
         // compile to a u64 division costing about as much as the `rte_rdtsc` this is meant to
         // avoid. A decrement and compare is a couple of cycles.
         let mut countdown: u64 = 1;
+        // Packets received since the timer wheel was last consulted. See the gate below.
+        let mut pkts_since_maint: u64 = 0;
 
         while self.is_running.load(Ordering::Relaxed) {
             // Sample decision for this whole iteration, taken once so every bucket within it is
@@ -171,7 +177,7 @@ where
             let mut spans_closed: u64 = 0;
 
             for rxqueue in self.rxqueues.iter() {
-                let mbufs: Vec<Mbuf> = self.rx_burst(rxqueue, 32);
+                let mbufs: Vec<Mbuf> = self.rx_burst(rxqueue, RX_BURST_SIZE);
                 let n_recv = mbufs.len();
 
                 // Close the poll bucket. An empty burst is charged to `poll_idle` — the pool of
@@ -196,6 +202,7 @@ where
                 } else {
                     budget.bursts += 1;
                     budget.recv_pkts += n_recv as u64;
+                    pkts_since_maint += n_recv as u64;
                 }
 
                 // Apply any pending flow rules pushed by the control plane.
@@ -261,7 +268,16 @@ where
                     t_cursor = t_after_pipeline;
                 }
             }
-            conn_table.check_inactive(&self.subscription, now);
+            // Quantise maintenance to a full RX burst. Run every iteration, its cost per packet
+            // scales with how idle the core is rather than with delivered work, which biases the
+            // freed-cycle comparison between arms.
+            //
+            // The wheel keeps its own `timeout_resolution` gate, so this only delays a check; the
+            // effective expiry period is the later of the two conditions.
+            if pkts_since_maint >= RX_BURST_SIZE as u64 {
+                pkts_since_maint = 0;
+                conn_table.check_inactive(&self.subscription, now);
+            }
 
             if sampled {
                 // Close the maintenance bucket (timer-wheel expiry).
@@ -317,7 +333,7 @@ where
 
         while self.is_running.load(Ordering::Relaxed) {
             for (i, rxqueue) in self.rxqueues.iter().enumerate() {
-                let mbufs: Vec<Mbuf> = self.rx_burst(rxqueue, 32);
+                let mbufs: Vec<Mbuf> = self.rx_burst(rxqueue, RX_BURST_SIZE);
                 for mbuf in mbufs.into_iter() {
                     per_queue[i].0 += 1;
                     per_queue[i].1 += mbuf.data_len() as u64;
