@@ -35,11 +35,21 @@
 //!   --stats-size  counter slots, rounded up to a power of two (env IRIS_STATS_SIZE, default 2^24)
 //!   --capacity --ways   software flow-table sizing (override config [flow_table])
 //!   --worker-cores --num-flows --hw-rule-secs --flow-channel-size   hardware arm
+//!
+//! A `[nic_latency]` config section makes the hardware arm replay another NIC's `rte_flow`
+//! latencies (see `filter::flow_drop::nic_latency`). That caps what one worker core can install:
+//! at the Intel trace's ~308 us/insert and ~208 us/delete, and two rules per `install_drop_flow`,
+//! a single worker tops out in the low hundreds of offloads per second. Past that the dispatcher
+//! backs up and offload requests are refused, so this app prints the dispatcher's
+//! dispatched/dropped counts and the emulation's counters at shutdown: a run with a non-trivial
+//! refusal fraction offloaded only some of the connections it meant to, and its shed numbers must
+//! be read that way. More `--worker-cores` raise the ceiling proportionally, and the trace cursor
+//! is shared, so the replay stays correct across them.
 
 use clap::{ArgEnum, Parser};
 use iris_compiler::*;
 use iris_core::dpdk::{rte_flow, rte_flow_action_handle};
-use iris_core::filter::flow_drop::{install_drop_flow, uninstall_flow};
+use iris_core::filter::flow_drop::{install_drop_flow, nic_latency_cost, uninstall_flow};
 use iris_core::filter::sw_flow::{self, FlowAction};
 use iris_core::multicore::{ChannelDispatcher, ChannelMode, SharedWorkerThreadSpawner};
 use iris_core::port::PortId;
@@ -52,7 +62,7 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 static STATS: OnceLock<Vec<AtomicU64>> = OnceLock::new();
@@ -67,6 +77,7 @@ static CB_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FLOW_DISPATCHER: OnceLock<Arc<ChannelDispatcher<FlowEvent>>> = OnceLock::new();
 static NUM_FLOWS: OnceLock<usize> = OnceLock::new();
 static HW_RULE_SECS: OnceLock<u64> = OnceLock::new();
+static BACKPRESSURE_WARNED: Once = Once::new();
 
 /// Raw rte_flow pointers are not Send; wrap them so the worker can own them.
 #[derive(Clone, Copy)]
@@ -321,13 +332,26 @@ fn count(five_tuple: &FiveTuple, core_id: &CoreId, pkts: &PktCount, pdu: &L4Pdu)
             DropMode::Hardware => {
                 // Off-datapath: dispatch to the install worker (flow_test pattern).
                 if let Some(d) = FLOW_DISPATCHER.get() {
-                    let _ = d.dispatch(
+                    // A refused dispatch means the worker cannot keep up, so this connection
+                    // is never offloaded. Rare at the native ~12 us install cost, common once
+                    // `[nic_latency]` replays a slower NIC, so count it.
+                    if d.dispatch(
                         FlowEvent::DropFlow {
                             tuple: *five_tuple,
                             rx_core: *core_id,
                         },
                         Some(core_id),
-                    );
+                    )
+                    .is_err()
+                    {
+                        BACKPRESSURE_WARNED.call_once(|| {
+                            log::warn!(
+                                "install worker saturated: offload requests are being refused. \
+                                 Raise --worker-cores or --flow-channel-size, or lower the \
+                                 connection rate; this run covers only part of the offered load."
+                            );
+                        });
+                    }
                 }
             }
             DropMode::Filter | DropMode::None => {}
@@ -417,7 +441,9 @@ fn main() {
         }
     }
 
+    let run_started = Instant::now();
     runtime.run();
+    let run_elapsed = run_started.elapsed();
 
     if let Some(h) = worker_handle {
         h.shutdown(None);
@@ -437,4 +463,74 @@ fn main() {
     println!("Datapath busy cycles: {dp_cycles}");
     println!("Datapath received pkts: {dp_pkts}");
     println!("Datapath cycles/pkt: {cpp:.2}");
+
+    if mode == DropMode::Hardware {
+        print_hw_arm_report(run_elapsed);
+    }
+}
+
+/// Report the hardware arm's control-plane side: what the NIC latency emulation charged, and
+/// whether the install worker kept up.
+///
+/// `run_elapsed` is wall time, which is what the worker's busy fraction has to be measured
+/// against — the number that says whether the arm was queue-limited rather than mechanism-limited.
+/// Datapath busy cycles are not a substitute: they are summed across RX cores with idle polling
+/// excluded, so they bear no fixed relation to how long one worker core was available.
+fn print_hw_arm_report(run_elapsed: Duration) {
+    if let Some(d) = FLOW_DISPATCHER.get() {
+        let stats = d.stats();
+        let dispatched = stats.get_dispatched();
+        let dropped = stats.get_dropped();
+        let offered = dispatched + dropped;
+        let drop_fraction = if offered > 0 {
+            dropped as f64 / offered as f64
+        } else {
+            0.0
+        };
+        println!("Offload requests dispatched: {dispatched}");
+        println!("Offload requests refused: {dropped}");
+        println!("Offload refusal fraction: {drop_fraction:.4}");
+        if drop_fraction > 0.01 {
+            log::warn!(
+                "{:.1}% of offload requests were refused: the install worker could not keep up, \
+                 so this run offloaded only part of the offered load.",
+                drop_fraction * 100.0
+            );
+        }
+    }
+
+    let nl = nic_latency_cost();
+    if !nl.configured {
+        println!("NIC latency emulation: not configured");
+        return;
+    }
+    println!(
+        "NIC latency emulation: {} ({} ops in trace, scale {})",
+        if nl.active { "active" } else { "off" },
+        nl.trace_ops,
+        nl.scale
+    );
+    println!(
+        "  paced inserts: {} (mean {:.3} us)",
+        nl.paced_inserts,
+        nl.mean_insert_us()
+    );
+    println!(
+        "  paced deletes: {} (mean {:.3} us)",
+        nl.paced_deletes,
+        nl.mean_delete_us()
+    );
+    println!("  spin overshoot ratio: {:.4}", nl.spin_overshoot_ratio());
+    println!("  trace wraps: {}", nl.trace_wraps);
+    // Teardown runs unpaced by design. Printing the count keeps that on the record, rather than
+    // leaving an unexplained gap between rules installed and deletes paced.
+    println!(
+        "  unpaced at teardown: {} inserts, {} deletes",
+        nl.unpaced_teardown_inserts, nl.unpaced_teardown_deletes
+    );
+    let wall_cycles = (run_elapsed.as_secs_f64() * nl.tsc_hz as f64) as u64;
+    println!(
+        "  worker busy fraction (1 core): {:.4}",
+        nl.worker_busy_fraction(wall_cycles, 1)
+    );
 }

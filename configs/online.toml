@@ -42,3 +42,21 @@ port = 9898
 throughput = true
 mempool_usage = true
 port_stats = [ "rx_good_packets", "rx_good_bytes", "rx_phy_packets", "rx_phy_bytes", "rx_mbuf_allocation_errors", "rx_phy_discard_packets", "rx_missed_errors",]
+
+# NIC control-plane latency emulation, off unless this section is present. Spins for a latency
+# measured on another NIC before each real rte_flow_create / rte_flow_destroy, so this box costs
+# per-connection rule installs like the traced NIC does.
+#
+# The trace is CSV, header `op_id,phase,us`, three rows per op_id (replace, delete, insert);
+# `replace` is a derived total (exactly delete + insert) and is ignored at load. Traces are large
+# and deliberately NOT committed here -- point `trace` at a local copy.
+#
+# A section present but not honourable is fatal on purpose: a run that silently skipped pacing
+# would be indistinguishable from an unemulated baseline. Teardown is never paced.
+# See filter::flow_drop::nic_latency.
+#[nic_latency]
+#trace = "/path/to/churn_intel_1m.csv"
+#enabled = true            # false = validate the trace but run at native speed (control arm)
+#scale = 1.0               # multiplier applied to every latency at load
+#limit_ops = 0             # load only the first N ops; 0 = all
+#sleep_threshold_us = 0    # 0 = spin throughout (recommended); >0 sleeps all but the tail

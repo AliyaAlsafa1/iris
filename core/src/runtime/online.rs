@@ -136,6 +136,14 @@ where
         unsafe { dpdk::rte_eal_mp_wait_lcore() };
 
         log::info!("Exiting loop...");
+
+        // Teardown begins here: the RX cores have exited, so nothing more is measured. Stop
+        // replaying the NIC latency trace, or draining a large rule set -- and the install
+        // worker's backlog flush -- would spend minutes emulating operations that contribute
+        // nothing. Apps uninstall rules after `run` returns, which is past this point. Skips are
+        // still counted; see `filter::flow_drop::nic_latency`.
+        crate::filter::flow_drop::nic_latency::suspend();
+
         self.stop_ports();
     }
 

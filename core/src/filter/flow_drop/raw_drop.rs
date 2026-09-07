@@ -5,6 +5,11 @@
 //! `pattern` buffer is the ASCII hex encoding of the spec/mask bytes, with
 //! length doubled accordingly. Unlike the mlx5 dyn_hardware_assist path, ICE
 //! does not need a table-0 -> table-1 jump — rules go on group 0 directly.
+//!
+//! These rules are deliberately **not** subject to the NIC latency emulation in
+//! [`super::nic_latency`]: they are installed once per port at startup and never churned, and the
+//! trace it replays measures 5-tuple exact-match churn, so charging it to raw-pattern parser
+//! rules would attribute the wrong distribution to a different class of rule.
 
 use std::ffi::CStr;
 use std::mem;

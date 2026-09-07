@@ -10,6 +10,7 @@ use crate::protocols::packet::udp::UDP_PROTOCOL;
 use crate::FiveTuple;
 use anyhow::{bail, Result};
 
+use super::nic_latency;
 use crate::dpdk;
 use crate::dpdk::{
     rte_flow, rte_flow_action, rte_flow_action_count, rte_flow_action_handle,
@@ -235,6 +236,12 @@ where
         let handle = create_count_handle(port_id.raw())?;
         let actions = make_actions(handle);
 
+        // Emulated NIC control-plane latency, if a trace is configured. Charged *before* the
+        // rdtsc read below, so it never lands inside a measurement of the real hardware cost. The
+        // count handle above is a CX5-only artefact the trace never paid for, so it stays outside
+        // too.
+        nic_latency::charge(nic_latency::Phase::Insert);
+
         let mut error: rte_flow_error = unsafe { mem::zeroed() };
 
         // Read unconditionally: hw-assist-cycle-eval consumes this for its
@@ -280,6 +287,10 @@ where
     for port_id in port_ids.iter() {
         let handle = create_count_handle(port_id.raw())?;
         let actions = make_actions(handle);
+
+        // A second rule, so a second emulated insert: the trace measures one rule, not one
+        // logical offload.
+        nic_latency::charge(nic_latency::Phase::Insert);
 
         let mut error_rev: rte_flow_error = unsafe { mem::zeroed() };
         // Read unconditionally: hw-assist-cycle-eval consumes this for its
@@ -417,6 +428,12 @@ pub fn uninstall_flow(
                 Err(e) => eprintln!("Port {} flow stats unavailable: {}", port_id.raw(), e),
             }
         }
+
+        // After the null check and the counter read, so only rules actually destroyed are
+        // charged; before the rdtsc read, for the same reason as on the install path.
+        // `nic_latency::suspend()` makes this a no-op once teardown begins, so draining the
+        // resident rule set does not replay the trace.
+        nic_latency::charge(nic_latency::Phase::Delete);
 
         let mut error: rte_flow_error = unsafe { mem::zeroed() };
         // Read unconditionally: hw-assist-cycle-eval consumes this for its

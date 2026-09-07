@@ -96,6 +96,12 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub flow_table: Option<FlowTableConfig>,
 
+    /// NIC control-plane latency emulation. Absent (`None`) means dynamic `rte_flow` operations
+    /// run at the local NIC's own speed. Add a `[nic_latency]` section to replay a trace measured
+    /// on a different NIC.
+    #[serde(default)]
+    pub nic_latency: Option<NicLatencyConfig>,
+
     #[doc(hidden)]
     /// Runtime filter for testing purposes.
     #[serde(default = "default_filter")]
@@ -239,6 +245,7 @@ impl Default for RuntimeConfig {
                 init_data: false,
             },
             flow_table: None,
+            nic_latency: None,
             filter: None,
         }
     }
@@ -838,6 +845,59 @@ impl Default for FlowTableConfig {
     }
 }
 
+/// NIC control-plane latency emulation settings.
+///
+/// Spins for a latency measured on another NIC before each real `rte_flow_create` /
+/// `rte_flow_destroy`, making a fast NIC behave like a slow one for the purpose of costing
+/// `dyn_hardware_assist` — whose viability turns entirely on what a rule costs to install. See
+/// `filter::flow_drop::nic_latency`.
+///
+/// The trace is CSV, header `op_id,phase,us`, three rows per `op_id` (`replace`, `delete`,
+/// `insert`); `replace` is a derived total and is ignored at load.
+///
+/// A section present but not honourable is deliberately fatal: a run that silently skipped pacing
+/// would be indistinguishable from an unemulated baseline. Use `enabled = false` to keep the
+/// trace validated but run at native speed.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct NicLatencyConfig {
+    /// Path to the latency trace. Required.
+    pub trace: String,
+
+    /// Whether to pace operations. `false` validates the trace but runs at native speed — the
+    /// control arm of an A/B comparison. Defaults to `true`.
+    #[serde(default = "default_nic_latency_enabled")]
+    pub enabled: bool,
+
+    /// Multiplier applied to every latency at load. `1.0` replays the trace as measured, `0.5`
+    /// halves it. Defaults to `1.0`.
+    #[serde(default = "default_nic_latency_scale")]
+    pub scale: f64,
+
+    /// Load only the trace's first N operations; `0` loads all of it. Useful while iterating, as
+    /// a large trace costs about a second to parse at startup. Defaults to `0`.
+    #[serde(default)]
+    pub limit_ops: usize,
+
+    /// Sleep all but the last this-many microseconds of a delay and spin the rest. `0` (the
+    /// default) spins throughout, which is what the emulation wants: it runs on a worker core off
+    /// the datapath, and non-RT wakeup jitter is tens of microseconds — enough to swamp a real
+    /// trace's short tail.
+    #[serde(default)]
+    pub sleep_threshold_us: u64,
+}
+
+impl Default for NicLatencyConfig {
+    fn default() -> Self {
+        NicLatencyConfig {
+            trace: String::new(),
+            enabled: default_nic_latency_enabled(),
+            scale: default_nic_latency_scale(),
+            limit_ops: 0,
+            sleep_threshold_us: 0,
+        }
+    }
+}
+
 fn default_max_connections() -> usize {
     10_000_000
 }
@@ -868,6 +928,14 @@ fn default_flow_table_capacity() -> usize {
 
 fn default_flow_table_ways() -> usize {
     8
+}
+
+fn default_nic_latency_enabled() -> bool {
+    true
+}
+
+fn default_nic_latency_scale() -> f64 {
+    1.0
 }
 
 fn default_init_synack() -> bool {

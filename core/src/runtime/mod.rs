@@ -107,6 +107,15 @@ where
         // section; otherwise no table is allocated and installs are no-ops.
         crate::filter::sw_flow::set_enabled(config.flow_table.is_some());
 
+        // After `rte_eal_init` (no TSC frequency before it) and before any RX core or install
+        // worker exists. Fatal on failure: a run that silently skipped pacing would be
+        // indistinguishable from an unemulated baseline.
+        if let Some(nic_latency) = &config.nic_latency {
+            crate::filter::flow_drop::nic_latency::init(nic_latency).unwrap_or_else(|e| {
+                panic!("NIC latency emulation requested but not initialized: {e:?}")
+            });
+        }
+
         let online = config.online.as_ref().map(|cfg| {
             log::info!("Initializing Online Runtime...");
             let online_opts = OnlineOptions {
