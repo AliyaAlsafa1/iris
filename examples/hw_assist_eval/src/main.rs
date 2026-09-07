@@ -30,10 +30,8 @@
 //!   * **A, control** — `dyn_hardware_assist = true`, `--drop-mode none`: same NIC configuration,
 //!     no drop rules.
 //!   * **B, treatment** — `dyn_hardware_assist = true`, `--drop-mode hardware`.
-//!   * **C, config cost** — `dyn_hardware_assist = false`, `--drop-mode none`: isolates the cost
-//!     of the flow-engine configuration itself so it is reported rather than smuggled into B - A.
-//!   * **D, matched software drop** — `--drop-mode software`: sheds the tail at RX, in software,
-//!     before the pipeline. `B - D` is the genuinely hardware-only benefit (no PCIe/DMA traffic).
+//!
+//! `B - A` is the hypothesis test.
 //!
 //! # Keeping the arms comparable
 //!
@@ -59,7 +57,6 @@ use iris_core::filter::flow_drop::{
     install_drop_flow, query_resident_flow, rule_control_cost, uninstall_flow, DISCARDED_BYTES,
     DISCARDED_PACKETS,
 };
-use iris_core::filter::sw_flow::{self, FlowAction};
 use iris_core::multicore::{ChannelDispatcher, ChannelMode, SharedWorkerThreadSpawner};
 use iris_core::port::{ingress_counters, IngressCounters, PortId};
 use iris_core::{CoreId, FiveTuple, Runtime};
@@ -99,8 +96,6 @@ static RULE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 enum DropMode {
     /// Control: do the application work, arrange no drop.
     None,
-    /// Shed the tail at RX in software, before the pipeline.
-    Software,
     /// Shed the tail in the NIC via a per-connection `rte_flow` DROP rule.
     Hardware,
 }
@@ -309,14 +304,6 @@ fn burn_cycles(target: u64) -> u64 {
     }
 }
 
-fn reverse(ft: &FiveTuple) -> FiveTuple {
-    FiveTuple {
-        orig: ft.resp,
-        resp: ft.orig,
-        proto: ft.proto,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The datapath callback.
 // ---------------------------------------------------------------------------
@@ -342,12 +329,6 @@ fn on_ciphertext(tls: &TlsHandshake, five_tuple: &FiveTuple, core_id: &CoreId) {
 
     match DROP_MODE.get().copied().unwrap_or(DropMode::None) {
         DropMode::None => {}
-        DropMode::Software => {
-            // Cheap enough to do inline; takes effect on the next burst.
-            sw_flow::install(*core_id, *five_tuple, FlowAction::Drop);
-            sw_flow::install(*core_id, reverse(five_tuple), FlowAction::Drop);
-            SHED_CONNS.fetch_add(1, Ordering::Relaxed);
-        }
         DropMode::Hardware => {
             // Never install inline: `rte_flow_create` is orders of magnitude slower than a poll
             // iteration and would stall the RX core.
@@ -494,7 +475,7 @@ struct Args {
     #[clap(long, arg_enum, default_value = "none")]
     drop_mode: DropMode,
 
-    /// Free-text arm label recorded in the report (e.g. "A", "B", "C").
+    /// Free-text arm label recorded in the report (e.g. "A", "B").
     #[clap(long, default_value = "unlabelled")]
     arm: String,
 
@@ -550,14 +531,10 @@ fn main() {
 
     let mut config = load_config(&args.config);
 
-    // The software flow table is allocated by the runtime iff `config.flow_table` is Some. Drive
-    // it from the arm so the other arms allocate nothing and pay no lookup — otherwise the
-    // control arm would carry the software table's cost and understate the effect.
-    config.flow_table = if args.drop_mode == DropMode::Software {
-        Some(config.flow_table.take().unwrap_or_default())
-    } else {
-        None
-    };
+    // Neither arm uses the software flow table, so leave it unallocated: the runtime allocates it
+    // iff `config.flow_table` is Some, and a table nothing installs into would charge both arms a
+    // per-packet lookup for nothing.
+    config.flow_table = None;
 
     // Stand the install worker up before the runtime, so no dispatch can be dropped on the floor
     // during the first bursts.

@@ -60,10 +60,10 @@ independent of any packets being dropped, which would confound the comparison.
 |---|---|---|---|
 | **A** control | `online-cx5-eval.toml` | `none` | assist configured, no rules installed |
 | **B** treatment | `online-cx5-eval.toml` | `hardware` | per-connection NIC drop |
-| **C** config cost | `online-cx5-eval-noassist.toml` | `none` | cost of the flow-engine configuration alone |
-| **D** matched software | `online-cx5-eval.toml` | `software` | shedding at RX in software; `B − D` is the hardware-only benefit |
 
-`B − A` is the hypothesis test. `C − A` is reported separately, not folded into the effect.
+`B − A` is the hypothesis test. Both arms load the same config, so the flow-engine
+reconfiguration `dyn_hardware_assist` performs is common to both and cannot leak into the
+difference; the only thing that varies is whether drop rules get installed.
 
 ## Keeping the arms comparable
 
@@ -104,19 +104,19 @@ Build:
 scripts/build.sh
 ```
 
-Deterministic offline gate first — no NIC, no root contention, and if the effect is invisible here
-it will be invisible online:
+An offline run first, as a harness check rather than an effect measurement — offline replay has no
+ports, so `--drop-mode hardware` resolves no port ids and installs nothing. What this confirms is
+that the app runs, the `tls` callback fires, and the cycle budget reconciles
+(`residual_fraction` ≈ 0):
 
 ```bash
-scripts/run_eval.sh configs/offline.toml --arm off-A --drop-mode none     --app-cycles 100000 --report /tmp/off_A.json
+scripts/run_eval.sh configs/offline.toml --arm off-A --drop-mode none --app-cycles 100000 --report /tmp/off_A.json
 ```
 
-```bash
-scripts/run_eval.sh configs/offline.toml --arm off-D --drop-mode software --app-cycles 100000 --report /tmp/off_D.json
-```
-
-`tls_callbacks` must be **identical** between those two (offline replay is deterministic). If it is
-not, the arms are not doing the same work and nothing downstream is meaningful.
+Two runs of that command should report **identical** `tls_callbacks`, since offline replay is
+deterministic; if they do not, the app-work trigger is not stable and nothing downstream is
+meaningful. The A/B effect itself can only be measured online, where a rule can actually drop a
+packet.
 
 Then a short online smoke test, to confirm the rules actually fire and to find out which mlx5 xstat
 flow-rule drops land in:

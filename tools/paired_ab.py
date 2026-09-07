@@ -41,16 +41,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 #
 # Note A is dyn_hardware_assist=true with no rules installed, NOT dyn_hardware_assist=false.
 # Using the latter as the baseline would fold the flow-engine reconfiguration into the measured
-# effect. Arm C exists to measure that separately.
+# effect, since that flag reconfigures the NIC flow engine whether or not any rule drops a packet.
 ARMS = {
     "A": dict(config="configs/online-cx5-eval.toml", drop_mode="none",
               label="control (assist configured, no rules)"),
     "B": dict(config="configs/online-cx5-eval.toml", drop_mode="hardware",
               label="treatment (NIC per-connection drop)"),
-    "C": dict(config="configs/online-cx5-eval-noassist.toml", drop_mode="none",
-              label="flow-engine configuration cost"),
-    "D": dict(config="configs/online-cx5-eval.toml", drop_mode="software",
-              label="matched software drop at RX"),
 }
 
 

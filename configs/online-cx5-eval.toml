@@ -13,7 +13,6 @@ promiscuous = true
 mtu = 1500
 hardware_assist = false
 dyn_hardware_assist = true
-# Replaced by script to be "none" when turned off
 flow_mode = "standard"
 
 [[online.ports]]
