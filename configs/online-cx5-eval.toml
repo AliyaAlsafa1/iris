@@ -1,84 +1,38 @@
-# Cycle-budget A/B evaluation of dyn_hardware_assist, across both tap NICs.
-#
-# Used by arms A (control, --drop-mode none), B (treatment, --drop-mode hardware) and
-# D (matched software drop, --drop-mode software). Arm C uses
-# configs/online-cx5-eval-noassist.toml, which is this file with dyn_hardware_assist = false.
-#
-# Everything except dyn_hardware_assist must be byte-identical across arms, or the comparison is
-# confounded. Do not tune one arm.
-#
-# ---------------------------------------------------------------------------------------------
-# WARNING: the second port is an Intel E810 (ice), which does not expose rx_phy_* xstats. Because
-# build_report requires *every* port to expose them (`phy_ok = ingress.iter().all(...)`,
-# examples/hw_assist_eval/src/main.rs:580), adding it sets ingress_normalisation_valid = false for
-# the whole run, and tools/paired_ab.py then rejects every run as invalid. M1 is unavailable in
-# this layout; M3 (the load regression) is the fallback. See the README section
-# "Before trusting any of it".
-# ---------------------------------------------------------------------------------------------
-#
-# Core assignment, one RX set per NUMA node so no port's queues cross the interconnect:
-#   node 0 (CPUs 0-17, 36-53):  main core 0, CX-5 0000:3b:00.0 on cores 1-8,  install worker 9
-#   node 1 (CPUs 18-35, 54-71): E810  0000:d8:00.0 on cores 18-25, install worker 26
-# Pass `--worker-cores 9,26` to hw_assist_eval. The workers must stay outside both RX sets; the
-# app panics if they overlap, since sharing would let install work steal cycles from the datapath
-# being measured. Verify the node/CPU mapping on the target host before running:
-#   cat /sys/bus/pci/devices/0000:3b:00.0/numa_node
-#   cat /sys/devices/system/node/node*/cpulist
-
 main_core = 0
 nb_memory_channels = 6
 
 [mempool]
-# Per socket the runtime allocates THREE pools at this capacity -- standard, split_header and
-# split_remainder -- because core/src/runtime/online.rs:64 creates the buffer-split pair
-# unconditionally, regardless of flow_mode. At ~2304 B/mbuf that is 3 * capacity * 2304 per node,
-# so 1 Mi mbufs costs ~7.2 GB on each of the two nodes. The original 8_388_608 wanted ~58 GB per
-# node and failed at "Mempool mempool_split_header_0 creation failed". This is still 4x the
-# 8 * nb_rxd descriptors a port can have in flight. Check headroom with:
-#   grep . /sys/devices/system/node/node*/hugepages/hugepages-1048576kB/free_hugepages
-capacity = 1_048_576
+# Runtime allocates three pools at this capacity
+capacity = 4_000_000
 cache_size = 512
 
 [online]
 duration = 120
-nb_rxd = 32768
+nb_rxd = 16384
 promiscuous = true
 mtu = 1500
-# The static offload filter is off: we are measuring the *dynamic* per-connection path, and the
-# two are mutually exclusive (dyn_hardware_assist takes the earlier branch in start_ports).
 hardware_assist = false
-# Installs the group-0 -> group-1 jump and the catch-all RSS rule on group 1, which is what makes
-# group 1 usable as a per-connection blocklist. Left true even in the control arm so that arm A
-# and arm B differ *only* in whether drop rules get installed.
 dyn_hardware_assist = true
-# Read by flow_test to decide whether to install rules at all; `standard` installs nothing.
-# hw_assist_eval ignores this and takes its arm from `--drop-mode` instead. Safe to leave set for
-# both: `drop` and `standard` differ only in whether the app installs rules, not in how the port
-# is configured (only `split` changes port setup), so this does not confound the A/B arms.
-flow_mode = "drop"
+# Replaced by script to be "none" when turned off
+flow_mode = "standard"
 
-# ConnectX-5, NUMA node 0. The only port whose rx_phy_* counters M1 can use.
 [[online.ports]]
 device = "0000:3b:00.0"
-cores = [ 1, 2, 3, 4, 5, 6, 7, 8 ]
+cores = [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 ]
 
-# Uncomment to sweep offered load downward: `nb_buckets` fills only the first N of the 512 RSS
-# redirection-table entries, so 256 delivers ~50% of flows and the rest go to the sink core. This
-# is the knob for producing (load, duty cycle) points across a range within one stable traffic
-# window, and the knob zlt.py sweeps for zero-loss throughput. Sink cores must be node-local to
-# their port and outside every RX set.
-# [online.ports.sink]
-# core = 10
-# nb_buckets = 512
+# Uncomment to sweep offered load, ZLT
+#[online.ports.sink]
+#core = 25
+#nb_buckets = 512
 
-# E810-C, NUMA node 1. Exposes no rx_phy_* -- see the WARNING above.
 [[online.ports]]
 device = "0000:d8:00.0"
-cores = [ 18, 19, 20, 21, 22, 23, 24, 25 ]
+cores = [ 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24 ]
 
-# [online.ports.sink]
-# core = 27
-# nb_buckets = 512
+# Uncomment to sweep offered load, ZLT
+#[online.ports.sink]
+#core = 26
+#nb_buckets = 512
 
 [conntrack]
 max_connections = 10000000
@@ -94,9 +48,7 @@ throughput = true
 mempool_usage = true
 port_stats = [ "rx_good_packets", "rx_good_bytes", "rx_phy_packets", "rx_phy_bytes", "rx_mbuf_allocation_errors", "rx_phy_discard_packets", "rx_missed_errors",]
 
-# Required for the load regression: writes cycle_budget.csv, one row per interval pairing the
-# datapath cycle budget with the offered load over that same interval.
 [online.monitor.log]
 directory = "./log/"
 interval = 1000
-port_stats = [ "rx" ]
+port_stats = [ "rx_good_packets", "rx_good_bytes", "rx_phy_packets", "rx_phy_bytes", "rx_mbuf_allocation_errors", "rx_phy_discard_packets", "rx_missed_errors",]
