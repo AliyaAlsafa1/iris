@@ -125,13 +125,13 @@ Then a short online smoke test, to confirm the rules actually fire and to find o
 flow-rule drops land in:
 
 ```bash
-sudo scripts/run_eval.sh configs/online-cx5-eval.toml --arm smoke --drop-mode hardware --worker-cores 9 --report /tmp/smoke.json
+sudo scripts/run_eval.sh configs/online-cx5-eval.toml --arm smoke --drop-mode hardware --worker-cores 13 --report /tmp/smoke.json
 ```
 
 Then the paired protocol:
 
 ```bash
-tools/paired_ab.py --pairs 10 --app-cycles 100000 --worker-cores 9 --out-dir results/run1 --plot
+tools/paired_ab.py --pairs 10 --app-cycles 100000 --worker-cores 13 --out-dir results/run1 --plot
 ```
 
 Add `--dry-run` to see the commands first, or `--analyze-only` to re-analyze existing reports.

@@ -52,14 +52,14 @@ cycle budget, which needs a sampling stride and rdtsc debiasing.
 Usage
 -----
     # once, after scripts/mem_setup.sh, to confirm the counters read and parse
-    sudo tools/mem_sample.py --config configs/online-cx5-eval.toml --sampler-core 35 --selftest
+    sudo tools/mem_sample.py --config configs/online-cx5-eval.toml --sampler-core 14 --worker-cores 13 --selftest
 
     # the DRAM noise floor, with Iris NOT running
-    sudo tools/mem_sample.py --config configs/online-cx5-eval.toml --sampler-core 35 \
+    sudo tools/mem_sample.py --config configs/online-cx5-eval.toml --sampler-core 14 \
         --baseline --duration 30 --out baseline.csv
 
     # alongside a run (tools/paired_ab.py does this for you)
-    sudo tools/mem_sample.py --config configs/online-cx5-eval.toml --sampler-core 35 \
+    sudo tools/mem_sample.py --config configs/online-cx5-eval.toml --sampler-core 14 \
         --duration 120 --out mem_sample.csv
 
 Only the standard library is required.
@@ -1012,25 +1012,57 @@ def main():
 
     if args.selftest:
         print("=== selftest ===")
-        wanted = sorted(specs_by_event)
-        ok = True
-        for ev in wanted:
-            state = ("advanced" if ev in advanced
-                     else "SEEN BUT ZERO" if ev in seen_events
-                     else "NOT SEEN")
-            print(f"  {ev:<48} {state}")
-            if ev not in advanced:
-                ok = False
+        # The pass criterion is per PMU, not per event. A NIC occupies ONE port of its 4-port IIO
+        # stack, so `bw_in_port1..3` on that stack read zero with no device attached — requiring
+        # every port to advance can never be satisfied and reports a healthy host as broken.
+        # (Summing all four is still right: adding zeros costs nothing and avoids having to
+        # discover which port the card sits on.) IMC events, by contrast, must each advance:
+        # they are stack-independent and any zero there is a real failure.
+        by_pmu = {}
+        for ev in sorted(specs_by_event):
+            by_pmu.setdefault(ev.split("/", 1)[0], []).append(ev)
+
+        failures = []
+        for pmu, evs in sorted(by_pmu.items()):
+            is_iio = "iio" in pmu
+            live = [e for e in evs if e in advanced]
+            for ev in evs:
+                state = ("advanced" if ev in advanced
+                         else "zero" if ev in seen_events
+                         else "NOT SEEN")
+                suffix = ""
+                if is_iio and state == "zero":
+                    suffix = "   (no device on this stack port — expected)"
+                print(f"  {ev:<48} {state}{suffix}")
+            if is_iio:
+                if not live:
+                    failures.append(
+                        f"{pmu}: no port advanced. Either no packets are arriving on the NIC on "
+                        f"this stack, or the stack was misidentified — check --show-topology."
+                    )
+                else:
+                    print(f"  -> {pmu}: {len(live)} of {len(evs)} ports carrying traffic, "
+                          "which is what a single card in one slot looks like")
+            else:
+                for ev in evs:
+                    if ev not in advanced:
+                        failures.append(f"{ev}: did not advance")
         print(f"  rows written: {written}")
-        if not ok:
-            print("\nSome counters did not advance. Raw perf stderr follows so the cause is "
-                  "visible rather than guessed:\n", file=sys.stderr)
-            print(err[-4000:], file=sys.stderr)
-            print("Common causes: perf_event_paranoid not -1 (run scripts/mem_setup.sh); the "
-                  "event name differs on this kernel; or nothing is generating traffic, which is "
-                  "expected for iio_in when no packets are arriving.", file=sys.stderr)
+
+        if failures:
+            print("\nselftest FAILED:", file=sys.stderr)
+            for f in failures:
+                print(f"  {f}", file=sys.stderr)
+            if err.strip():
+                print("\nperf's own output:\n" + err[-4000:], file=sys.stderr)
+            else:
+                print("\n(perf reported no errors, so the events were accepted; the counters "
+                      "simply read zero)", file=sys.stderr)
+            print("\nCommon causes: perf_event_paranoid not -1 (run scripts/mem_setup.sh); the "
+                  "event name differs on this kernel; or no traffic is arriving on the port.",
+                  file=sys.stderr)
             sys.exit(1)
-        print("\nAll counters advanced and parsed. Ready.")
+        print("\nDRAM counters advanced and every IIO stack is carrying traffic. Ready.")
     else:
         label = "baseline (Iris stopped)" if args.baseline else "run"
         print(f"wrote {written} rows to {args.out} ({label})")

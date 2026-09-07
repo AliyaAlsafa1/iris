@@ -110,6 +110,16 @@ Neither is the cycle counters.
    floor that is a large fraction of the signal means the effect is not resolvable, and that is the
    finding.
 
+3. **The install worker's own memory traffic is arm-asymmetric, and the baseline cannot remove
+   it.** The worker only exists in arm B, and `--worker-cores 13` puts it on node 0 — so its
+   `rte_flow_create` traffic is added to socket 0's IMC counters in the treatment arm only, while
+   `--baseline` (measured with Iris stopped) sees neither arm's. At order 10³–10⁴ installs/sec
+   touching a few KiB each, this is ~MB/s against tens of GB/s, so it is negligible in practice
+   rather than corrected for — but it is a cost *of the mechanism*, so counting it against arm B is
+   the right sign. `control_plane.installs` bounds it: if install rate is high enough for this to
+   matter, `install_cycles_vs_core_wall` will already have flagged the mechanism as not paying for
+   itself.
+
 ### Per-socket attribution, not machine-wide
 
 Uncore IMC and IIO counters are socket-scoped, so everything is attributed per socket and each
@@ -150,19 +160,19 @@ sudo scripts/mem_setup.sh
 Confirm the counters read and parse before spending a session on them:
 
 ```bash
-sudo tools/mem_sample.py --config configs/online-cx5-eval.toml --sampler-core 35 --selftest
+sudo tools/mem_sample.py --config configs/online-cx5-eval.toml --sampler-core 14 --worker-cores 13 --selftest
 ```
 
 Measure the DRAM noise floor with Iris **not** running:
 
 ```bash
-sudo tools/mem_sample.py --config configs/online-cx5-eval.toml --sampler-core 35 --baseline --duration 30 --out results/baseline.csv
+sudo tools/mem_sample.py --config configs/online-cx5-eval.toml --sampler-core 14 --baseline --duration 30 --out results/baseline.csv
 ```
 
 Then the paired protocol, which now reports M1–M3 and N1–N3 from the same runs:
 
 ```bash
-tools/paired_ab.py --pairs 10 --app-cycles 100000 --worker-cores 9 --mem-sample --sampler-core 35 --mem-baseline results/baseline.csv --out-dir results/mem1 --plot
+tools/paired_ab.py --pairs 10 --app-cycles 100000 --worker-cores 13 --mem-sample --sampler-core 14 --mem-baseline results/baseline.csv --out-dir results/mem1 --plot
 ```
 
 And the pool sizing question separately:
@@ -187,16 +197,19 @@ C-states and turbo off). In addition:
 Findings, not excuses.
 
 1. **The conn table may already be thrashing LLC, making DDIO pollution second-order.**
-   `max_connections = 10_000_000` against 24.75 MiB of LLC per socket (11 ways × 2304 KiB): at a
-   few hundred bytes an entry, only order 10⁵ entries can ever be resident. If the conn table
-   misses LLC regardless of what DDIO does, freeing DDIO ways buys nothing. This is the most likely
-   null result, and N3's occupancy figure detects it directly.
+   `max_connections = 10_000_000` against an LLC of tens of MiB per socket — the lab hosts have
+   24.75 MiB (11 ways × 2304 KiB) and 35.75 MiB (11 ways × 3328 KiB); `--show-topology` prints the
+   figure for the host you are on. At a few hundred bytes an entry, only order 10⁵ entries can ever
+   be resident either way. If the conn table misses LLC regardless of what DDIO does, freeing DDIO
+   ways buys nothing. This is the most likely null result, and N3's occupancy figure detects it
+   directly.
 2. **DDIO may already be absorbing the packet writes.** If a ciphertext packet is DMA'd into LLC,
    its header read, and the line overwritten before eviction, it never reaches DRAM — so there was
    no DRAM traffic to remove and N1 shows little. `io_dram / iio_inbound` measures this, and is
    worth reading before anything else.
 3. **The mempool saving is mostly arm-independent.** In-use mbufs are dominated by the pre-filled
-   RX rings (`nb_rxd` × queues × ports ≈ 393K mbufs), which are populated at port setup regardless
+   RX rings (`nb_rxd` × queues × ports, so 16384 × 12 × 2 = 393,216 mbufs as configured — recompute
+   it if you change `nb_rxd` or the core counts), which are populated at port setup regardless
    of what the NIC later drops and are therefore identical in both arms. The arm-sensitive term is
    only the mbufs held for reassembly. Expect a large right-sizing win available to *both* arms and
    a smaller A/B delta on top; `mempool_bisect.py` reports them separately so the config win is not

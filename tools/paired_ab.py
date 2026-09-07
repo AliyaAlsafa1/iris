@@ -80,8 +80,10 @@ def parse_args():
     p.add_argument("--table-full-policy", choices=("refuse", "evict"), default="refuse",
                    help="at --max-rules: refuse further offloads, or evict the least recently "
                         "added rule (FIFO) to make room (default: refuse)")
-    p.add_argument("--worker-cores", default="9",
-                   help="cores for the rte_flow install worker (default: 9, NUMA-local to the CX-5)")
+    p.add_argument("--worker-cores", default="13",
+                   help="cores for the rte_flow install worker (default: 13 — NUMA-local to "
+                        "the node-0 CX-5 and outside the RX set in configs/online-cx5-eval.toml. "
+                        "hw_assist_eval panics if this overlaps an RX core.)")
     p.add_argument("--out-dir", type=Path, default=Path("results/paired_ab"),
                    help="where to write reports, the tidy CSV and the summary")
     p.add_argument("--settle", type=float, default=5.0,
