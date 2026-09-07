@@ -1,5 +1,8 @@
 # Measuring the CPU cycles `dyn_hardware_assist` frees up
 
+For the memory-side evaluation — DRAM traffic, LLC occupancy and mbuf pool footprint, collected
+from these same runs — see [README-memory.md](README-memory.md).
+
 ## The claim under test
 
 With `dyn_hardware_assist`, fewer packets are pulled off the NIC, so the system spends fewer CPU
