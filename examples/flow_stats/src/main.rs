@@ -37,14 +37,19 @@
 //!   --worker-cores --num-flows --hw-rule-secs --flow-channel-size   hardware arm
 //!
 //! A `[nic_latency]` config section makes the hardware arm replay another NIC's `rte_flow`
-//! latencies (see `filter::flow_drop::nic_latency`). That caps what one worker core can install:
-//! at the Intel trace's ~308 us/insert and ~208 us/delete, and two rules per offload, a single
-//! worker tops out around 1600 offloads/s, or 800 once evictions churn. Past that the dispatcher
-//! backs up and offload requests are refused, so this app prints the dispatcher's
-//! dispatched/dropped counts and the emulation's counters at shutdown: a run with a non-trivial
-//! refusal fraction offloaded only some of the connections it meant to, and its shed numbers must
-//! be read that way. More `--worker-cores` raise the ceiling proportionally, and the trace cursor
-//! is shared, so the replay stays correct across them.
+//! latencies (see `filter::flow_drop::nic_latency`). That caps what one worker core can install.
+//! At the Intel trace's ~308 us/insert and ~208 us/delete, and two rules per offload per port:
+//!
+//!   ports | unbounded          | at the `--num-flows` cap (evict + install)
+//!   ------|--------------------|-------------------------------------------
+//!     1   | ~1620 offloads/s   | ~970/s
+//!     2   |  ~810 offloads/s   | ~484/s
+//!
+//! Past that the dispatcher backs up and offload requests are refused, so this app prints the
+//! dispatcher's dispatched/dropped counts and the emulation's counters at shutdown: a run with a
+//! non-trivial refusal fraction offloaded only some of the connections it meant to, and its shed
+//! numbers must be read that way. More `--worker-cores` raise the ceiling proportionally, and the
+//! trace cursor is shared, so the replay stays correct across them.
 
 use clap::{ArgEnum, Parser};
 use iris_compiler::*;
