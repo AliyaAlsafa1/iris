@@ -38,8 +38,8 @@
 //!
 //! A `[nic_latency]` config section makes the hardware arm replay another NIC's `rte_flow`
 //! latencies (see `filter::flow_drop::nic_latency`). That caps what one worker core can install:
-//! at the Intel trace's ~308 us/insert and ~208 us/delete, and two rules per `install_drop_flow`,
-//! a single worker tops out in the low hundreds of offloads per second. Past that the dispatcher
+//! at the Intel trace's ~308 us/insert and ~208 us/delete, and two rules per offload, a single
+//! worker tops out around 1600 offloads/s, or 800 once evictions churn. Past that the dispatcher
 //! backs up and offload requests are refused, so this app prints the dispatcher's
 //! dispatched/dropped counts and the emulation's counters at shutdown: a run with a non-trivial
 //! refusal fraction offloaded only some of the connections it meant to, and its shed numbers must
@@ -233,18 +233,20 @@ fn install_hw_drop(tuple: &FiveTuple) {
         }
     };
 
-    let rev = reverse(tuple);
-    let mut flow_ptrs = Vec::new();
-    let mut handle_ptrs = Vec::new();
-    for t in [tuple, &rev] {
-        match install_drop_flow(ports.clone(), t) {
-            Ok((flows, handles)) => {
-                flow_ptrs.extend(flows.into_iter().map(FlowPtr));
-                handle_ptrs.extend(handles.into_iter().map(HandlePtr));
-            }
-            Err(e) => log::warn!("HW drop rule install failed for {t:?}: {e:?}"),
+    // One call, not one per direction: `install_drop_flow` already installs the forward and
+    // reverse rules for `tuple`. Calling it again for the reverse tuple installed the same pair
+    // twice, and left `flow_ptrs` at `ports.len() * 4`, which `uninstall_flow` rejects outright --
+    // so no rule was ever destroyed or read back for its counters.
+    let (flow_ptrs, handle_ptrs) = match install_drop_flow(ports.clone(), tuple) {
+        Ok((flows, handles)) => (
+            flows.into_iter().map(FlowPtr).collect::<Vec<_>>(),
+            handles.into_iter().map(HandlePtr).collect::<Vec<_>>(),
+        ),
+        Err(e) => {
+            log::warn!("HW drop rule install failed for {tuple:?}: {e:?}");
+            (Vec::new(), Vec::new())
         }
-    }
+    };
     if !flow_ptrs.is_empty() {
         FLOW_QUEUE.lock().unwrap().push_back(FlowEntry {
             tuple: *tuple,
