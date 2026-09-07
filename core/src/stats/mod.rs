@@ -27,43 +27,29 @@ pub fn datapath_busy() -> (u64, u64) {
 
 /// A full accounting of every TSC tick spent on the RX lcores, summed across cores.
 ///
-/// `DP_BUSY_CYCLES` above answers "what did a received packet cost?". That is the wrong question
-/// for evaluating an ingress-shedding mechanism such as `dyn_hardware_assist`: shedding removes the
-/// *cheapest* packets (a parse plus one hot hash hit) from the denominator while leaving handshakes
-/// and reassembly in it, so per-packet cost can stay flat or rise even as total cycles fall.
+/// This budget answers "where did the core's time go?" In a run-to-completion busy-poll
+/// loop the CPU is always 100% utilised, so the quantity that actually varies is the split
+/// between doing work and spinning on an empty queue. `poll_idle` is roughly the pool of
+/// cycles available to application logic. The buckets are disjoint and sum to `sampled_wall`.
 ///
-/// This budget answers "where did the core's time go?" instead. In a run-to-completion busy-poll
-/// loop the CPU is always 100% utilised, so the quantity that actually varies is the *split*
-/// between doing work and spinning on an empty queue. `poll_idle` is therefore the headline: it is
-/// the pool of cycles available to application logic. The buckets are disjoint and, by
-/// construction, sum to `sampled_wall`.
-///
-/// Cycles are only comparable across runs once normalised — divide by `sampled_wall` for a duty
-/// cycle, or by ingress packets/bytes from `rte_eth_xstats` (i.e. what the NIC *saw*, before flow
-/// rules dropped anything) for a load-independent per-packet cost.
+/// Cycles are only comparable across runs once normalised.
+/// - Divide by `sampled_wall` for accounting of RX cycles doing work
+/// - Divide by ingress packets/bytes for load-independent per-packet cost.
 ///
 /// # Measuring this without biasing it
 ///
-/// Two distinct problems, and both had to be solved, because `poll_idle` is both the headline
-/// number and the most fragile one — an empty `rte_eth_rx_burst` is only on the order of a hundred
-/// cycles, while an `rte_rdtsc()` read is a couple of dozen.
+/// 1. **Perturbation.** Bracketing every iteration would add a read per empty poll, slowing down
+///    the path being measured. Cycle attribution runs on a sampled subset of iterations
+///    (`sample_stride`), while cheap counters (`wall`, `bursts`, `idle_polls`, `recv_pkts`)
+///    stay exact. `sample_stride = 1` recovers exact attribution.
 ///
-/// 1. **Perturbation.** Bracketing every iteration would add a read per empty poll, materially
-///    slowing the very path being measured. So attribution runs on a sampled subset of iterations
-///    (`sample_stride`), while the cheap counters (`wall`, `bursts`, `idle_polls`, `recv_pkts`)
-///    stay exact. `sample_stride = 1` recovers exact attribution, which is right offline and is
-///    how to confirm sampling has not skewed a result.
+/// 2. **Bias.** Inside a sampled iteration, every span absorbs the latency of an rte_rdtsc,
+///    which is a nontrivial fraction of an empty poll. Without debiasing, this could inflate
+///    `poll_idle`. `rdtsc_cost` is calibrated per core and subtracted from every span, and
+///    the same total from `sampled_wall`.
 ///
-/// 2. **Bias.** Sampling alone does *not* fix the accounting: inside a sampled iteration every
-///    span still absorbs the latency of the read that closes it, and since idle polls are the
-///    cheapest events they are inflated most in relative terms. Left uncorrected, that inflates
-///    `poll_idle` in proportion to the idle-poll count — which is exactly what differs between the
-///    arms of an ingress-shedding experiment, so the error would push *in favour of* the
-///    hypothesis. Hence `rdtsc_cost` is calibrated per core and subtracted from every span, and
-///    the same total from `sampled_wall` so the buckets still close.
-///
-/// Fractions are computed within the sample, where they are unbiased; `wall` supplies the absolute
-/// scale. `instrumentation_fraction` and `residual_fraction` are the two validity checks.
+/// Fractions are computed within the sample, where they are unbiased. `wall` supplies the absolute
+/// scale. `instrumentation_fraction` and `residual_fraction` are just validity checks.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DatapathBudget {
     /// Sampled cycles in `rte_eth_rx_burst` calls that returned at least one packet.

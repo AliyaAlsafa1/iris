@@ -594,11 +594,9 @@ impl fmt::Display for RxQueue {
 
 /// NIC-side ingress counters, as read from `rte_eth_xstats`.
 ///
-/// The distinction between `phy` and `good` is what makes an ingress-shedding mechanism such as
-/// `dyn_hardware_assist` measurable: `phy_packets` counts what arrived at the port, `good_packets`
-/// counts what was actually delivered to a queue. A working drop rule widens the gap between them
-/// while leaving `phy_packets` untouched — so `phy_packets` is the load-normalisation denominator
-/// that stays fixed across an A/B comparison, and `good_packets` is what the CPU had to touch.
+/// `phy_packets` counts what arrived at the port, `good_packets` counts what was delivered to a queue.
+/// A working drop rule widens the gap between them while leaving `phy_packets` untouched.
+/// `phy_packets` is the load-normalisation denominator; `good_packets` is what the CPU had to touch.
 #[derive(Debug, Default, Clone, Copy, serde::Serialize)]
 pub struct IngressCounters {
     pub phy_packets: u64,
@@ -609,7 +607,7 @@ pub struct IngressCounters {
     pub phy_discard_packets: u64,
     /// Packets dropped because no descriptor was available (software could not keep up).
     pub missed_errors: u64,
-    /// False when the PMD does not expose `rx_phy_*` (ICE, for instance, does not). The `phy_*`
+    /// False when the PMD does not expose `rx_phy_*` (ICE, for instance). The `phy_*`
     /// fields then fall back to the `good_*` values, which makes shed traffic invisible — so a
     /// report carrying `phy_available: false` cannot be used for the ingress-normalised metric.
     pub phy_available: bool,

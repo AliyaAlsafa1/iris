@@ -272,11 +272,8 @@ struct Logger {
     port_wtrs: HashMap<PortId, Writer<std::fs::File>>,
     keywords: Vec<String>,
     /// Per-interval datapath cycle budget paired with the offered load in the same row.
-    ///
-    /// This pairing is the point: on live, non-stationary traffic two runs never see the same
-    /// load, so the robust comparison is to regress duty cycle on offered load per arm and
-    /// compare slopes. That needs many (load, duty) samples, which one row per second delivers
-    /// from a handful of runs instead of dozens.
+    /// Note: the "right" way to read this is to look at cycles relative to offered load
+    /// across many runs, with and without HW offload.
     budget_wtr: Writer<std::fs::File>,
     last_budget: crate::stats::DatapathBudget,
     last_ingress_pkts: u64,
@@ -384,15 +381,15 @@ impl Logger {
         }
 
         let prev = self.last_budget;
-        let d = |cur: u64, old: u64| cur.saturating_sub(old);
-        let d_poll_busy = d(now.poll_busy, prev.poll_busy);
-        let d_poll_idle = d(now.poll_idle, prev.poll_idle);
-        let d_pipeline = d(now.pipeline, prev.pipeline);
-        let d_maint = d(now.maint, prev.maint);
-        let d_sampled_wall = d(now.sampled_wall, prev.sampled_wall);
-        let d_wall = d(now.wall, prev.wall);
-        let d_ingress_pkts = d(phy_pkts, self.last_ingress_pkts);
-        let d_ingress_bytes = d(phy_bytes, self.last_ingress_bytes);
+        let diff = |cur: u64, old: u64| cur.saturating_sub(old);
+        let d_poll_busy = diff(now.poll_busy, prev.poll_busy);
+        let d_poll_idle = diff(now.poll_idle, prev.poll_idle);
+        let d_pipeline = diff(now.pipeline, prev.pipeline);
+        let d_maint = diff(now.maint, prev.maint);
+        let d_sampled_wall = diff(now.sampled_wall, prev.sampled_wall);
+        let d_wall = diff(now.wall, prev.wall);
+        let d_ingress_pkts = diff(phy_pkts, self.last_ingress_pkts);
+        let d_ingress_bytes = diff(phy_bytes, self.last_ingress_bytes);
 
         // Fractions come from the sample; absolute cycles are the fraction scaled by the exact
         // interval span.
@@ -418,10 +415,10 @@ impl Logger {
             d_pipeline.to_string(),
             d_maint.to_string(),
             d_sampled_wall.to_string(),
-            d_wall.to_string(),
-            d(now.bursts, prev.bursts).to_string(),
-            d(now.idle_polls, prev.idle_polls).to_string(),
-            d(now.recv_pkts, prev.recv_pkts).to_string(),
+            diff(now.wall, prev.wall).to_string(),
+            diff(now.bursts, prev.bursts).to_string(),
+            diff(now.idle_polls, prev.idle_polls).to_string(),
+            diff(now.recv_pkts, prev.recv_pkts).to_string(),
             d_ingress_pkts.to_string(),
             d_ingress_bytes.to_string(),
             now.cores.to_string(),

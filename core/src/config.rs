@@ -366,12 +366,8 @@ pub struct OnlineConfig {
 
     /// Attribute datapath cycles on one in every `budget_sample_stride` poll-loop iterations.
     ///
-    /// Only the cycle *attribution* is sampled; the packet, burst and idle-poll counters stay
-    /// exact. Sampling exists because bracketing every iteration costs an `rte_rdtsc` per empty
-    /// poll, which is a sizeable fraction of an empty poll's cost and scales with the idle-poll
-    /// count — so exact measurement would bias the freed-cycle metric. `1` disables sampling and
-    /// measures exactly, which is right for offline replay and for confirming that sampling has
-    /// not skewed a result. Defaults to 64.
+    /// Only the cycles are sampled; the packet, burst and idle-poll counters stay exact.
+    /// Defaults to 64.
     #[serde(default = "default_budget_sample_stride")]
     pub budget_sample_stride: u64,
 

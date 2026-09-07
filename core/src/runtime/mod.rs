@@ -160,11 +160,9 @@ where
     /// Stopping a port flushes its hardware flow rules and calls `rte_eth_dev_stop`, which frees
     /// every `rte_flow` and indirect action handle the port owns. An application that installed
     /// rules and wants to read their counters back, or that runs a worker still issuing
-    /// `rte_flow_create`, must therefore finish that work *before* the stop — after `run` returns
-    /// the handles are already dangling and touching them is a use-after-free. This hook is that
-    /// window.
+    /// `rte_flow_create`, must finish that work before the stop.
     ///
-    /// Offline mode has no ports to stop, so the hook simply runs after the replay finishes.
+    /// Offline mode has no ports to stop, so the hook runs after the replay finishes.
     ///
     /// # Example
     ///

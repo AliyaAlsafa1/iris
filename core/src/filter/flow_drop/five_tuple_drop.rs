@@ -33,14 +33,7 @@ const UDP: u8 = 17;
 pub static DISCARDED_PACKETS: AtomicU64 = AtomicU64::new(0);
 pub static DISCARDED_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// Cost of the control plane, so hardware offload can be charged for its own overhead rather than
-/// only credited for the packets it sheds.
-///
-/// `rte_flow_create` is expensive and its cost scales with *connection arrival rate*, not byte
-/// rate — at high connection churn the install cost can exceed the datapath cycles saved, which is
-/// the main way ingress offload fails to pay off. These counters make that visible instead of
-/// leaving it as an assumption. They are accumulated rather than printed per rule: printing per
-/// `rte_flow_create` would itself dominate the measurement.
+/// Cost of the control plane, so hardware offload can be charged for its overhead.
 pub static RULE_INSTALL_CYCLES: AtomicU64 = AtomicU64::new(0);
 pub static RULE_INSTALLS: AtomicU64 = AtomicU64::new(0);
 pub static RULE_INSTALL_FAILURES: AtomicU64 = AtomicU64::new(0);

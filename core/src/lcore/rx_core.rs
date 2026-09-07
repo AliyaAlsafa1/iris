@@ -120,24 +120,18 @@ where
 
         // Cycle budget for this lcore (see `stats::DatapathBudget` for the full rationale).
         //
-        // Cheap counters (`wall`, `bursts`, `idle_polls`, `recv_pkts`) are exact. The *cycle*
-        // attribution is sampled, on one in every `sample_stride` outer iterations, because
-        // bracketing every iteration costs an `rte_rdtsc` per empty poll — roughly a tenth of an
-        // empty poll's cost, and the inflation scales with the idle-poll count, which is exactly
-        // what differs between the arms of an ingress-shedding experiment. Measuring exactly would
-        // bias the headline number in favour of the hypothesis.
+        // Cheap counters (`wall`, `bursts`, `idle_polls`, `recv_pkts`) are exact. The cycle
+        // attribution is sampled, on one in every `sample_stride` outer iterations.
         //
-        // Within a sampled iteration, timestamps are *chained*: each read closes one bucket and
-        // opens the next, so the buckets sum to that iteration's span by construction and
-        // `residual_fraction` is a genuine self-check rather than a formality.
+        // A `rte_rdtsc` per empty poll costs a nonnegligible fraction of an empty poll's cost,
+        // so doing this every time would inflate results.
         //
-        // Sampling alone is not enough to make the buckets unbiased. Inside a sampled iteration
-        // every span still absorbs the latency of the read that closes it, and since an empty poll
-        // is by far the cheapest event, `poll_idle` is inflated the most in relative terms — the
-        // exact bias sampling was supposed to remove. So the calibrated per-read cost is subtracted
-        // from each span, and the same total from the iteration's own span, which keeps the buckets
-        // summing to `sampled_wall`. Calibration is per-core because it is cheap and the cores may
-        // not be identical.
+        // Within a sampled iteration, timestamps are chained: each read closes one bucket and
+        // opens the next. The buckets sum to that iteration's span.
+        //
+        // To further try to unbias, subtract the cost of an `rte_rdtsc` from each.
+        // Otherwise, every span would be inflated by the same absolute rte_rdtsc cost, which
+        // is a larger fraction of a short span than a long one.
         let sample_stride = self.budget_sample_stride.max(1);
         let rdtsc_cost = crate::stats::measure_rdtsc_overhead(4096).round() as u64;
         let mut budget = crate::stats::DatapathBudget {
@@ -256,9 +250,7 @@ where
                     }
                 }
 
-                // Close the pipeline bucket. Skipped on an empty burst: there was no pipeline, so
-                // the loop bookkeeping above smears into the next poll span rather than costing
-                // another read. The buckets still sum to the iteration's span.
+                // Close the pipeline bucket, if applicable.
                 if sampled && n_recv > 0 {
                     let t_after_pipeline = unsafe { dpdk::rte_rdtsc() };
                     rdtsc_reads += 1;
@@ -272,8 +264,7 @@ where
             conn_table.check_inactive(&self.subscription, now);
 
             if sampled {
-                // Close the maintenance bucket (timer-wheel expiry). Unlike the previous
-                // instrumentation, this is inside the accounting rather than outside it.
+                // Close the maintenance bucket (timer-wheel expiry).
                 let t_after_maint = unsafe { dpdk::rte_rdtsc() };
                 rdtsc_reads += 1;
                 spans_closed += 1;
@@ -287,16 +278,7 @@ where
                 budget.sampled_iters += 1;
 
                 // Publish the delta periodically so the monitor can log a duty cycle beside each
-                // interval's ingress rate. Only done on sampled iterations, where a fresh
-                // timestamp is already in hand.
-                //
-                // The cadence has to count *sampled* iterations, not loop iterations. Keying off
-                // TOTAL_CYCLES meant this never fired for any `budget_sample_stride` above 1:
-                // TOTAL_CYCLES increments every iteration, so the trigger wanted iteration
-                // 256 (mod 1024) -- which is always 0 (mod stride) -- while sampled iterations are
-                // 1 (mod stride). The two conditions were mutually exclusive, so online runs
-                // published nothing until the final flush after the loop, and every interval row
-                // in cycle_budget.csv was zeros. M3 had no data.
+                // interval's ingress rate. Only done on sampled iterations.
                 if budget.sampled_iters & 1023 == 0 {
                     budget.wall = t_after_maint.wrapping_sub(loop_start);
                     budget.rdtsc_reads = rdtsc_reads;

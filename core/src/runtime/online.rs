@@ -114,10 +114,7 @@ where
     pub(crate) fn run(&mut self, pre_stop: Option<&mut dyn FnMut()>) {
         self.start_ports();
 
-        // Declare the cycle-budget denominator up front. Sink cores are excluded: they run
-        // `rx_sink`, which does no pipeline work and publishes no budget. Setting this before
-        // launch (rather than counting cores as they exit) is what lets the monitor report a
-        // per-core duty cycle while the run is still going.
+        // Set up # of cores in the stats module
         let budget_cores = self
             .rx_cores
             .values()
@@ -151,8 +148,7 @@ where
 
         // The RX cores have exited but the ports are still up, so every `rte_flow` and indirect
         // action handle installed during the run is still valid. This is the only point at which
-        // an application can read those handles back: `stop_ports` flushes the rules and stops the
-        // device, after which the handles are freed and querying one is a use-after-free.
+        // an application can read those handles back.
         if let Some(pre_stop) = pre_stop {
             log::info!("Running pre-stop hook...");
             pre_stop();
