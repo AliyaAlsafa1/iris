@@ -66,14 +66,16 @@ Only the standard library is required.
 """
 
 import argparse
+import collections
 import csv
 import json
-import os
+import queue
 import re
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from pathlib import Path
@@ -468,14 +470,68 @@ def parse_perf_json_line(line: str):
     }
 
 
+def check_events_exist(event_args):
+    """Reasons perf will not be able to count these events, checked against sysfs.
+
+    A pre-flight check because the failure mode otherwise is a silent hang: perf writes its
+    complaint to stderr and produces no interval rows, and a reader waiting on stdout waits
+    forever. Better to name the missing PMU up front.
+    """
+    problems = []
+    for i in range(0, len(event_args), 2):
+        ev = event_args[i + 1]
+        pmu = ev.split("/", 1)[0]
+
+        # A bare `uncore_imc` is not a directory: the instances are uncore_imc_0..N and perf
+        # treats the unsuffixed name as a wildcard across them. Resolve either spelling, or this
+        # check rejects the very events it is meant to validate.
+        candidates = [PMU_DIR / pmu] if (PMU_DIR / pmu).is_dir() else sorted(
+            p for p in PMU_DIR.glob(f"{pmu}_[0-9]*") if p.is_dir()
+        )
+        if not candidates:
+            problems.append(f"{ev}: no PMU matching {pmu!r} or {pmu}_N under {PMU_DIR}")
+            continue
+
+        name = ev.split("/")[1] if "/" in ev else ""
+        if not name:
+            continue
+        # Present on any instance is enough; perf will expand the wildcard to those that have it.
+        # Only conclude "missing" when at least one instance publishes a populated events/ dir,
+        # since some kernels expose events as aliases rather than files.
+        saw_populated = False
+        for inst in candidates:
+            events_dir = inst / "events"
+            if events_dir.is_dir() and any(events_dir.iterdir()):
+                saw_populated = True
+                if (events_dir / name).exists():
+                    break
+        else:
+            if saw_populated:
+                problems.append(
+                    f"{ev}: {pmu} exists ({len(candidates)} instance(s)) but none publishes an "
+                    f"event named {name!r}"
+                )
+    return problems
+
+
 class PerfSampler:
-    """Runs `perf stat` as a child and reads its interval rows off stdout."""
+    """Runs `perf stat` as a child and hands back its interval rows.
+
+    Lines are drained by a reader thread onto a queue rather than read inline. Two reasons, both
+    of which produced hangs when this was a plain `for line in proc.stdout`:
+
+    * stderr used to be a second pipe that was only read at shutdown. perf writes one warning per
+      event per interval in some configurations, and once that 64 KiB pipe filled, perf blocked
+      writing while this process blocked reading stdout — a deadlock with no output at all. stderr
+      is now merged into stdout, and the JSON parser already skips non-JSON lines, so perf's own
+      diagnostics are captured instead of discarded.
+    * a blocking read has no timeout, so perf failing to start (a missing PMU, paranoid still
+      restricting) meant waiting forever. The queue lets the caller apply a deadline.
+    """
 
     def __init__(self, specs, event_args, interval_ms, sampler_core):
         self.specs = specs
-        self.by_event = {}
-        for s in specs:
-            self.by_event.setdefault(s["event"], []).append(s)
+        self.event_args = event_args
         self.cmd = [
             "perf", "stat",
             "-j",                       # self-describing output; see parse_perf_json_line
@@ -487,34 +543,105 @@ class PerfSampler:
         # its own thread runs, so this only keeps its bookkeeping off the datapath.
         self.cmd = ["taskset", "-c", str(sampler_core)] + self.cmd
         self.proc = None
+        self.lines = queue.Queue()
+        # Bounded: perf can emit a warning per event per interval, and a two-hour run would
+        # otherwise accumulate them all in memory for the sake of an error path that prints 40.
+        self.diagnostics = collections.deque(maxlen=2000)
+        self._reader = None
 
     def start(self):
         if shutil.which("perf") is None:
             raise SystemExit("perf not found on PATH")
         self.proc = subprocess.Popen(
-            self.cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            self.cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1,
         )
+
+        def drain(stream, q):
+            try:
+                for line in stream:
+                    q.put(line)
+            finally:
+                q.put(None)  # sentinel: the child closed its output
+
+        self._reader = threading.Thread(target=drain, args=(self.proc.stdout, self.lines),
+                                        daemon=True)
+        self._reader.start()
         return self
 
-    def rows(self):
-        """Yield parsed rows as perf emits them."""
-        assert self.proc and self.proc.stdout
-        for line in self.proc.stdout:
+    def rows(self, deadline=None, first_row_timeout=15.0):
+        """Yield parsed rows, giving up rather than blocking forever.
+
+        `first_row_timeout` bounds the wait for perf's *first* interval; after that the deadline
+        governs. Raises SystemExit with perf's own output when nothing parseable ever arrives,
+        which is the case that used to hang.
+        """
+        seen_any = False
+        started = time.time()
+        while True:
+            if deadline and time.time() >= deadline:
+                return
+            budget = first_row_timeout if not seen_any else 5.0
+            if not seen_any and (time.time() - started) >= first_row_timeout:
+                self._fail_no_output(first_row_timeout)
+            try:
+                line = self.lines.get(timeout=min(budget, 1.0))
+            except queue.Empty:
+                # The child may have died without closing cleanly; notice rather than spin.
+                if self.proc.poll() is not None and self.lines.empty():
+                    if not seen_any:
+                        self._fail_no_output(time.time() - started)
+                    return
+                continue
+            if line is None:
+                if not seen_any:
+                    self._fail_no_output(time.time() - started)
+                return
             parsed = parse_perf_json_line(line)
             if parsed:
+                seen_any = True
                 yield parsed
+            elif line.strip():
+                # perf's warnings and errors land here now that stderr is merged.
+                self.diagnostics.append(line.rstrip())
+
+    def _fail_no_output(self, waited):
+        self.stop()
+        # deque has no slicing, and this runs on the error path where a TypeError would replace
+        # the diagnostic it is trying to print.
+        detail = "\n  ".join(list(self.diagnostics)[-40:]) or "(perf produced no output at all)"
+        raise SystemExit(
+            f"perf produced no parseable interval rows in {waited:.0f}s. Its output was:\n"
+            f"  {detail}\n\n"
+            "Common causes: scripts/mem_setup.sh has not been run (perf_event_paranoid must be "
+            "-1, or run as root); this kernel's perf does not support `-j` with `-I`; or one of "
+            "the requested uncore PMUs does not exist on this host. Run with --show-topology to "
+            "see which PMUs were resolved."
+        )
 
     def stop(self):
+        """Stop perf and return whatever it wrote that was not interval data."""
         if not self.proc:
             return ""
-        self.proc.send_signal(signal.SIGINT)
-        try:
-            _, err = self.proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            _, err = self.proc.communicate()
-        return err or ""
+        if self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGINT)
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+        # Collect anything the reader thread still has buffered.
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            try:
+                line = self.lines.get_nowait()
+            except queue.Empty:
+                break
+            if line is None:
+                break
+            if line.strip() and not parse_perf_json_line(line):
+                self.diagnostics.append(line.rstrip())
+        return "\n".join(self.diagnostics)
 
 
 # --------------------------------------------------------------------------- aggregation
@@ -609,6 +736,9 @@ def main():
     ap.add_argument("--show-topology", action="store_true",
                     help="print the core/NUMA/IIO layout for this host and a NUMA-local core "
                          "allocation for the configured ports, then exit. Changes nothing.")
+    ap.add_argument("--startup-timeout", type=float, default=15.0,
+                    help="give up if perf has produced no parseable interval row within this "
+                         "many seconds, printing what it did output (default: 15)")
     ap.add_argument("--allow-cross-numa", action="store_true",
                     help="proceed even though a port's RX cores are not on the port's NUMA node. "
                          "Only for deliberately measuring the cross-socket case: it misattributes "
@@ -667,6 +797,17 @@ def main():
     for s in specs:
         specs_by_event.setdefault(s["event"], []).append(s)
 
+    # Name a missing PMU here rather than letting it become a wait for output that never comes.
+    event_problems = check_events_exist(event_args)
+    if event_problems:
+        print("\nRequested events that this host cannot count:", file=sys.stderr)
+        for p in event_problems:
+            print(f"  {p}", file=sys.stderr)
+        raise SystemExit(
+            "\nThe uncore PMUs differ between platforms. Re-run with --show-topology to see what "
+            "was resolved, and check `perf list | grep uncore` for what this host offers."
+        )
+
     n_intervals = 3 if args.selftest else None
     interval_ms = 200 if args.selftest else args.interval
 
@@ -685,9 +826,13 @@ def main():
         prev_rdt = groups.read()
         seen_events, advanced, written = set(), set(), 0
 
-        stop = {"now": False}
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            signal.signal(sig, lambda *_: stop.update(now=True))
+        # No SIGINT handler. An earlier version installed one that only set a flag, and checked
+        # that flag solely on an interval boundary — so when perf emitted nothing the flag was
+        # never read and Ctrl-C did nothing at all. Letting KeyboardInterrupt propagate is both
+        # simpler and correct: the `with` blocks below and above still run their cleanup, removing
+        # the resctrl monitoring groups and stopping perf. SIGTERM keeps its default too, so
+        # `pkill` works. `paired_ab.py` stops the sampler with SIGINT and relies on this.
+        deadline = (started + args.duration) if args.duration else None
 
         with args.out.open("w", newline="") as fh:
             wtr = csv.DictWriter(fh, fieldnames=csv_fields(port_devices),
@@ -695,7 +840,8 @@ def main():
             wtr.writeheader()
 
             batch, cur_interval, intervals_done = [], None, 0
-            for row in sampler.rows():
+            for row in sampler.rows(deadline=deadline,
+                                    first_row_timeout=args.startup_timeout):
                 seen_events.add(row["event"].strip())
                 if row["value"] > 0:
                     advanced.add(row["event"].strip())
@@ -759,9 +905,7 @@ def main():
                     intervals_done += 1
                     if n_intervals and intervals_done >= n_intervals:
                         break
-                    if args.duration and (time.time() - started) >= args.duration:
-                        break
-                    if stop["now"]:
+                    if deadline and time.time() >= deadline:
                         break
                 batch.append(row)
 
