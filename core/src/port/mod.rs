@@ -617,6 +617,14 @@ impl fmt::Display for RxQueue {
 /// `phy_packets` is the load-normalisation denominator; `good_packets` is what the CPU had to touch.
 #[derive(Debug, Default, Clone, Copy, serde::Serialize)]
 pub struct IngressCounters {
+    /// DPDK port id, so a report's entries are identifiable rather than positional.
+    pub port_id: u16,
+    /// NUMA socket the port is attached to.
+    ///
+    /// Needed to normalise socket-scoped quantities: the uncore IMC and IIO counters the memory
+    /// evaluation reads are per socket, so "DRAM bytes per ingress byte" can only be formed by
+    /// pairing each socket's counters with the ingress of the ports actually on that socket.
+    pub socket_id: u32,
     pub phy_packets: u64,
     pub phy_bytes: u64,
     pub good_packets: u64,
@@ -650,6 +658,8 @@ pub fn ingress_counters(port_id: PortId) -> Result<IngressCounters> {
     let phy_bytes = get("rx_phy_bytes");
 
     Ok(IngressCounters {
+        port_id: port_id.raw(),
+        socket_id: port_id.socket_id().raw(),
         phy_packets: phy_packets.unwrap_or(good_packets),
         phy_bytes: phy_bytes.unwrap_or(good_bytes),
         good_packets,

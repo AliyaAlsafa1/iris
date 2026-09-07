@@ -10,6 +10,20 @@ Runs the arms in an alternating A,B,A,B,... sequence, collects each run's JSON r
       run's cycle_budget.csv. The slope gap is the effect size and, unlike M1, it does not assume
       the two arms saw comparable load at all.
 
+With --mem-sample, the memory-side metrics are collected from the same runs and reported alongside:
+
+  N1  DRAM bytes per *ingress* byte, per socket, with the same paired test. Ingress-normalised for
+      the same reason M1 is.
+  N2  that traffic split into core-originated (RDT MBM) and IO-originated (IMC minus MBM), plus
+      PCIe inbound bytes. Answers whether packet writes or the application dominate memory usage.
+  N3  the RX cores' LLC occupancy (RDT CMT).
+
+Why from the same runs rather than separate ones: freed cycles and freed memory bandwidth are two
+views of the same shed traffic, so measuring them together lets a single run state both at a given
+offered load. The cycle instrumentation issues no memory reference of its own — `rte_rdtsc` is a
+register read — but that is checked rather than assumed, by running with `budget_sample_stride = 0`
+and confirming N1 does not move.
+
 Why alternating rather than one run per arm: campus traffic is non-stationary on a minutes
 timescale, so back-to-back runs of the same arm differ. Alternating makes the arm assignment
 roughly orthogonal to the drift, and pairing lets the analysis difference it out.
@@ -29,10 +43,12 @@ import csv
 import json
 import math
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -73,6 +89,18 @@ def parse_args():
     p.add_argument("--load-tolerance", type=float, default=0.10,
                    help="discard a pair whose two runs differ in ingress bytes by more than this "
                         "fraction (default: 0.10)")
+    p.add_argument("--mem-sample", action="store_true",
+                   help="collect memory counters (uncore IMC/IIO, RDT MBM/CMT) alongside each "
+                        "run via tools/mem_sample.py, and report N1-N3. Needs "
+                        "scripts/mem_setup.sh to have been run.")
+    p.add_argument("--sampler-core", type=int, default=None,
+                   help="core to pin the memory sampler to. Required with --mem-sample, and "
+                        "must not be an RX core or a --worker-cores core: sampling from a "
+                        "measured core steals its cycles and pollutes its LLC occupancy.")
+    p.add_argument("--mem-baseline", type=Path, default=None,
+                   help="a mem_sample.py --baseline CSV, measured with Iris stopped. Its DRAM "
+                        "rate is subtracted from N1, since uncore counters are socket-wide and "
+                        "include the OS and the sampler itself.")
     p.add_argument("--plot", action="store_true", help="write the M3 regression plot (matplotlib)")
     p.add_argument("--dry-run", action="store_true", help="print commands, run nothing")
     p.add_argument("--quiet", action="store_true",
@@ -85,6 +113,48 @@ def parse_args():
 
 
 # --------------------------------------------------------------------------- running
+
+
+def start_mem_sampler(arm, index, args):
+    """Launch tools/mem_sample.py for the duration of one run.
+
+    Started before the run rather than after so the first intervals are covered, and given no
+    --duration: it is stopped by SIGINT when the run returns, which is what bounds it. That way a
+    run that ends early does not leave a sampler running into the next one.
+    """
+    if not args.mem_sample:
+        return None, None
+    out = args.out_dir / f"mem_sample_{arm}_{index:03d}.csv"
+    cmd = [
+        "sudo", str(REPO_ROOT / "tools" / "mem_sample.py"),
+        "--config", ARMS[arm]["config"],
+        "--sampler-core", str(args.sampler_core),
+        "--worker-cores", args.worker_cores,
+        "--out", str(out),
+    ]
+    if args.dry_run:
+        print(f"    (would start: {' '.join(cmd)})")
+        return None, out
+    proc = subprocess.Popen(cmd, cwd=REPO_ROOT, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    return proc, out
+
+
+def stop_mem_sampler(proc, out):
+    """SIGINT the sampler and wait for it to flush its CSV."""
+    if proc is None:
+        return
+    try:
+        proc.send_signal(signal.SIGINT)
+        stdout, _ = proc.communicate(timeout=20)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout, _ = proc.communicate()
+    if proc.returncode not in (0, -2, 130) or not (out and out.exists()):
+        print(f"  !! memory sampler failed (exit {proc.returncode}); "
+              f"N1-N3 will be missing for this run", file=sys.stderr)
+        if stdout:
+            print(stdout[-2000:], file=sys.stderr)
 
 
 def run_one(arm, index, args):
@@ -105,27 +175,36 @@ def run_one(arm, index, args):
 
     print(f"[{time.strftime('%H:%M:%S')}] arm {arm} run {index}: {' '.join(cmd)}", flush=True)
     if args.dry_run:
+        start_mem_sampler(arm, index, args)
         return None
+
+    mem_proc, mem_out = start_mem_sampler(arm, index, args)
 
     # Stream by default: a run is `duration` seconds long and captured output means a silent
     # terminal for all of it, with no way to tell a healthy run from a hang. Inheriting the
     # terminal rather than piping also keeps DPDK's own C-buffered output line-prompt, which a
     # pipe would hold back in 4 KB blocks.
-    if args.quiet:
-        proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
-        if proc.returncode != 0:
-            print(f"  !! exit {proc.returncode}\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}",
-                  file=sys.stderr)
+    #
+    # `finally`, not a stop at each exit: a sampler left running past its run would keep a resctrl
+    # monitoring group holding the RX cores, and the next run would then measure through it.
+    try:
+        if args.quiet:
+            proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+            if proc.returncode != 0:
+                print(f"  !! exit {proc.returncode}\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}",
+                      file=sys.stderr)
+                return None
+        else:
+            proc = subprocess.run(cmd, cwd=REPO_ROOT)
+            if proc.returncode != 0:
+                # No tail to reprint: the run's output already went to the terminal above.
+                print(f"  !! exit {proc.returncode} (output above)", file=sys.stderr)
+                return None
+        if not report_path.exists():
+            print(f"  !! no report written to {report_path}", file=sys.stderr)
             return None
-    else:
-        proc = subprocess.run(cmd, cwd=REPO_ROOT)
-        if proc.returncode != 0:
-            # No tail to reprint: the run's output already went to the terminal above.
-            print(f"  !! exit {proc.returncode} (output above)", file=sys.stderr)
-            return None
-    if not report_path.exists():
-        print(f"  !! no report written to {report_path}", file=sys.stderr)
-        return None
+    finally:
+        stop_mem_sampler(mem_proc, mem_out)
 
     report = json.loads(report_path.read_text())
 
@@ -274,6 +353,238 @@ def load_budget_rows(out_dir, arm):
     return points
 
 
+# --------------------------------------------------------------------------- memory (N1-N3)
+
+
+MEM_SUM_FIELDS = ("imc_bytes", "imc_read_bytes", "imc_write_bytes", "iio_in_bytes",
+                  "mbm_total_bytes", "mbm_local_bytes", "core_dram_bytes", "io_dram_bytes")
+
+
+def load_mem_totals(out_dir, arm, index):
+    """Totals per socket for one run's mem_sample CSV, plus mean LLC occupancy.
+
+    Byte columns are per-interval deltas, so they sum. `llc_occupancy_bytes` is a gauge, so it is
+    averaged instead — summing an occupancy would be meaningless.
+    """
+    path = out_dir / f"mem_sample_{arm}_{index:03d}.csv"
+    if not path.exists():
+        return None
+    totals = defaultdict(lambda: defaultdict(float))
+    occ = defaultdict(list)
+    intervals = defaultdict(int)
+    with path.open() as fh:
+        for row in csv.DictReader(fh):
+            try:
+                socket = int(row["socket"])
+            except (KeyError, ValueError):
+                continue
+            for f in MEM_SUM_FIELDS:
+                try:
+                    totals[socket][f] += float(row.get(f) or 0.0)
+                except ValueError:
+                    pass
+            try:
+                occ[socket].append(float(row.get("llc_occupancy_bytes") or 0.0))
+            except ValueError:
+                pass
+            intervals[socket] += 1
+    out = {}
+    for socket, vals in totals.items():
+        d = dict(vals)
+        d["intervals"] = intervals[socket]
+        d["llc_occupancy_bytes_mean"] = statistics.fmean(occ[socket]) if occ[socket] else 0.0
+        out[socket] = d
+    return out or None
+
+
+def ingress_by_socket(report):
+    """Ingress bytes/packets summed per socket, using the report's own socket_id field.
+
+    Positional pairing with the config's port list would be fragile — DPDK port ids follow probe
+    order, not config order — which is why `IngressCounters` carries `socket_id`.
+    """
+    out = defaultdict(lambda: {"phy_bytes": 0, "phy_packets": 0, "good_bytes": 0,
+                               "phy_available": True})
+    for p in report["ingress"]:
+        s = p.get("socket_id")
+        if s is None:
+            continue
+        out[s]["phy_bytes"] += p["phy_bytes"]
+        out[s]["phy_packets"] += p["phy_packets"]
+        out[s]["good_bytes"] += p["good_bytes"]
+        out[s]["phy_available"] &= bool(p.get("phy_available", False))
+    return dict(out)
+
+
+def check_mem_run(report, mem):
+    """Hard validity gates for the memory side, in the spirit of `check_run`.
+
+    Each of these, if ignored, yields a number that looks plausible and is wrong.
+    """
+    problems = []
+    if not mem:
+        return ["no mem_sample CSV for this run"]
+    ing = ingress_by_socket(report)
+    for socket, vals in sorted(mem.items()):
+        if vals["intervals"] < 10:
+            problems.append(f"socket {socket}: only {vals['intervals']} sampled intervals")
+        if vals["imc_bytes"] <= 0:
+            problems.append(f"socket {socket}: IMC counters never advanced — perf could not read "
+                            "the memory controllers")
+        # The PCIe/NIC cross-check. If the IIO stack were misidentified this ratio goes wild, and
+        # every other memory number for that socket is then attributed to the wrong device.
+        phy = ing.get(socket, {}).get("phy_bytes", 0)
+        if phy > 0 and vals["iio_in_bytes"] > 0:
+            ratio = vals["iio_in_bytes"] / phy
+            if not 0.5 <= ratio <= 3.0:
+                problems.append(
+                    f"socket {socket}: PCIe inbound / rx_phy_bytes = {ratio:.2f}, outside [0.5, 3]"
+                    " — likely the wrong IIO stack, so its byte attribution cannot be trusted"
+                )
+        if vals["llc_occupancy_bytes_mean"] <= 0:
+            problems.append(f"socket {socket}: LLC occupancy read zero — the resctrl monitoring "
+                            "group held no RX cores, so N3 is invalid")
+    return problems
+
+
+def load_mem_baseline(path):
+    """Mean per-socket DRAM bytes per interval from a --baseline CSV, for subtraction."""
+    if not path or not Path(path).exists():
+        return {}
+    per_socket = defaultdict(list)
+    with Path(path).open() as fh:
+        for row in csv.DictReader(fh):
+            try:
+                per_socket[int(row["socket"])].append(float(row["imc_bytes"]))
+            except (KeyError, ValueError):
+                continue
+    return {s: statistics.fmean(v) for s, v in per_socket.items() if v}
+
+
+def analyze_memory(usable, args):
+    """N1-N3: DRAM per ingress byte, the core/IO decomposition, and LLC occupancy."""
+    mem_by_run = {}
+    for r, _ in usable:
+        mem = load_mem_totals(args.out_dir, r["_arm"], r["_index"])
+        problems = check_mem_run(r, mem)
+        mem_by_run[(r["_arm"], r["_index"])] = (mem, problems)
+
+    have = [k for k, (m, p) in mem_by_run.items() if m and not p]
+    print("\n" + "=" * 78)
+    print("N1-N3  MEMORY SYSTEM")
+    print("=" * 78)
+    if not have:
+        print("no usable memory samples. Reasons per run:")
+        for (arm, idx), (_, problems) in sorted(mem_by_run.items()):
+            print(f"  arm {arm} run {idx}: {'; '.join(problems) or 'ok'}")
+        return
+    for (arm, idx), (_, problems) in sorted(mem_by_run.items()):
+        if problems:
+            print(f"  REJECT memory for arm {arm} run {idx}: {'; '.join(problems)}")
+
+    baseline = load_mem_baseline(args.mem_baseline)
+    if baseline:
+        print(f"\nDRAM baseline (Iris stopped), per interval: "
+              + ", ".join(f"socket {s}: {v / 1e6:.1f} MB" for s, v in sorted(baseline.items())))
+        print("  subtracted from N1 below, since uncore counters are socket-wide.")
+    else:
+        print("\nNo --mem-baseline given: N1 includes whatever else the box was doing. "
+              "Measure it with `mem_sample.py --baseline` and pass it in.")
+
+    # ---- N2 decomposition, per arm per socket ----
+    print("\n--- N2  where the memory traffic comes from (means over usable runs) ---")
+    print(f"{'arm':<4}{'sock':>5}{'n':>3}{'DRAM GB':>10}{'IO%':>7}{'DRAM/phy':>10}"
+          f"{'core/phy':>10}{'IO/phy':>8}{'PCIe/phy':>10}{'LLC MiB':>9}")
+    per_arm_socket = defaultdict(list)
+    for (arm, idx) in have:
+        mem, _ = mem_by_run[(arm, idx)]
+        for socket, vals in mem.items():
+            per_arm_socket[(arm, socket)].append((vals, idx))
+    for (arm, socket) in sorted(per_arm_socket):
+        entries = per_arm_socket[(arm, socket)]
+        def mean(f):
+            return statistics.fmean(v[f] for v, _ in entries)
+        report_by_idx = {r["_index"]: r for r, _ in usable if r["_arm"] == arm}
+        phys = [ingress_by_socket(report_by_idx[i]).get(socket, {}).get("phy_bytes", 0)
+                for _, i in entries]
+        phy_mean = statistics.fmean(phys) if phys else 0
+        imc, core, io = mean("imc_bytes"), mean("core_dram_bytes"), mean("io_dram_bytes")
+        pcie = mean("iio_in_bytes")
+        # Per-ingress-byte columns are the only ones comparable *across* arms: the absolute GB
+        # figures scale with whatever load happened to arrive, and the two arms need not have
+        # the same number of surviving runs (see `n`), so their raw totals are not commensurate.
+        def per_phy(v):
+            return v / phy_mean if phy_mean else 0.0
+        print(f"{arm:<4}{socket:>5}{len(entries):>3}{imc / 1e9:>10.2f}"
+              f"{100 * (io / imc if imc else 0):>6.1f}%{per_phy(imc):>10.3f}"
+              f"{per_phy(core):>10.3f}{per_phy(io):>8.3f}{per_phy(pcie):>10.2f}"
+              f"{mean('llc_occupancy_bytes_mean') / (1 << 20):>9.2f}")
+    print("  core = RDT MBM (traffic the RX cores originated). IO = IMC minus MBM, i.e. DDIO/IIO")
+    print("  traffic, which carries no RMID on this microarchitecture. IO% is the headline for")
+    print("  'do packet writes or the application dominate memory usage'.")
+    print("  DRAM GB is load-dependent and NOT comparable across arms; the /phy columns are.")
+    print("  PCIe/phy should sit near 1: far from it means the wrong IIO stack was read.")
+
+    # ---- N1 paired ----
+    arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+    if len(arms) < 2:
+        return
+    a_arm, b_arm = arms[0], arms[1]
+    sockets = sorted({s for (_, s) in per_arm_socket})
+    for socket in sockets:
+        pairs = []
+        for r, _ in usable:
+            if r["_arm"] != a_arm:
+                continue
+            idx = r["_index"]
+            if (a_arm, idx) not in have or (b_arm, idx) not in have:
+                continue
+            a_mem = mem_by_run[(a_arm, idx)][0].get(socket)
+            b_mem = mem_by_run[(b_arm, idx)][0].get(socket)
+            b_rep = next((x for x, _ in usable
+                          if x["_arm"] == b_arm and x["_index"] == idx), None)
+            if not (a_mem and b_mem and b_rep):
+                continue
+            a_phy = ingress_by_socket(r).get(socket, {})
+            b_phy = ingress_by_socket(b_rep).get(socket, {})
+            if not (a_phy.get("phy_bytes") and b_phy.get("phy_bytes")):
+                continue
+            # N1 is ingress-normalised for exactly the reason M1 is: the numerator falls when the
+            # NIC sheds and the denominator does not, so paired runs on drifting traffic stay
+            # comparable. Per *received* byte would be the trap, and is not reported.
+            floor_a = baseline.get(socket, 0.0) * a_mem["intervals"]
+            floor_b = baseline.get(socket, 0.0) * b_mem["intervals"]
+            va = max(0.0, a_mem["imc_bytes"] - floor_a) / a_phy["phy_bytes"]
+            vb = max(0.0, b_mem["imc_bytes"] - floor_b) / b_phy["phy_bytes"]
+            if not a_phy.get("phy_available") or not b_phy.get("phy_available"):
+                continue  # no valid ingress denominator on this socket
+            pairs.append((idx, va, vb))
+
+        print(f"\n--- N1  DRAM bytes per ingress byte, socket {socket} "
+              f"({a_arm} vs {b_arm}) ---")
+        if not pairs:
+            print("  no complete pairs with a valid ingress denominator on this socket.")
+            continue
+        print(f"{'pair':>5}{a_arm:>12}{b_arm:>12}{'change':>10}")
+        diffs, rels = [], []
+        for idx, va, vb in pairs:
+            d = vb - va
+            diffs.append(d)
+            rels.append(d / va if va else 0.0)
+            print(f"{idx:>5}{va:>12.3f}{vb:>12.3f}{100 * (d / va if va else 0):>9.1f}%")
+        n, k, p = sign_test(diffs)
+        mean_rel = statistics.fmean(rels)
+        print(f"  mean change: {100 * mean_rel:+.2f}%   "
+              f"sign test n={n}, {k} favour {b_arm}, p={p:.4f}")
+        if p >= 0.05:
+            print("  -> NOT significant at 0.05; report that rather than the point estimate.")
+        elif mean_rel < 0:
+            print(f"  -> {b_arm} moves significantly fewer DRAM bytes per ingress byte.")
+        else:
+            print(f"  -> {b_arm} moves significantly MORE DRAM bytes per ingress byte, "
+                  "contradicting the hypothesis.")
+
+
 def analyze(reports, args):
     usable, rejected = [], []
     for r in reports:
@@ -420,7 +731,10 @@ def analyze(reports, args):
     if args.plot and fits:
         write_plot(fits, args.out_dir)
 
-    write_tidy_csv([r for r, _ in usable], args.out_dir)
+    if args.mem_sample:
+        analyze_memory(usable, args)
+
+    write_tidy_csv([r for r, _ in usable], args.out_dir, args)
 
 
 def write_plot(fits, out_dir):
@@ -448,11 +762,64 @@ def write_plot(fits, out_dir):
     print(f"\nwrote {path}")
 
 
-def write_tidy_csv(reports, out_dir):
+def write_tidy_mem_csv(reports, out_dir, args):
+    """One row per (run, socket): the memory metrics, which are socket-scoped.
+
+    Kept separate from runs.csv rather than widened into it, because flattening a per-socket
+    quantity into a per-run row means either picking one socket or inventing a total, and on a
+    config whose RX cores straddle both sockets neither is defensible.
+    """
+    rows = []
+    for r in reports:
+        mem = load_mem_totals(out_dir, r["_arm"], r["_index"])
+        if not mem:
+            continue
+        ing = ingress_by_socket(r)
+        for socket, vals in sorted(mem.items()):
+            phy_bytes = ing.get(socket, {}).get("phy_bytes", 0)
+            phy_pkts = ing.get(socket, {}).get("phy_packets", 0)
+            rows.append({
+                "arm": r["_arm"], "index": r["_index"], "socket": socket,
+                "intervals": vals["intervals"],
+                "imc_bytes": int(vals["imc_bytes"]),
+                "imc_read_bytes": int(vals["imc_read_bytes"]),
+                "imc_write_bytes": int(vals["imc_write_bytes"]),
+                "core_dram_bytes": int(vals["core_dram_bytes"]),
+                "io_dram_bytes": int(vals["io_dram_bytes"]),
+                "io_dram_fraction": (vals["io_dram_bytes"] / vals["imc_bytes"]
+                                     if vals["imc_bytes"] else 0.0),
+                "iio_in_bytes": int(vals["iio_in_bytes"]),
+                "mbm_total_bytes": int(vals["mbm_total_bytes"]),
+                "mbm_local_bytes": int(vals["mbm_local_bytes"]),
+                "llc_occupancy_bytes_mean": int(vals["llc_occupancy_bytes_mean"]),
+                "ingress_phy_bytes": phy_bytes,
+                "ingress_phy_packets": phy_pkts,
+                # N1 and its PCIe cross-check, precomputed so the CSV is usable as-is.
+                "dram_bytes_per_ingress_byte": (vals["imc_bytes"] / phy_bytes
+                                                if phy_bytes else 0.0),
+                "pcie_bytes_per_ingress_byte": (vals["iio_in_bytes"] / phy_bytes
+                                                if phy_bytes else 0.0),
+                "phy_available": ing.get(socket, {}).get("phy_available", False),
+            })
+    if not rows:
+        return
+    path = out_dir / "runs_memory.csv"
+    with path.open("w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    print(f"wrote {path}")
+
+
+def write_tidy_csv(reports, out_dir, args=None):
     """One row per run, for downstream analysis in whatever tool you prefer."""
     if not reports:
         return
     path = out_dir / "runs.csv"
+    # Memory columns are per socket, so they cannot be flattened into a one-row-per-run table
+    # without picking a socket. Emit a companion tidy file keyed by (run, socket) instead.
+    if args is not None and args.mem_sample:
+        write_tidy_mem_csv(reports, out_dir, args)
     fields = [
         "arm", "index", "drop_mode", "app_cycles_requested", "tls_callbacks", "shed_conns",
         "idle_fraction", "busy_fraction", "cores_idle", "residual_fraction",
@@ -500,6 +867,32 @@ def main():
     for arm in arms:
         if arm not in ARMS:
             sys.exit(f"unknown arm {arm!r}; known arms: {', '.join(ARMS)}")
+
+    if args.mem_sample and not args.analyze_only:
+        if args.sampler_core is None:
+            sys.exit("--mem-sample needs --sampler-core. Pick a core outside the config's RX "
+                     "cores and outside --worker-cores: sampling from a measured core steals "
+                     "its cycles and pollutes its LLC occupancy.")
+        # Fail before the first run rather than after it, so a whole batch is not wasted.
+        # mem_sample.py re-checks this, but only once it is actually launched — too late to save
+        # a ten-pair batch, and never at all under --dry-run.
+        worker = {int(c) for c in args.worker_cores.split(",") if c.strip()}
+        if args.sampler_core in worker:
+            sys.exit(f"--sampler-core {args.sampler_core} is also an install-worker core")
+        if not (REPO_ROOT / "tools" / "mem_sample.py").exists():
+            sys.exit("tools/mem_sample.py is missing")
+        # Reuse mem_sample's config parser rather than re-implementing it, so the two tools cannot
+        # disagree about which cores the run will use.
+        sys.path.insert(0, str(REPO_ROOT / "tools"))
+        import mem_sample
+        for arm in arms:
+            layout = mem_sample.load_layout(REPO_ROOT / ARMS[arm]["config"])
+            if args.sampler_core in layout["rx_cores"]:
+                sys.exit(
+                    f"--sampler-core {args.sampler_core} is an RX core in "
+                    f"{ARMS[arm]['config']} (RX cores: {layout['rx_cores']}). Sampling from a "
+                    "measured core steals its cycles and pollutes its LLC occupancy."
+                )
 
     if args.analyze_only:
         reports = []
