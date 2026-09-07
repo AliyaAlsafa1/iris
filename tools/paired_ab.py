@@ -231,6 +231,19 @@ def run_one(arm, index, args):
 # --------------------------------------------------------------------------- validity
 
 
+# Prefix marking the one gate that is fatal to M1 but not necessarily to the per-socket N1.
+PHY_GATE = "no-rx-phy"
+
+
+def phy_only_failures(problems):
+    """True when the only thing wrong with a run is the machine-wide rx_phy_* gate.
+
+    Such a run is unusable for M1, whose denominator sums every port's phy_bytes, but its memory
+    metrics are still sound on any socket whose own ports report the counters.
+    """
+    return bool(problems) and all(p.startswith(PHY_GATE) for p in problems)
+
+
 def check_run(report):
     """Return a list of reasons this run must not be used. Empty means usable.
 
@@ -242,7 +255,11 @@ def check_run(report):
     n = report["normalised"]
 
     if not n["ingress_normalisation_valid"]:
-        problems.append("PMD exposed no rx_phy_* counters, so M1 is meaningless")
+        # Tagged so the memory analysis can tell this apart from the other gates. M1 sums every
+        # port's phy_bytes into one denominator, so a single port without the counters spoils it
+        # — but N1 is computed per socket, and a socket whose own ports all report phy_* is still
+        # sound. See `phy_only_failures`.
+        problems.append(PHY_GATE + ": PMD exposed no rx_phy_* counters, so M1 is meaningless")
     if abs(b["residual_fraction"]) > 1e-3:
         problems.append(f"cycle budget does not close (residual {b['residual_fraction']:.2%})")
     if b["instrumentation_fraction"] > 0.02:
@@ -735,7 +752,16 @@ def analyze(reports, args):
         write_plot(fits, args.out_dir)
 
     if args.mem_sample:
-        analyze_memory(usable, args)
+        # Include runs rejected *only* by the machine-wide rx_phy_* gate. N1 is per socket and
+        # checks each socket's own ports, so a config mixing a PMD that exposes rx_phy_* with one
+        # that does not still yields a sound N1 on the former's socket — whereas M1, which sums
+        # all ports into one denominator, correctly rejects the run.
+        mem_usable = usable + [(r, p) for r, p in rejected if phy_only_failures(p)]
+        if len(mem_usable) > len(usable):
+            print(f"\n(memory analysis additionally uses {len(mem_usable) - len(usable)} run(s) "
+                  f"rejected only by the machine-wide rx_phy_* gate; N1 is per socket and will "
+                  f"skip whichever socket lacks the counters)")
+        analyze_memory(mem_usable, args)
 
     write_tidy_csv([r for r, _ in usable], args.out_dir, args)
 
@@ -904,7 +930,8 @@ def main():
                 for p in numa:
                     print(f"  {p}", file=sys.stderr)
                 print("\nA NUMA-local allocation for this host:\n", file=sys.stderr)
-                print(mem_sample.suggest_allocation(layout), file=sys.stderr)
+                reserve = {args.sampler_core} | worker
+                print(mem_sample.suggest_allocation(layout, reserve), file=sys.stderr)
                 sys.exit("\nFix the config's `cores` lists, or pass --allow-cross-numa.")
 
     if args.analyze_only:

@@ -94,6 +94,82 @@ def cpu_socket(cpu: int) -> int:
     return int(p.read_text().strip())
 
 
+PCI_VENDORS = {"0x15b3": "Mellanox", "0x8086": "Intel", "0x14e4": "Broadcom"}
+
+# Whether a PMD exposes rx_phy_* — the N1 denominator, and all-or-nothing across ports, so one
+# port without it invalidates the ingress normalisation for the whole run.
+PHY_COUNTER_BY_VENDOR = {"0x15b3": True, "0x8086": False}
+
+
+def device_identity(pci_addr: str):
+    """Vendor, driver and whether this NIC is expected to expose `rx_phy_*`.
+
+    Reported because the answer changes what N1 means, and it is a property of the card rather
+    than of the harness: mlx5 provides `rx_phy_*`, ICE does not. Guessing it from the config's
+    filename is how a mixed-vendor assumption survives onto a machine where it is false.
+    """
+    base = Path("/sys/bus/pci/devices") / pci_addr
+
+    def read(name):
+        try:
+            return (base / name).read_text().strip()
+        except OSError:
+            return None
+
+    vendor = read("vendor")
+    driver = None
+    try:
+        driver = (base / "driver").resolve().name
+    except OSError:
+        pass
+    return {
+        "vendor_id": vendor,
+        "vendor": PCI_VENDORS.get(vendor, vendor or "unknown"),
+        "device_id": read("device"),
+        "driver": driver or "(unbound)",
+        # None means "cannot tell from the vendor alone" — check the smoke run's ingress[] array.
+        "phy_counters": PHY_COUNTER_BY_VENDOR.get(vendor),
+    }
+
+
+def llc_geometry():
+    """LLC size and way count for one socket, or None if it cannot be determined.
+
+    Needed to interpret N3: an occupancy figure means nothing without knowing the cache it is a
+    fraction of, and the per-way size is what a future CAT or DDIO sweep moves in units of.
+    """
+    size_raw = None
+    try:
+        size_raw = Path(
+            "/sys/devices/system/cpu/cpu0/cache/index3/size").read_text().strip()
+    except OSError:
+        return None
+    mult = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30}
+    size = None
+    if size_raw and size_raw[-1].upper() in mult:
+        try:
+            size = int(size_raw[:-1]) * mult[size_raw[-1].upper()]
+        except ValueError:
+            return None
+    if size is None:
+        return None
+
+    ways = None
+    # resctrl's cbm_mask is authoritative for how many ways CAT can actually address; fall back to
+    # the cache's own associativity when resctrl is not mounted.
+    try:
+        ways = bin(int((RESCTRL / "info" / "L3" / "cbm_mask").read_text().strip(), 16)).count("1")
+    except (OSError, ValueError):
+        try:
+            ways = int(Path("/sys/devices/system/cpu/cpu0/cache/index3/"
+                            "ways_of_associativity").read_text().strip())
+        except (OSError, ValueError):
+            return None
+    if not ways:
+        return None
+    return {"size_bytes": size, "ways": ways, "bytes_per_way": size // ways}
+
+
 def device_numa_node(pci_addr: str):
     """The NUMA node a PCI device is attached to, or None if the platform does not say."""
     try:
@@ -147,7 +223,7 @@ def check_numa_locality(layout):
     return problems
 
 
-def suggest_allocation(layout):
+def suggest_allocation(layout, reserve=()):
     """A NUMA-local core allocation for the configured ports, as TOML.
 
     Keeps each port's core count but draws the cores from the port's own NUMA node, skipping
@@ -155,7 +231,12 @@ def suggest_allocation(layout):
     avoided: two RX cores sharing a physical core contend for the same L1/L2 and halve the
     per-core throughput the evaluation is trying to measure.
     """
-    used = {layout["main_core"]} if layout["main_core"] is not None else set()
+    # `reserve` keeps cores that are already spoken for — the memory sampler and the rte_flow
+    # install worker — out of the RX lists. Omitting them produced a suggestion that silently made
+    # the sampler core an RX core, which the gates would then reject.
+    used = set(reserve)
+    if layout["main_core"] is not None:
+        used.add(layout["main_core"])
     by_node = {}
     for cpu_path in sorted(CPU_DIR.glob("cpu[0-9]*"), key=lambda p: int(p.name[3:])):
         cpu = int(cpu_path.name[3:])
@@ -769,10 +850,25 @@ def main():
         loc = stacks.get(bus)
         node = device_numa_node(p["device"])
         core_sockets = sorted({cpu_socket(c) for c in p["cores"]})
-        print(f"port {p['device']}  NUMA node {node}, root bus {bus} -> "
+        ident = device_identity(p["device"])
+        print(f"port {p['device']}  {ident['vendor']} "
+              f"({ident['device_id']}, driver {ident['driver']}), NUMA node {node}")
+        print(f"    root bus {bus} -> "
               + (f"uncore_iio_{loc[0]} die{loc[1]}, {iio_scale(loc[0]):.1f} B/count"
-                 if loc else "NO IIO STACK FOUND")
-              + f"; its {len(p['cores'])} cores are on socket(s) {core_sockets}")
+                 if loc else "NO IIO STACK FOUND"))
+        print(f"    {len(p['cores'])} RX cores on socket(s) {core_sockets}")
+        phy = ident["phy_counters"]
+        print("    rx_phy_* (the ingress denominator): "
+              + ("expected" if phy is True else
+                 "NOT exposed by this PMD — M1 is invalid for the whole run (it sums every "
+                 "port into one denominator), and N1 is skipped for this socket only"
+                 if phy is False else
+                 "unknown for this vendor; check ingress[] in a smoke run"))
+
+    llc = llc_geometry()
+    if llc:
+        print(f"LLC             {llc['size_bytes'] / (1 << 20):.2f} MiB per socket, "
+              f"{llc['ways']} ways, {llc['bytes_per_way'] / (1 << 10):.0f} KiB per way")
 
     # Cross-NUMA polling misattributes N2 between sockets, so this is a gate, not a note.
     numa_problems = check_numa_locality(layout)
@@ -782,7 +878,10 @@ def main():
             print(f"  NUMA: {p}")
         if numa_problems:
             print("\nA NUMA-local allocation for this host:\n")
-            print("    " + suggest_allocation(layout).replace("\n", "\n    "))
+            reserve = {args.sampler_core} | worker
+            print("    " + suggest_allocation(layout, reserve).replace("\n", "\n    "))
+            print(f"\n  (keeping cores {sorted(reserve)} free for the sampler and install "
+                  "worker)")
     if args.show_topology:
         return
     if numa_problems and not args.allow_cross_numa:
