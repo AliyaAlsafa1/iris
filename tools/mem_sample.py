@@ -167,17 +167,48 @@ def suggest_allocation(layout):
             continue
         by_node.setdefault(node, []).append(cpu)
 
-    lines = []
+    # Ports sharing a NUMA node compete for its cores, so allocate the most demanding first and
+    # report any shortfall explicitly: when two NICs sit on one node, a NUMA-local allocation
+    # bounds the *total* core count, and the fix is fewer cores per port rather than cores on the
+    # far socket.
+    per_node_demand = {}
+    for port in layout["ports"]:
+        node = device_numa_node(port["device"])
+        per_node_demand.setdefault(node, 0)
+        per_node_demand[node] += len(port["cores"])
+
+    lines, warnings = [], []
+    for node, demand in sorted(per_node_demand.items(), key=lambda kv: (kv[0] is None, kv[0])):
+        supply = len([c for c in by_node.get(node, []) if c not in used])
+        if demand > supply:
+            sharers = [p["device"] for p in layout["ports"]
+                       if device_numa_node(p["device"]) == node]
+            warnings.append(
+                f"NUMA node {node} has {supply} usable physical cores (excluding main_core and "
+                f"hyperthread siblings) but {len(sharers)} port(s) on it ask for {demand} "
+                f"in total: {', '.join(sharers)}.\n"
+                f"    A NUMA-local allocation is therefore only possible with fewer cores per "
+                f"port — roughly {supply // max(1, len(sharers))} each. Spilling the remainder "
+                f"onto the other socket is what the gate rejects, because it misattributes N2.\n"
+                f"    Reducing the core count is a real change to the experiment: it lowers the "
+                f"per-arm throughput ceiling, so cycle results are not comparable across the "
+                f"change either."
+            )
+
     for port in layout["ports"]:
         node = device_numa_node(port["device"])
         want = len(port["cores"])
         pool = [c for c in by_node.get(node, []) if c not in used]
         take = pool[:want]
         used.update(take)
-        note = "" if len(take) == want else f"  # only {len(take)} of {want} available on node {node}"
+        note = ("" if len(take) == want
+                else f"   # SHORT: {len(take)} of {want} requested; see the note above")
         lines.append(f"[[online.ports]]\ndevice = \"{port['device']}\"   # NUMA node {node}\n"
                      f"cores = {take}{note}")
-    return "\n\n".join(lines)
+    out = "\n\n".join(lines)
+    if warnings:
+        out += "\n\n" + "\n\n".join(f"NOTE: {w}" for w in warnings)
+    return out
 
 
 def device_root_bus(pci_addr: str) -> str:

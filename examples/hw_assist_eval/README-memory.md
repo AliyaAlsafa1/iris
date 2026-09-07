@@ -112,15 +112,28 @@ Neither is the cycle counters.
 
 ### Per-socket attribution, not machine-wide
 
-`configs/online-cx5-eval.toml` drives a CX-5 on socket 0 and an E810 on socket 1, with RX cores
-1–17 on socket 0 and 18–24 on socket 1 — so the E810's twelve cores straddle the NUMA boundary
-while its NIC sits on socket 1. Uncore counters are per socket, so everything is attributed per
-socket and each socket is normalised by the ingress of the ports on it. Socket 0 (CX-5,
-NUMA-local, `rx_phy_*` present) is the credible N1; socket 1 is reported alongside and interpreted
-separately. `mbm_local_bytes` against `mbm_total_bytes` exposes the cross-socket share.
+Uncore IMC and IIO counters are socket-scoped, so everything is attributed per socket and each
+socket is normalised by the ingress of the ports on it — never as one machine-wide figure, which
+would mix memory domains.
 
-Note also that ICE does not expose `rx_phy_*`. `ingress_normalisation_valid` is all-or-nothing
-across ports, so check the per-port `ingress[]` array in a smoke run before trusting any N1 figure.
+**The core lists in `configs/online-cx5-eval.toml` are specific to one host and do not transfer.**
+They were written for a 2×18-core box; on a machine with a different core count per socket the same
+list lands the cores somewhere else entirely. `tools/mem_sample.py --show-topology` prints the
+actual layout for the host it runs on, and both it and `paired_ab.py` refuse to sample a
+cross-socket allocation rather than reporting a misattributed N2 — see the gate's rationale in
+`check_numa_locality`. `mbm_local_bytes` against `mbm_total_bytes` quantifies any residual
+cross-socket share.
+
+Two host-dependent facts to establish before trusting N1, rather than assuming:
+
+* **Whether every port exposes `rx_phy_*`.** It is the N1 denominator, and
+  `ingress_normalisation_valid` is all-or-nothing across ports: one PMD that lacks it invalidates
+  the figure for the whole run. mlx5 provides it; ICE does not, so a mixed
+  Mellanox/E810 config is normalisable only on the Mellanox side, whereas an all-Mellanox config
+  is credible on every socket. Check the per-port `ingress[]` array in a smoke run.
+* **Whether both NICs are on the same NUMA node.** If they are, a NUMA-local allocation needs every
+  RX core for both ports drawn from that one node, which bounds the total core count — and the
+  right fix is fewer cores per port, not cores on the far socket.
 
 ## Running it
 
