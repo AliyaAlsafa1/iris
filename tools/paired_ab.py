@@ -99,6 +99,11 @@ def parse_args():
                    help="core to pin the memory sampler to. Required with --mem-sample, and "
                         "must not be an RX core or a --worker-cores core: sampling from a "
                         "measured core steals its cycles and pollutes its LLC occupancy.")
+    p.add_argument("--clamp-tolerance", type=float, default=0.05,
+                   help="reject a socket's memory data when more than this fraction of its "
+                        "io_dram was clamped away because MBM momentarily exceeded IMC "
+                        "(default: 0.05). Occasional clamping is sampling skew and cancels; a "
+                        "large share means the counters genuinely disagree.")
     p.add_argument("--allow-cross-numa", action="store_true",
                    help="proceed even though a port's RX cores are not on the port's NUMA node. "
                         "Only for deliberately measuring the cross-socket case.")
@@ -235,6 +240,12 @@ def run_one(arm, index, args):
 
 # Prefix marking the one gate that is fatal to M1 but not necessarily to the per-socket N1.
 PHY_GATE = "no-rx-phy"
+
+# Prefix marking problems that invalidate the core/IO decomposition (N2) but NOT N1. N1 is
+# imc_bytes over rx_phy_bytes and involves no RDT counter, so an MBM/IMC disagreement cannot
+# touch it. Excluding such a run outright would discard the headline metric to protect a
+# secondary one.
+DECOMP_GATE = "decomposition"
 
 
 def phy_only_failures(problems):
@@ -381,7 +392,7 @@ def load_budget_rows(out_dir, arm):
 MEM_SUM_FIELDS = ("imc_bytes", "imc_read_bytes", "imc_write_bytes", "iio_in_bytes",
                   "mbm_total_bytes", "mbm_local_bytes", "mbm_remote_bytes",
                   "mbm_other_local_bytes", "core_dram_bytes", "io_dram_bytes",
-                  "io_dram_clamped")
+                  "io_dram_clamped", "io_dram_deficit_bytes")
 
 # Occupancies, not deltas: these belong nowhere near MEM_SUM_FIELDS. Adding a gauge across
 # intervals produces a number that grows with run length and means nothing at all.
@@ -429,6 +440,10 @@ def load_mem_totals(out_dir, arm, index):
     out = {}
     for socket, vals in totals.items():
         d = dict(vals)
+        # Undo the per-interval clamp: summing clamped values keeps every positive excursion and
+        # discards every negative one, so the total overstates IO traffic by exactly the deficit.
+        d["io_dram_bytes"] = max(0.0, d.get("io_dram_bytes", 0.0)
+                                 - d.get("io_dram_deficit_bytes", 0.0))
         d["intervals"] = intervals[socket]
         for f in MEM_GAUGE_FIELDS:
             seen = gauges[socket][f]
@@ -457,7 +472,7 @@ def ingress_by_socket(report):
     return dict(out)
 
 
-def check_mem_run(report, mem):
+def check_mem_run(report, mem, clamp_tolerance=0.05):
     """Hard validity gates for the memory side, in the spirit of `check_run`.
 
     Each of these, if ignored, yields a number that looks plausible and is wrong.
@@ -501,12 +516,29 @@ def check_mem_run(report, mem):
                     f"socket {socket}: PCIe inbound / rx_phy_bytes = {ratio:.2f}, outside [0.5, 3]"
                     " — likely the wrong IIO stack, so its byte attribution cannot be trusted"
                 )
-        # io_dram was clamped at zero on some intervals: MBM claimed more local traffic than
-        # the IMC saw, so the two counters disagree and the core/IO split is not trustworthy.
-        if vals.get("io_dram_clamped", 0) > 0:
+        # io_dram clamping: MBM briefly exceeded IMC on some intervals. Occasional clamping is
+        # expected — the two counters are not read atomically, so a burst can land inside one
+        # sampling window and outside the other, and the error cancels across intervals. What
+        # matters is not how often it happened but how much was discarded, since clamping keeps
+        # positive excursions and drops negative ones, biasing io_dram upward. Gate on the
+        # magnitude; `io_dram_bytes` below is already net of it.
+        clamped_n = int(vals.get("io_dram_clamped", 0))
+        deficit = vals.get("io_dram_deficit_bytes", 0.0)
+        gross_io = vals.get("io_dram_bytes", 0.0) + deficit
+        if clamped_n and not deficit:
+            # Pre-dates the deficit column, so the bias cannot be sized or corrected.
             problems.append(
-                f"socket {socket}: io_dram clamped on {int(vals['io_dram_clamped'])} of "
-                f"{vals['intervals']} intervals — MBM and IMC disagree, so IO% is unreliable"
+                f"{DECOMP_GATE}: socket {socket}: io_dram clamped on {clamped_n} of "
+                f"{vals['intervals']} "
+                "intervals and this CSV predates io_dram_deficit_bytes, so the upward bias in "
+                "IO% cannot be measured or removed — re-collect to size it"
+            )
+        elif gross_io > 0 and deficit / gross_io > clamp_tolerance:
+            problems.append(
+                f"{DECOMP_GATE}: socket {socket}: {100 * deficit / gross_io:.1f}% of io_dram "
+                "was clamped away "
+                f"(on {clamped_n} of {vals['intervals']} intervals) — MBM and IMC disagree by "
+                "too much for the core/IO split to be trustworthy"
             )
         # RX cores reaching the other socket's memory. Should be ~0 with a NUMA-local config.
         if vals.get("mbm_total_bytes", 0) > 0:
@@ -541,21 +573,31 @@ def analyze_memory(usable, args):
     mem_by_run = {}
     for r, _ in usable:
         mem = load_mem_totals(args.out_dir, r["_arm"], r["_index"])
-        problems = check_mem_run(r, mem)
+        problems = check_mem_run(r, mem, args.clamp_tolerance)
         mem_by_run[(r["_arm"], r["_index"])] = (mem, problems)
 
-    have = [k for k, (m, p) in mem_by_run.items() if m and not p]
+    def fatal(problems):
+        return [x for x in problems if not x.startswith(DECOMP_GATE)]
+
+    have = [k for k, (m, p) in mem_by_run.items() if m and not fatal(p)]
     print("\n" + "=" * 78)
     print("N1-N3  MEMORY SYSTEM")
     print("=" * 78)
     if not have:
         print("no usable memory samples. Reasons per run:")
         for (arm, idx), (_, problems) in sorted(mem_by_run.items()):
-            print(f"  arm {arm} run {idx}: {'; '.join(problems) or 'ok'}")
+            print(f"  arm {arm} run {idx}: {'; '.join(fatal(problems)) or 'ok'}")
         return
     for (arm, idx), (_, problems) in sorted(mem_by_run.items()):
-        if problems:
-            print(f"  REJECT memory for arm {arm} run {idx}: {'; '.join(problems)}")
+        hard = fatal(problems)
+        if hard:
+            print(f"  REJECT memory for arm {arm} run {idx}: {'; '.join(hard)}")
+        # Decomposition-only problems leave N1 intact, so the run is still used; the core/IO
+        # split from it is what should be discounted.
+        for soft in (x for x in problems if x.startswith(DECOMP_GATE)):
+            print(f"  WARN  arm {arm} run {idx}: {soft[len(DECOMP_GATE) + 2:]}")
+            print("        N1 is unaffected (it uses no RDT counter); treat IO% and core/phy "
+                  "from this run with caution.")
 
     baseline = load_mem_baseline(args.mem_baseline)
     if baseline:

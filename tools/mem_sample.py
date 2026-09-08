@@ -859,6 +859,8 @@ def csv_fields(port_devices):
         "io_dram_fraction",
         # 1 when MBM claimed more local traffic than the IMC saw, i.e. the counters disagree.
         "io_dram_clamped",
+        # How much io_dram was clamped away, so the run total can be corrected and the bias sized.
+        "io_dram_deficit_bytes",
     ]
 
 
@@ -1103,6 +1105,15 @@ def main():
                         # the two counters disagree and the split is not trustworthy. Clamping
                         # silently would hide that, so record it.
                         rec["io_dram_clamped"] = 1 if raw_io < 0 else 0
+                        # The magnitude clamped away, not just that it happened. IMC and MBM are
+                        # not read atomically — perf emits its interval row and resctrl is read a
+                        # moment later — so a burst can fall inside one window and outside the
+                        # other, making MBM briefly exceed IMC. That phase error cancels across
+                        # intervals, but clamping keeps the positive excursions and discards the
+                        # negative ones, biasing io_dram upward. Recording the deficit lets the
+                        # run-level total subtract it back out and lets the gate judge the size of
+                        # the effect rather than merely its occurrence.
+                        rec["io_dram_deficit_bytes"] = -raw_io if raw_io < 0 else 0
                         rec["core_dram_bytes"] = core
                         rec["io_dram_bytes"] = io
                         rec["io_dram_fraction"] = (
