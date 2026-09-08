@@ -116,9 +116,13 @@ static UNPACED_TEARDOWN_DELETES: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NicLatencyStats {
     /// True while operations are being paced. False before init, under `enabled = false`, and
-    /// after [`suspend`].
+    /// after [`suspend`] — so it is false in any end-of-run report. Use `armed` there.
     pub active: bool,
-    /// True once a trace is loaded, whether or not pacing is active.
+    /// True if pacing was ever armed, including after [`suspend`]. This, not `active`, is what an
+    /// end-of-run report wants: teardown suspends pacing before any report runs, so `active` is
+    /// always false by then and would label every emulated run as "off".
+    pub armed: bool,
+    /// True once a trace is loaded, whether or not pacing was ever armed.
     pub configured: bool,
     pub trace_ops: usize,
     pub scale: f64,
@@ -278,7 +282,7 @@ pub fn charge(phase: Phase) {
 /// Snapshot of the emulation's counters. All zero, and `configured` false, if no trace loaded.
 pub fn nic_latency_cost() -> NicLatencyStats {
     match PACER.get() {
-        Some(p) => p.stats(STATE.load(Ordering::Acquire) == STATE_ACTIVE),
+        Some(p) => p.stats(STATE.load(Ordering::Acquire)),
         None => NicLatencyStats::default(),
     }
 }
@@ -477,10 +481,12 @@ impl Pacer {
         }
     }
 
-    fn stats(&self, active: bool) -> NicLatencyStats {
+    fn stats(&self, state: u8) -> NicLatencyStats {
         let c = &self.counters;
         NicLatencyStats {
-            active,
+            active: state == STATE_ACTIVE,
+            // `suspend` only fires from `ACTIVE`, so `SUSPENDED` means pacing did run.
+            armed: state == STATE_ACTIVE || state == STATE_SUSPENDED,
             // A pacer exists, so a trace was loaded.
             configured: true,
             trace_ops: self.ops.len(),
@@ -753,12 +759,14 @@ op_id,phase,us
     #[test]
     fn state_machine_and_teardown_exemption() {
         assert!(!nic_latency_cost().active);
+        assert!(!nic_latency_cost().armed);
         assert!(!nic_latency_cost().configured);
 
         // Zero scale, so the lifecycle costs no real time.
         let p = Pacer::from_reader(SAMPLE.as_bytes(), GHZ, 0.0, 0, 0).unwrap();
         install(p, true).unwrap();
         assert!(nic_latency_cost().active);
+        assert!(nic_latency_cost().armed);
         assert!(nic_latency_cost().configured);
 
         charge(Phase::Delete);
@@ -771,6 +779,8 @@ op_id,phase,us
         // Teardown: nothing is paced from here on, but skips are counted.
         suspend();
         assert!(!nic_latency_cost().active);
+        // Still `armed`: a report runs after this point and must not call the run "off".
+        assert!(nic_latency_cost().armed);
         for _ in 0..3 {
             charge(Phase::Delete);
         }
@@ -782,8 +792,9 @@ op_id,phase,us
         assert_eq!(stats.unpaced_teardown_inserts, 1);
         assert!(stats.configured, "state still records that a trace loaded");
 
-        // Suspension is permanent.
+        // Suspension is permanent, and still distinguishable from never having been armed.
         suspend();
         assert!(!nic_latency_cost().active);
+        assert!(nic_latency_cost().armed);
     }
 }

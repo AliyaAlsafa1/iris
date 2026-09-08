@@ -511,9 +511,10 @@ fn print_hw_arm_report(run_elapsed: Duration) {
         println!("NIC latency emulation: not configured");
         return;
     }
+    // `armed`, not `active`: teardown suspends pacing before this runs.
     println!(
         "NIC latency emulation: {} ({} ops in trace, scale {})",
-        if nl.active { "active" } else { "off" },
+        if nl.armed { "armed" } else { "off (enabled = false)" },
         nl.trace_ops,
         nl.scale
     );
@@ -540,4 +541,24 @@ fn print_hw_arm_report(run_elapsed: Duration) {
         "  worker busy fraction (1 core): {:.4}",
         nl.worker_busy_fraction(wall_cycles, 1)
     );
+
+    // The teardown exemption is only sound while teardown is a small tail of the run. A saturated
+    // worker flushes its whole queued backlog at shutdown, and those installs run at native speed,
+    // so the majority of the run's rule installs can end up unemulated. That invalidates the run
+    // rather than merely degrading it.
+    let unpaced = nl.unpaced_teardown_inserts + nl.unpaced_teardown_deletes;
+    let paced = nl.paced_inserts + nl.paced_deletes;
+    if unpaced > paced {
+        log::warn!(
+            "{unpaced} operations ran unpaced at teardown against {paced} paced during the run:              most of this run's rule installs were not emulated, because the install worker              flushed a large backlog at shutdown. Reduce the offered connection rate or add              --worker-cores until the backlog is small."
+        );
+    }
+
+    // A trace this non-stationary only replays its own distribution if enough of it is consumed.
+    if nl.trace_wraps == 0 && paced < nl.trace_ops as u64 {
+        log::warn!(
+            "only {paced} of {} trace ops were consumed, so the replayed latencies are a              contiguous slice of the trace rather than its distribution -- compare the means above              against that prefix, not against the whole-trace means.",
+            nl.trace_ops
+        );
+    }
 }
