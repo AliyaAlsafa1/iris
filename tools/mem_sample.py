@@ -464,10 +464,21 @@ class ResctrlGroups:
         return problems
 
     def read(self):
-        """Read every group's monitoring files. Returns {(socket, domain, field): value}."""
+        """Read every group's monitoring files. Returns {(group, domain, field): value}.
+
+        `group` is the socket number for an RX-core group, or the string "root" for the default
+        group — which holds every CPU *not* moved into one of ours: the main lcore, the install
+        worker, the sampler, kernel threads and any other process.
+
+        Reading root is what makes the IO decomposition honest. `imc - mbm(RX cores)` attributes
+        all of that other core traffic to DDIO, because it is core-originated but not originated
+        by a *monitored* core. Subtracting root as well leaves only traffic that no core caused.
+        """
         out = {}
-        for socket, g in self.groups.items():
-            for dom in sorted((g["path"] / "mon_data").glob("mon_L3_*")):
+        sources = list(self.groups.items()) + [("root", {"path": RESCTRL})]
+        for key, g in sources:
+            mon_data = g["path"] / "mon_data"
+            for dom in sorted(mon_data.glob("mon_L3_*")):
                 domain = int(dom.name.rsplit("_", 1)[1])
                 for field in ("llc_occupancy", "mbm_total_bytes", "mbm_local_bytes"):
                     try:
@@ -475,7 +486,7 @@ class ResctrlGroups:
                     except OSError:
                         continue
                     # "Unavailable" appears when no RMID is assigned yet.
-                    out[(socket, domain, field)] = int(raw) if raw.isdigit() else None
+                    out[(key, domain, field)] = int(raw) if raw.isdigit() else None
         return out
 
 
@@ -810,12 +821,19 @@ def csv_fields(port_devices):
         # RDT: core-originated DRAM traffic and LLC occupancy for this socket's RX cores.
         "mbm_total_bytes",
         "mbm_local_bytes",
+        # RX-core traffic to the other socket's memory. ~0 under a NUMA-local allocation.
+        "mbm_remote_bytes",
+        # Every other CPU on the box: main lcore, install worker, sampler, kernel, other procs.
+        # Subtracted alongside the RX cores so it is not misattributed to DDIO.
+        "mbm_other_local_bytes",
         "llc_occupancy_bytes",
         # The decomposition. IO-originated = everything the memory controller saw that the cores
         # did not originate; on Skylake-SP that is DDIO/IIO traffic, which carries no RMID.
         "core_dram_bytes",
         "io_dram_bytes",
         "io_dram_fraction",
+        # 1 when MBM claimed more local traffic than the IMC saw, i.e. the counters disagree.
+        "io_dram_clamped",
     ]
 
 
@@ -998,29 +1016,51 @@ def main():
                             rec[f"iio_in_bytes::{d}"] = int(vals.get(f"iio_in_bytes::{d}", 0))
 
                         # RDT deltas for this socket's group, summed over its L3 domains.
-                        mbm_total = mbm_local = 0
+                        # Deltas keyed by (group, field), restricted to the L3 domain that matches
+                        # this socket.
+                        #
+                        # `mbm_local_bytes`, not `mbm_total_bytes`, is what may be subtracted from
+                        # imc_bytes: total includes traffic those cores sent to the *other*
+                        # socket's memory, which never crossed this socket's controllers.
+                        # Subtracting it over-subtracts and inflates the IO share.
+                        d = {}
                         occ = 0
-                        for (s, dom, field), v in rdt.items():
-                            if s != socket or v is None:
+                        for (grp, dom, field), v in rdt.items():
+                            if v is None or dom != socket:
                                 continue
-                            p = prev_rdt.get((s, dom, field))
                             if field == "llc_occupancy":
-                                occ += v
-                            elif p is not None:
-                                d = v - p
-                                if d < 0:
-                                    d = 0  # counter wrap or RMID reassignment
-                                if field == "mbm_total_bytes":
-                                    mbm_total += d
-                                else:
-                                    mbm_local += d
-                        rec["mbm_total_bytes"] = mbm_total
-                        rec["mbm_local_bytes"] = mbm_local
+                                if grp == socket:      # RX cores' own occupancy only
+                                    occ += v
+                                continue
+                            p = prev_rdt.get((grp, dom, field))
+                            if p is None:
+                                continue
+                            delta = max(0, v - p)      # counter wrap or RMID reassignment
+                            d[(grp, field)] = d.get((grp, field), 0) + delta
+
+                        rx_local = d.get((socket, "mbm_local_bytes"), 0)
+                        rx_total = d.get((socket, "mbm_total_bytes"), 0)
+                        other_local = d.get(("root", "mbm_local_bytes"), 0)
+
+                        rec["mbm_local_bytes"] = rx_local
+                        rec["mbm_total_bytes"] = rx_total
+                        # RX-core traffic that went to the other socket's memory. Should be ~0
+                        # under a NUMA-local allocation; a large value means the gate was bypassed
+                        # and this socket's decomposition cannot be trusted.
+                        rec["mbm_remote_bytes"] = max(0, rx_total - rx_local)
+                        rec["mbm_other_local_bytes"] = other_local
                         rec["llc_occupancy_bytes"] = occ
 
-                        # The headline decomposition.
-                        core = mbm_total
-                        io = max(0, rec["imc_bytes"] - core)
+                        # The headline decomposition. Core-originated is the RX cores plus every
+                        # other CPU on the box; whatever the memory controller saw beyond that had
+                        # no core behind it, which on this microarchitecture means DDIO/IIO.
+                        core = rx_local + other_local
+                        raw_io = rec["imc_bytes"] - core
+                        io = max(0, raw_io)
+                        # A negative value means MBM claimed more local traffic than the IMC saw:
+                        # the two counters disagree and the split is not trustworthy. Clamping
+                        # silently would hide that, so record it.
+                        rec["io_dram_clamped"] = 1 if raw_io < 0 else 0
                         rec["core_dram_bytes"] = core
                         rec["io_dram_bytes"] = io
                         rec["io_dram_fraction"] = (

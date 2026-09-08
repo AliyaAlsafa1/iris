@@ -379,7 +379,9 @@ def load_budget_rows(out_dir, arm):
 
 
 MEM_SUM_FIELDS = ("imc_bytes", "imc_read_bytes", "imc_write_bytes", "iio_in_bytes",
-                  "mbm_total_bytes", "mbm_local_bytes", "core_dram_bytes", "io_dram_bytes")
+                  "mbm_total_bytes", "mbm_local_bytes", "mbm_remote_bytes",
+                  "mbm_other_local_bytes", "core_dram_bytes", "io_dram_bytes",
+                  "io_dram_clamped")
 
 
 def load_mem_totals(out_dir, arm, index):
@@ -481,6 +483,21 @@ def check_mem_run(report, mem):
                 problems.append(
                     f"socket {socket}: PCIe inbound / rx_phy_bytes = {ratio:.2f}, outside [0.5, 3]"
                     " — likely the wrong IIO stack, so its byte attribution cannot be trusted"
+                )
+        # io_dram was clamped at zero on some intervals: MBM claimed more local traffic than
+        # the IMC saw, so the two counters disagree and the core/IO split is not trustworthy.
+        if vals.get("io_dram_clamped", 0) > 0:
+            problems.append(
+                f"socket {socket}: io_dram clamped on {int(vals['io_dram_clamped'])} of "
+                f"{vals['intervals']} intervals — MBM and IMC disagree, so IO% is unreliable"
+            )
+        # RX cores reaching the other socket's memory. Should be ~0 with a NUMA-local config.
+        if vals.get("mbm_total_bytes", 0) > 0:
+            remote_share = vals.get("mbm_remote_bytes", 0) / vals["mbm_total_bytes"]
+            if remote_share > 0.05:
+                problems.append(
+                    f"socket {socket}: {100 * remote_share:.0f}% of RX-core memory traffic went "
+                    "to the other socket, so this socket's core/IO split is mixed across domains"
                 )
         if vals["llc_occupancy_bytes_mean"] <= 0:
             problems.append(f"socket {socket}: LLC occupancy read zero — the resctrl monitoring "
