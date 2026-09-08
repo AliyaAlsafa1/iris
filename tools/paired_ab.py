@@ -396,7 +396,8 @@ MEM_SUM_FIELDS = ("imc_bytes", "imc_read_bytes", "imc_write_bytes", "iio_in_byte
 
 # Occupancies, not deltas: these belong nowhere near MEM_SUM_FIELDS. Adding a gauge across
 # intervals produces a number that grows with run length and means nothing at all.
-MEM_GAUGE_FIELDS = ("llc_occupancy_bytes", "llc_occupancy_all_bytes", "llc_ddio_bytes",
+MEM_GAUGE_FIELDS = ("llc_occupancy_bytes", "llc_occupancy_root_bytes",
+                    "llc_occupancy_all_bytes", "llc_size_bytes", "llc_ddio_bytes",
                     "llc_ddio_fraction")
 
 
@@ -611,8 +612,9 @@ def analyze_memory(usable, args):
     # ---- N2 decomposition, per arm per socket ----
     print("\n--- N2  where the memory traffic comes from (means over usable runs) ---")
     print(f"{'arm':<4}{'sock':>5}{'n':>3}{'DRAM/phy':>10}{'rd/phy':>8}{'wr/phy':>8}"
-          f"{'PCIe/phy':>10}{'wr-PCIe':>9}{'core/phy':>10}{'IO/phy':>8}{'IO%':>7}{'LLC MiB':>9}"
-          f"{'DDIO MiB':>10}{'DRAM GB':>10}")
+          f"{'PCIe/phy':>10}{'wr-PCIe':>9}{'RXcore/phy':>12}{'othcore/phy':>13}"
+          f"{'IO/phy':>8}{'IO%':>7}"
+          f"{'DRAM GB':>10}")
     per_arm_socket = defaultdict(list)
     for (arm, idx) in have:
         mem, _ = mem_by_run[(arm, idx)]
@@ -639,26 +641,66 @@ def analyze_memory(usable, args):
         def per_phy(v):
             return v / phy_mean if phy_mean else 0.0
         rd, wr = mean("imc_read_bytes"), mean("imc_write_bytes")
+        # Split rather than one "core" column: core_dram_bytes folds in the resctrl root group so
+        # that other CPUs are not misattributed to DDIO, so a single column labelled RX cores
+        # would be false. These three sum to DRAM/phy by construction.
+        rx_core, oth_core = mean("mbm_local_bytes"), mean("mbm_other_local_bytes")
         # wr/phy minus PCIe/phy is the write traffic NOT explained by DMA'd payload being
         # evicted once. It is what separates "we are writing packet bodies" from "we are writing
         # something else we never read": payload writes track DMA, per-packet metadata and
         # application writes do not. Expect a small, arm-stable offset.
         excess = per_phy(wr) - per_phy(pcie)
-        ddio = gauge_mean("llc_ddio_bytes_mean")
-        ddio_col = f"{'-':>10}" if ddio is None else f"{ddio / (1 << 20):>10.2f}"
         print(f"{arm:<4}{socket:>5}{len(entries):>3}{per_phy(imc):>10.3f}"
               f"{per_phy(rd):>8.3f}{per_phy(wr):>8.3f}{per_phy(pcie):>10.2f}"
-              f"{excess:>+9.3f}{per_phy(core):>10.3f}{per_phy(io):>8.3f}"
-              f"{100 * (io / imc if imc else 0):>6.1f}%"
-              f"{mean('llc_occupancy_bytes_mean') / (1 << 20):>9.2f}{ddio_col}"
-              f"{imc / 1e9:>10.2f}")
-    print("  core = RDT MBM mbm_local, RX cores PLUS every other CPU (resctrl root group), so")
-    print("  other processes are not misattributed. IO = IMC minus that: traffic the memory")
-    print("  controller saw with no core behind it, i.e. DDIO/IIO, which carries no RMID here.")
+              f"{excess:>+9.3f}{per_phy(rx_core):>12.3f}{per_phy(oth_core):>13.3f}"
+              f"{per_phy(io):>8.3f}"
+              f"{100 * (io / imc if imc else 0):>6.1f}%{imc / 1e9:>10.2f}")
+    print("  RXcore/phy and othcore/phy are RDT MBM mbm_local for the RX cores and for every")
+    print("  other CPU (resctrl root group). IO = IMC minus both: traffic the memory controller")
+    print("  saw with no core behind it, i.e. DDIO/IIO, which carries no RMID here. The three")
+    print("  sum to DRAM/phy. Other CPUs are subtracted so they are not misattributed to DDIO.")
     print("  IO/phy is DRAM traffic packets caused per ingress byte — the load-normalised I/O")
     print("  figure, and the one that moves with the mechanism. IO% is the same quantity over")
     print("  imc_bytes rather than ingress, so it answers 'packets or application?' but is a")
     print("  composition share: it barely shifts between arms even when IO/phy falls sharply.")
+
+    # ---- N3 LLC attribution ----
+    #
+    # Separate from N2 because it answers a different question. N2 is about *traffic*: who moved
+    # bytes to DRAM. This is about *capacity*: who is holding the cache. A workload can move few
+    # bytes while occupying most of the LLC, and vice versa.
+    #
+    # Note "core" means the same thing here as in N2 — RX cores plus every other CPU — which it
+    # did not before: the old single LLC column showed the RX cores alone, so the two halves of
+    # the table quietly used different definitions.
+    print("\n--- N3  LLC attribution: who is holding the cache (means over usable runs) ---")
+    print(f"{'arm':<4}{'sock':>5}{'RX cores':>12}{'other cores':>13}{'I/O (DDIO)':>13}"
+          f"{'accounted':>11}{'LLC size':>10}")
+    for (arm, socket) in sorted(per_arm_socket):
+        entries = per_arm_socket[(arm, socket)]
+
+        def g(field):
+            vals = [v[field] for v, _ in entries if v.get(field) is not None]
+            return statistics.fmean(vals) if vals else None
+
+        rx = g("llc_occupancy_bytes_mean")
+        root = g("llc_occupancy_root_bytes_mean")
+        ddio = g("llc_ddio_bytes_mean")
+        size = g("llc_size_bytes_mean")
+
+        def mib(v, w):
+            return f"{v / (1 << 20):>{w}.2f}" if v is not None else f"{'-':>{w}}"
+
+        # Only meaningful when all three shares are present: a partial sum would look like a
+        # shortfall against the cache size when it is really a missing column.
+        parts = (rx, root, ddio)
+        acc = sum(parts) if all(v is not None for v in parts) else None
+        print(f"{arm:<4}{socket:>5}{mib(rx, 12)}{mib(root, 13)}{mib(ddio, 13)}"
+              f"{mib(acc, 11)}{mib(size, 10)}")
+    print("  RX cores and other cores are CMT per RMID; I/O is the cache size minus both, since")
+    print("  DDIO fills carry no RMID. A '-' means the sampler predates these columns.")
+    print("  Caveats: free lines carry no RMID either, so I/O is overstated on a cache that is")
+    print("  not full; resctrl drains recycled RMIDs lazily; CMT is sampled instantaneous state.")
     print("  DRAM GB is load-dependent and NOT comparable across arms; the /phy columns are.")
     print("  PCIe/phy should sit near 1: far from it means the wrong IIO stack was read.")
     print("  wr-PCIe is write traffic beyond DMA'd payload evicted once — per-packet metadata and")

@@ -849,7 +849,11 @@ def csv_fields(port_devices):
         #   the monitoring groups are created the sum reads low and the DDIO figure reads high.
         # * CMT is instantaneous state, sampled once per interval. A burst that fills and drains
         #   the LLC between two samples leaves no trace here, unlike the MBM/IMC byte counters.
+        "llc_occupancy_root_bytes",
         "llc_occupancy_all_bytes",
+        # Constant per host, but recorded per row so a CSV can be checked without knowing the
+        # machine it came from: rx + root + ddio should equal it.
+        "llc_size_bytes",
         "llc_ddio_bytes",
         "llc_ddio_fraction",
         # The decomposition. IO-originated = everything the memory controller saw that the cores
@@ -1085,7 +1089,12 @@ def main():
                         rec["mbm_remote_bytes"] = max(0, rx_total - rx_local)
                         rec["mbm_other_local_bytes"] = other_local
                         rec["llc_occupancy_bytes"] = occ
+                        # Root's share on its own, not just folded into the sum, so the three-way
+                        # split (RX cores / other cores / I/O) is auditable against the cache size
+                        # rather than recoverable only by subtraction.
+                        rec["llc_occupancy_root_bytes"] = occ_all - occ
                         rec["llc_occupancy_all_bytes"] = occ_all
+                        rec["llc_size_bytes"] = llc_size if llc_size else ""
                         # Clamped for the same reason io_dram is: a sum over RMIDs that exceeds the
                         # cache size means CMT and the reported geometry disagree, and a negative
                         # "LLC held by DDIO" is not a quantity.
