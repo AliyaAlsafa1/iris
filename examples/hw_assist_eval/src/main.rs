@@ -54,8 +54,8 @@ use iris_compiler::*;
 use iris_core::config::load_config;
 use iris_core::dpdk::{rte_flow, rte_flow_action_handle};
 use iris_core::filter::flow_drop::{
-    install_drop_flow, query_resident_flow, rule_control_cost, uninstall_flow, DISCARDED_BYTES,
-    DISCARDED_PACKETS,
+    install_drop_flow, query_resident_flow, rule_control_cost, uninstall_flow, RuleControlCost,
+    DISCARDED_BYTES, DISCARDED_PACKETS,
 };
 use iris_core::multicore::{ChannelDispatcher, ChannelMode, SharedWorkerThreadSpawner};
 use iris_core::port::{ingress_counters, IngressCounters, PortId};
@@ -90,6 +90,56 @@ static SHED_CONNS: AtomicU64 = AtomicU64::new(0);
 static OFFLOAD_REFUSED: AtomicU64 = AtomicU64::new(0);
 /// Rules evicted to make room, under `--table-full-policy evict`.
 static RULE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
+// Cycle buckets for the rule-management core, measured on the worker thread itself. These cover
+// the part of the install path that lives in this binary; the PMD calls underneath are timed in
+// `iris_core::filter::flow_drop`, and the loop around it in `iris_core::stats::WorkerBudget`.
+// Together the three layers account for the worker core's whole busy time, and the report checks
+// that they reconcile rather than assuming they do.
+//
+// Unlike the RX budget these are exact, not sampled: the unit of work is an `rte_flow_create` of
+// order 12 us, against which an `rte_rdtsc` is under 0.1%. Sampling exists on the datapath because
+// there an empty poll is only a few reads long.
+/// The install path's cycle buckets.
+///
+/// Grouped in one struct rather than left as free statics only for readability; sharing a cache
+/// line was tried as a way to cut the attribution's own cost and measurably did not help, so
+/// nothing here depends on their layout.
+struct InstallBuckets {
+    /// Handler entry up to the first lock attempt: three `OnceLock` reads and the `RULES` deref.
+    /// Nominally a few dozen cycles, and more in practice, since a parked core takes them cold.
+    preamble: AtomicU64,
+    /// Waiting for the `RULES` mutex. The lock is deliberately never held across an `rte_flow`
+    /// call, so with one worker core this is pure uncontended-acquire cost; with several it is the
+    /// figure that says whether more worker cores buy install throughput or just contention.
+    lock_wait: AtomicU64,
+    /// Under the lock, on the dedup set and the FIFO.
+    table: AtomicU64,
+    /// Inside `install_drop_flow`: every PMD call for one rule set, plus the pattern and action
+    /// marshalling around them. Timed as a whole span so that subtracting the individually timed
+    /// PMD calls leaves the glue as a residual — nothing can hide in a span never opened.
+    install_span: AtomicU64,
+    /// Inside `uninstall_flow` on the eviction path. Excludes the shutdown drain, which runs on
+    /// the main thread and is not a steady-state cost.
+    evict_span: AtomicU64,
+}
+
+static INSTALL_BUCKETS: InstallBuckets = InstallBuckets {
+    preamble: AtomicU64::new(0),
+    lock_wait: AtomicU64::new(0),
+    table: AtomicU64::new(0),
+    install_span: AtomicU64::new(0),
+    evict_span: AtomicU64::new(0),
+};
+/// Offload requests for a tuple already resident or already installing. These reach the worker,
+/// take the lock and return, so they cost utilisation while installing nothing.
+static DEDUP_HITS: AtomicU64 = AtomicU64::new(0);
+/// Offload requests the datapath could not enqueue because the worker's channel was full.
+///
+/// Distinct from `OFFLOAD_REFUSED`, which is the rule table hitting `--max-rules`. This one means
+/// the *worker* could not keep up, and without it a saturated worker is indistinguishable from a
+/// low connection arrival rate.
+static DISPATCH_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(ArgEnum, Copy, Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -163,9 +213,63 @@ enum FlowEvent {
     DropFlow { tuple: FiveTuple },
 }
 
+/// What the reservation step decided. Split out from [`install_hw_drop`] so the work done under
+/// the lock has exactly one exit, and the caller can therefore close its cycle bucket on every
+/// path — an early `return` from inside the critical section would drop those cycles into the
+/// residual instead.
+enum Reservation {
+    /// Already resident, or an install for it is already in flight.
+    Duplicate,
+    /// The table is at `--max-rules` and the policy is to decline.
+    Refused,
+    /// Reserved; install, evicting `victim` first if there is one.
+    Proceed { victim: Option<FlowEntry> },
+}
+
+/// Decide and reserve, doing no `rte_flow` work: the caller holds the lock across this and a
+/// create or destroy is on the order of 12 us, which every other worker would serialise behind.
+fn reserve(
+    table: &mut RuleTable,
+    tuple: &FiveTuple,
+    cap: usize,
+    policy: TableFullPolicy,
+) -> Reservation {
+    if table.resident.contains(tuple) {
+        return Reservation::Duplicate;
+    }
+
+    let mut victim = None;
+    if cap != 0 && table.resident.len() >= cap {
+        match policy {
+            TableFullPolicy::Refuse => return Reservation::Refused,
+            TableFullPolicy::Evict => match table.fifo.pop_front() {
+                // Release the victim's reservation along with its rule, so that tuple can be
+                // offered again later.
+                Some(old) => {
+                    table.resident.remove(&old.tuple);
+                    victim = Some(old);
+                }
+                // Nothing installed yet to evict: every resident tuple is an install still in
+                // flight. Refuse rather than let the table exceed the cap.
+                None => return Reservation::Refused,
+            },
+        }
+    }
+
+    // Reserve before installing so a concurrent worker cannot double-install.
+    table.resident.insert(*tuple);
+    Reservation::Proceed { victim }
+}
+
 /// Worker-side install. Deduped, and bounded at `--max-rules` so a run cannot silently become a
 /// rule-table capacity experiment. `--table-full-policy` decides what happens at the bound.
+///
+/// Runs on the rule-management core, and every cycle of it is attributed: the buckets here plus
+/// the PMD counters in `iris_core::filter::flow_drop` should account for
+/// `WorkerBudget::handler`, which is measured independently from inside the worker loop.
 fn install_hw_drop(tuple: &FiveTuple) {
+    let t_entry = unsafe { iris_core::rte_rdtsc() };
+
     let ports = match PORT_IDS.get() {
         Some(p) => p,
         None => {
@@ -177,41 +281,37 @@ fn install_hw_drop(tuple: &FiveTuple) {
     let cap = *MAX_RULES.get().unwrap_or(&0);
     let policy = *TABLE_FULL_POLICY.get().unwrap_or(&TableFullPolicy::Refuse);
 
-    // Decide and reserve under the lock; do no rte_flow work while holding it. A create or a
-    // destroy is on the order of 12 us, and every other worker would serialise behind it.
-    let victim = {
+    let reservation = {
+        let t_enter = unsafe { iris_core::rte_rdtsc() };
         let mut table = RULES.lock().unwrap();
-        if table.resident.contains(tuple) {
+        let t_locked = unsafe { iris_core::rte_rdtsc() };
+        let reservation = reserve(&mut table, tuple, cap, policy);
+        drop(table);
+        let t_done = unsafe { iris_core::rte_rdtsc() };
+
+        // All three updates after the last read, so that no bucket absorbs another's write.
+        INSTALL_BUCKETS
+            .preamble
+            .fetch_add(t_enter.wrapping_sub(t_entry), Ordering::Relaxed);
+        INSTALL_BUCKETS
+            .lock_wait
+            .fetch_add(t_locked.wrapping_sub(t_enter), Ordering::Relaxed);
+        INSTALL_BUCKETS
+            .table
+            .fetch_add(t_done.wrapping_sub(t_locked), Ordering::Relaxed);
+        reservation
+    };
+
+    let victim = match reservation {
+        Reservation::Duplicate => {
+            DEDUP_HITS.fetch_add(1, Ordering::Relaxed);
             return;
         }
-
-        let mut victim = None;
-        if cap != 0 && table.resident.len() >= cap {
-            match policy {
-                TableFullPolicy::Refuse => {
-                    OFFLOAD_REFUSED.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-                TableFullPolicy::Evict => match table.fifo.pop_front() {
-                    // Release the victim's reservation along with its rule, so that tuple can be
-                    // offered again later.
-                    Some(old) => {
-                        table.resident.remove(&old.tuple);
-                        victim = Some(old);
-                    }
-                    // Nothing installed yet to evict: every resident tuple is an install still in
-                    // flight. Refuse rather than let the table exceed the cap.
-                    None => {
-                        OFFLOAD_REFUSED.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
-                },
-            }
+        Reservation::Refused => {
+            OFFLOAD_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return;
         }
-
-        // Reserve before installing so a concurrent worker cannot double-install.
-        table.resident.insert(*tuple);
-        victim
+        Reservation::Proceed { victim } => victim,
     };
 
     // Evict before installing rather than after: against a real table limit the install would
@@ -222,7 +322,15 @@ fn install_hw_drop(tuple: &FiveTuple) {
         let flows: Vec<*mut rte_flow> = old.flow_ptrs.iter().map(|p| p.0).collect();
         let handles: Vec<*mut rte_flow_action_handle> =
             old.handle_ptrs.iter().map(|p| p.0).collect();
-        if let Err(e) = uninstall_flow(old.ports.clone(), flows, handles) {
+
+        let start = unsafe { iris_core::rte_rdtsc() };
+        let evicted = uninstall_flow(old.ports.clone(), flows, handles);
+        INSTALL_BUCKETS.evict_span.fetch_add(
+            unsafe { iris_core::rte_rdtsc() }.wrapping_sub(start),
+            Ordering::Relaxed,
+        );
+
+        if let Err(e) = evicted {
             log::warn!("failed to evict HW flow {:?}: {e:?}", old.tuple);
         }
         RULE_EVICTIONS.fetch_add(1, Ordering::Relaxed);
@@ -230,9 +338,19 @@ fn install_hw_drop(tuple: &FiveTuple) {
 
     // `install_drop_flow` installs both directions and attaches an indirect COUNT action to each
     // rule, which is how the report proves the rules actually matched traffic.
-    match install_drop_flow(ports.clone(), tuple) {
+    let start = unsafe { iris_core::rte_rdtsc() };
+    let installed = install_drop_flow(ports.clone(), tuple);
+    INSTALL_BUCKETS.install_span.fetch_add(
+        unsafe { iris_core::rte_rdtsc() }.wrapping_sub(start),
+        Ordering::Relaxed,
+    );
+
+    let t_enter = unsafe { iris_core::rte_rdtsc() };
+    let mut table = RULES.lock().unwrap();
+    let t_locked = unsafe { iris_core::rte_rdtsc() };
+    match installed {
         Ok((flows, handles)) => {
-            RULES.lock().unwrap().fifo.push_back(FlowEntry {
+            table.fifo.push_back(FlowEntry {
                 tuple: *tuple,
                 ports: ports.clone(),
                 flow_ptrs: flows.into_iter().map(FlowPtr).collect(),
@@ -241,9 +359,18 @@ fn install_hw_drop(tuple: &FiveTuple) {
         }
         Err(e) => {
             log::warn!("HW drop rule install failed for {tuple:?}: {e:?}");
-            RULES.lock().unwrap().resident.remove(tuple);
+            table.resident.remove(tuple);
         }
     }
+    drop(table);
+    let t_done = unsafe { iris_core::rte_rdtsc() };
+
+    INSTALL_BUCKETS
+        .lock_wait
+        .fetch_add(t_locked.wrapping_sub(t_enter), Ordering::Relaxed);
+    INSTALL_BUCKETS
+        .table
+        .fetch_add(t_done.wrapping_sub(t_locked), Ordering::Relaxed);
 }
 
 /// Read every still-resident rule's COUNT handle, then tear the rules down. Both paths accumulate
@@ -333,10 +460,16 @@ fn on_ciphertext(tls: &TlsHandshake, five_tuple: &FiveTuple, core_id: &CoreId) {
             // Never install inline: `rte_flow_create` is orders of magnitude slower than a poll
             // iteration and would stall the RX core.
             if let Some(d) = FLOW_DISPATCHER.get() {
-                if d.dispatch(FlowEvent::DropFlow { tuple: *five_tuple }, Some(core_id))
-                    .is_ok()
-                {
-                    SHED_CONNS.fetch_add(1, Ordering::Relaxed);
+                // A failure here is the worker's queue being full, i.e. the rule-management core
+                // not keeping up. Counted rather than swallowed: otherwise a saturated worker
+                // looks identical to a low connection arrival rate.
+                match d.dispatch(FlowEvent::DropFlow { tuple: *five_tuple }, Some(core_id)) {
+                    Ok(()) => {
+                        SHED_CONNS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        DISPATCH_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -427,6 +560,107 @@ struct ControlPlaneCost {
     install_cycles_vs_core_wall: f64,
 }
 
+/// What the rule-management core cost, as opposed to what its PMD calls cost.
+///
+/// [`ControlPlaneCost`] charges the mechanism for the cycles inside `rte_flow_create`. This charges
+/// it for the **core**: every cycle the install worker was on-CPU, whether that was in a PMD call,
+/// waiting for the rule-table lock, or taking events off its queue. The two differ by a lot, and
+/// the difference is not overhead that can be waved away — a core the offload occupies is a core
+/// the application does not get, no matter which instruction it was executing.
+///
+/// Note that only `busy_fraction` and `cores_busy` measure utilisation. The cycle buckets are
+/// `rte_rdtsc` spans, which keep counting while the thread is parked; see
+/// [`iris_core::stats::WorkerBudget`] for why measuring this needs two clocks.
+#[derive(Serialize)]
+struct RuleManagementReport {
+    /// Worker threads instrumented, i.e. the width of `--worker-cores`.
+    cores: u64,
+    /// On-CPU seconds summed over the worker threads, from `CLOCK_THREAD_CPUTIME_ID`.
+    cpu_seconds: f64,
+    /// **The headline.** Mean share of one worker core consumed over the run.
+    busy_fraction: f64,
+    /// Utilisation expressed as whole cores. Subtract from `budget.cores_idle` for the net
+    /// freed-core figure; `tools/paired_ab.py` does that across the arms, which is the only place
+    /// it can be done, since one run cannot see the other arm.
+    cores_busy: f64,
+    /// Offload requests per second sustainable at 100% of one core.
+    ///
+    /// Requests, not rules: one request installs a rule per direction per port, and may instead
+    /// dedup or be refused. Requests are the unit to compare against a TLS connection arrival
+    /// rate, which is the crossover the README predicts as the binding constraint. Independent of
+    /// this run's offered load, unlike a utilisation fraction.
+    sustainable_offload_rate: f64,
+
+    /// Cycles spanned by the worker loop, and the buckets it splits into.
+    wall_cycles: u64,
+    /// In `Select::select()` with nothing to do — parked, or spinning before it parks.
+    blocked_cycles: u64,
+    /// Taking events off the channel and assembling a batch.
+    dispatch_cycles: u64,
+    /// Inside `install_hw_drop`, the indirect call to it included.
+    handler_cycles: u64,
+    /// The dispatcher's per-batch counter updates. Three cold atomics on a core that parks
+    /// between batches, which is why they are not folded into `handler_cycles`.
+    bookkeeping_cycles: u64,
+    /// Share of `blocked_cycles` that was actually on-CPU. Near 0 means the worker gives the core
+    /// back between installs and `busy_fraction` is the whole cost; near 1 means the "idle" worker
+    /// is burning a core and `blocked_cycles` should be read as cost, not slack.
+    spin_fraction: f64,
+    /// Must be ~0. Non-zero means the worker loop has a path the instrumentation does not bracket.
+    loop_residual_fraction: f64,
+
+    /// Offload requests the worker handled. The denominator for the per-request means, and the
+    /// unit `sustainable_offload_rate` is expressed in.
+    offload_requests: u64,
+    /// Handler entry to the first lock attempt. Larger than its instruction count suggests, since
+    /// a parked core takes these accesses cold.
+    preamble_cycles: u64,
+    /// Waiting for the `RULES` mutex. With one worker core this is uncontended-acquire cost; with
+    /// several it is the figure that says whether more worker cores buy install throughput.
+    lock_wait_cycles: u64,
+    /// Under the lock, on the dedup set and the FIFO.
+    table_cycles: u64,
+    /// The whole `install_drop_flow` span, PMD calls included.
+    install_span_cycles: u64,
+    /// The whole `uninstall_flow` span on the eviction path.
+    evict_span_cycles: u64,
+    /// Per-PMD-entry-point cycles attributable to the worker, snapshotted when it stopped so the
+    /// shutdown drain's queries and destroys stay out. Those are teardown, not a steady-state
+    /// per-install cost, and their size depends only on how many rules happened to be resident.
+    pmd: RuleControlCost,
+    /// `install_span - (flow_create + handle_create)`: pattern building, action marshalling and
+    /// the `Vec`s around them. A residual rather than a bucket, so nothing can hide in a span the
+    /// instrumentation forgot to open. Signed, since two independent reads can cross at low counts.
+    install_glue_cycles: i64,
+    /// Share of `handler_cycles` that no bucket above covers.
+    ///
+    /// What lives in this region is per-call overhead outside every span: the boxed-closure
+    /// dispatch, the batch iteration, the bucket updates themselves, and the handler's own
+    /// prologue and epilogue. It has not been attributed more finely than that. Packing the
+    /// buckets onto one cache line was tried on the theory that their read-modify-writes dominated
+    /// and made no difference, so the cause is not established — treat it as cold-core per-call
+    /// cost, and expect it to shrink as a share once the install rate keeps the core warm.
+    ///
+    /// It is also the cross-check between the two instrumentation layers: `handler_cycles` is
+    /// timed independently inside the worker loop, so a jump here means a span stopped being
+    /// bracketed. Note that it does **not** put the headline at risk — `busy_fraction` comes from
+    /// the CPU clock, not from these buckets, so incomplete attribution cannot understate the cost.
+    handler_unbracketed_fraction: f64,
+    /// What `control_plane.install_cycles` was missing: on-CPU cycles over `rte_flow_create`
+    /// cycles. The factor by which charging the mechanism for its creates alone understates it.
+    understatement_vs_install_cycles: f64,
+
+    /// Offload requests for a tuple already resident. They cost utilisation and install nothing.
+    dedup_hits: u64,
+    /// Offloads lost because the worker's queue was full — the worker, not the rule table, being
+    /// the bottleneck. Non-zero means `shed_conns` undercounts what the policy asked for.
+    dispatch_failures: u64,
+    /// Involuntary context switches on the worker cores. Should be ~0 under `isolcpus`; a large
+    /// value means something else was scheduled there and `busy_fraction` describes this thread
+    /// rather than the core.
+    nonvoluntary_ctxt_switches: u64,
+}
+
 #[derive(Serialize)]
 struct GroundTruth {
     /// Packets/bytes the NIC's drop rules actually matched, read from the rules' indirect COUNT
@@ -453,6 +687,7 @@ struct Report {
     budget: CycleBudgetReport,
     normalised: NormalisedMetrics,
     control_plane: ControlPlaneCost,
+    rule_management: RuleManagementReport,
     ground_truth: GroundTruth,
     ingress: Vec<IngressCounters>,
     tsc_hz: u64,
@@ -538,8 +773,12 @@ fn main() {
 
     // Stand the install worker up before the runtime, so no dispatch can be dropped on the floor
     // during the first bursts.
-    let mut worker_handle = None;
-    if args.drop_mode == DropMode::Hardware {
+    //
+    // Stood up in **both** arms, not just the hardware one. Nothing dispatches to it in the
+    // control arm, so it parks immediately and should report ~0 utilisation — which is worth
+    // measuring rather than assuming, and which keeps the two arms holding the same number of
+    // cores so "cores consumed" can be compared directly instead of across different machines.
+    let worker_handle = {
         let rx_cores = config.get_all_rx_core_ids();
         if let Some(overlap) = args
             .worker_cores
@@ -561,16 +800,15 @@ fn main() {
             .set(dispatcher.clone())
             .map_err(|_| "failed to set flow dispatcher")
             .unwrap();
-        worker_handle = Some(
-            SharedWorkerThreadSpawner::new()
-                .set_cores(args.worker_cores.iter().map(|&c| CoreId(c)).collect())
-                .set_batch_size(16)
-                .add_dispatcher(dispatcher, |event: FlowEvent| match event {
-                    FlowEvent::DropFlow { tuple } => install_hw_drop(&tuple),
-                })
-                .run(),
-        );
-    }
+        SharedWorkerThreadSpawner::new()
+            .set_cores(args.worker_cores.iter().map(|&c| CoreId(c)).collect())
+            .set_batch_size(16)
+            .measure_utilisation(true)
+            .add_dispatcher(dispatcher, |event: FlowEvent| match event {
+                FlowEvent::DropFlow { tuple } => install_hw_drop(&tuple),
+            })
+            .run()
+    };
 
     let mut runtime: Runtime<SubscribedWrapper> = Runtime::new(config.clone(), filter).unwrap();
 
@@ -600,12 +838,18 @@ fn main() {
     // hardware arm could never write a report. The order within the hook matters too: the install
     // worker must be joined first, or it keeps calling `rte_flow_create` on a port about to stop.
     let mut ingress: Vec<IngressCounters> = Vec::new();
+    // PMD control-plane cost as of the moment the worker stopped. Snapshotted here rather than
+    // read at the end so the shutdown drain's queries and destroys stay out of it: that work runs
+    // on the main thread, scales with how many rules happened to still be resident, and is not a
+    // cost the mechanism pays per install.
+    let mut worker_pmd = RuleControlCost::default();
     {
-        let mut worker_handle = worker_handle;
+        let mut worker_handle = Some(worker_handle);
         let mut pre_stop = || {
             if let Some(h) = worker_handle.take() {
                 h.shutdown(None);
             }
+            worker_pmd = rule_control_cost();
 
             // Read the NIC-side ground truth while the rules are still resident.
             drain_rules(!args.keep_rules);
@@ -624,7 +868,7 @@ fn main() {
         runtime.run_with_pre_stop(&mut pre_stop);
     }
 
-    let report = build_report(&args, &ingress, cycles_per_rdtsc_read, tsc_hz);
+    let report = build_report(&args, &ingress, &worker_pmd, cycles_per_rdtsc_read, tsc_hz);
     print_summary(&report);
 
     if let Some(path) = &args.report {
@@ -642,12 +886,16 @@ fn main() {
 fn build_report(
     args: &Args,
     ingress: &[IngressCounters],
+    worker_pmd: &RuleControlCost,
     cycles_per_rdtsc_read: f64,
     tsc_hz: u64,
 ) -> Report {
     let b = iris_core::stats::datapath_budget();
-    let (install_cycles, installs, install_failures, destroy_cycles, destroys) =
-        rule_control_cost();
+    // Read at the end, not in the pre-stop hook: `shutdown` joins the worker threads, and each
+    // publishes its budget as it leaves the loop.
+    let w = iris_core::stats::worker_budget();
+    // The whole-run PMD cost, teardown included. `worker_pmd` is the steady-state subset.
+    let cp = rule_control_cost();
 
     let phy_pkts: u64 = ingress.iter().map(|c| c.phy_packets).sum();
     let phy_bytes: u64 = ingress.iter().map(|c| c.phy_bytes).sum();
@@ -710,16 +958,17 @@ fn build_report(
             ingress_normalisation_valid: phy_ok,
         },
         control_plane: ControlPlaneCost {
-            install_cycles,
-            installs,
-            install_failures,
-            destroy_cycles,
-            destroys,
-            mean_install_cycles: div(install_cycles, installs),
+            install_cycles: cp.install_cycles,
+            installs: cp.installs,
+            install_failures: cp.install_failures,
+            destroy_cycles: cp.destroy_cycles,
+            destroys: cp.destroys,
+            mean_install_cycles: div(cp.install_cycles, cp.installs),
             offload_refused: OFFLOAD_REFUSED.load(Ordering::Relaxed),
             evictions: RULE_EVICTIONS.load(Ordering::Relaxed),
-            install_cycles_vs_core_wall: div(install_cycles, per_core_wall),
+            install_cycles_vs_core_wall: div(cp.install_cycles, per_core_wall),
         },
+        rule_management: build_rule_management_report(&w, worker_pmd, tsc_hz),
         ground_truth: GroundTruth {
             discarded_packets: DISCARDED_PACKETS.load(Ordering::Relaxed),
             discarded_bytes: DISCARDED_BYTES.load(Ordering::Relaxed),
@@ -727,6 +976,57 @@ fn build_report(
         },
         ingress: ingress.to_vec(),
         tsc_hz,
+    }
+}
+
+/// Assemble the rule-management core's accounting from the three layers that measure it: the
+/// worker loop's budget, this binary's install-path buckets, and the PMD counters beneath them.
+///
+/// The two residuals are the reason for the layering. `handler_unbracketed_fraction` checks the
+/// install-path buckets against `handler`, which the worker loop timed independently, and
+/// `install_glue_cycles` checks the PMD counters against the span that contains them. A span
+/// nobody remembered to open shows up as a number in one of the two rather than as a quietly low
+/// cost.
+fn build_rule_management_report(
+    w: &iris_core::stats::WorkerBudget,
+    pmd: &RuleControlCost,
+    tsc_hz: u64,
+) -> RuleManagementReport {
+    let preamble = INSTALL_BUCKETS.preamble.load(Ordering::Relaxed);
+    let lock_wait = INSTALL_BUCKETS.lock_wait.load(Ordering::Relaxed);
+    let table = INSTALL_BUCKETS.table.load(Ordering::Relaxed);
+    let install_span = INSTALL_BUCKETS.install_span.load(Ordering::Relaxed);
+    let evict_span = INSTALL_BUCKETS.evict_span.load(Ordering::Relaxed);
+    let accounted = preamble + lock_wait + table + install_span + evict_span;
+
+    RuleManagementReport {
+        cores: w.threads,
+        cpu_seconds: w.cpu_ns as f64 / 1e9,
+        busy_fraction: w.busy_fraction(tsc_hz),
+        cores_busy: w.cores_busy(tsc_hz),
+        sustainable_offload_rate: w.sustainable_item_rate(),
+        wall_cycles: w.wall,
+        blocked_cycles: w.blocked,
+        dispatch_cycles: w.dispatch,
+        handler_cycles: w.handler,
+        bookkeeping_cycles: w.bookkeeping,
+        spin_fraction: w.spin_fraction(tsc_hz),
+        loop_residual_fraction: w.residual_fraction(),
+        offload_requests: w.items,
+        preamble_cycles: preamble,
+        lock_wait_cycles: lock_wait,
+        table_cycles: table,
+        install_span_cycles: install_span,
+        evict_span_cycles: evict_span,
+        install_glue_cycles: install_span as i64
+            - pmd.install_cycles as i64
+            - pmd.handle_create_cycles as i64,
+        handler_unbracketed_fraction: fdiv(w.handler as f64 - accounted as f64, w.handler as f64),
+        understatement_vs_install_cycles: fdiv(w.cpu_cycles(tsc_hz), pmd.install_cycles as f64),
+        pmd: *pmd,
+        dedup_hits: DEDUP_HITS.load(Ordering::Relaxed),
+        dispatch_failures: DISPATCH_FAILURES.load(Ordering::Relaxed),
+        nonvoluntary_ctxt_switches: w.nonvoluntary_ctxt_switches,
     }
 }
 
@@ -843,5 +1143,105 @@ fn print_summary(r: &Report) {
     println!(
         "  ingress reconciliation gap: {} pkts (should be ~0)",
         r.ground_truth.ingress_reconciliation_gap
+    );
+    print_rule_management_summary(&r.rule_management);
+}
+
+fn per_request(cycles: u64, requests: u64) -> String {
+    if requests == 0 {
+        "-".to_string()
+    } else {
+        format!("{:.0}", cycles as f64 / requests as f64)
+    }
+}
+
+/// The rule-management core, printed as utilisation first and attribution second — that is the
+/// order in which the numbers are trustworthy, since the buckets cannot distinguish a parked
+/// thread from a spinning one and the CPU clock can.
+fn print_rule_management_summary(m: &RuleManagementReport) {
+    println!("--- rule-management core ({} core(s)) ---", m.cores);
+    println!(
+        "  utilisation:            {:>9.4}%  <- PRIMARY ({:.4} cores, {:.3} CPU-sec)",
+        100.0 * m.busy_fraction,
+        m.cores_busy,
+        m.cpu_seconds
+    );
+    println!(
+        "  sustainable offload:    {:>10.0} req/s at 100% of one core",
+        m.sustainable_offload_rate
+    );
+    if m.pmd.installs > 0 {
+        println!(
+            "  vs install_cycles:      {:>10.2}x  <- factor by which rte_flow_create alone understates it",
+            m.understatement_vs_install_cycles
+        );
+    } else {
+        println!("  vs install_cycles:            n/a  (no rules were installed)");
+    }
+    println!(
+        "  busy time went to ({} offload requests):",
+        m.offload_requests
+    );
+    println!(
+        "    handler:              {:>12} cyc ({} per request)",
+        m.handler_cycles,
+        per_request(m.handler_cycles, m.offload_requests)
+    );
+    println!(
+        "      flow_create:        {:>12} cyc over {} rules",
+        m.pmd.install_cycles, m.pmd.installs
+    );
+    println!(
+        "      handle_create:      {:>12} cyc over {} handles  <- was never counted before",
+        m.pmd.handle_create_cycles, m.pmd.handle_creates
+    );
+    println!(
+        "      query/destroy:      {:>12} cyc ({} queries, {} destroys, {} handle destroys)",
+        m.pmd.query_cycles + m.pmd.destroy_cycles + m.pmd.handle_destroy_cycles,
+        m.pmd.queries,
+        m.pmd.destroys,
+        m.pmd.handle_destroys
+    );
+    println!(
+        "      install glue:       {:>12} cyc (pattern/action marshalling, by residual)",
+        m.install_glue_cycles
+    );
+    println!(
+        "      preamble:           {:>12} cyc ({} per request, cold on a parked core)",
+        m.preamble_cycles,
+        per_request(m.preamble_cycles, m.offload_requests)
+    );
+    println!(
+        "      lock wait:          {:>12} cyc ({} per request)",
+        m.lock_wait_cycles,
+        per_request(m.lock_wait_cycles, m.offload_requests)
+    );
+    println!(
+        "      rule table:         {:>12} cyc ({} per request)",
+        m.table_cycles,
+        per_request(m.table_cycles, m.offload_requests)
+    );
+    println!(
+        "    bookkeeping:          {:>12} cyc ({} per request, 3 cold atomics)",
+        m.bookkeeping_cycles,
+        per_request(m.bookkeeping_cycles, m.offload_requests)
+    );
+    println!("    dispatch:             {:>12} cyc", m.dispatch_cycles);
+    println!(
+        "    blocked:              {:>12} cyc ({:.2}% of it spinning, not parked)",
+        m.blocked_cycles,
+        100.0 * m.spin_fraction
+    );
+    println!(
+        "  loop residual:          {:>10.6}   (must be ~0)",
+        m.loop_residual_fraction
+    );
+    println!(
+        "  unbracketed:            {:>9.4}%  of handler (per-call overhead; not in the headline)",
+        100.0 * m.handler_unbracketed_fraction
+    );
+    println!(
+        "  saturation:             {} dedup hits, {} dispatch failures (queue full), {} involuntary ctx switches",
+        m.dedup_hits, m.dispatch_failures, m.nonvoluntary_ctxt_switches
     );
 }

@@ -31,6 +31,7 @@ result.** This harness reports it only for contrast.
 | **M2** | per-core cycle budget: `poll_busy` / `poll_idle` / `pipeline` / `maint`. `poll_idle` is the freed-cycle pool | `budget.*` |
 | **M3** | duty cycle regressed on offered load, per arm; the slope gap is the effect size | `cycle_budget.csv`, fitted by `tools/paired_ab.py` |
 | **M4** | max zero-loss throughput at fixed `--app-cycles` | `tests/functionality/zero_loss/zlt.py` |
+| **M5** | total utilisation of the rule-management core, and where its busy time went | `rule_management.*` |
 
 M1 is the headline because it is load-normalised: the numerator falls when the NIC sheds traffic
 and the denominator does not, so paired runs on non-stationary live traffic remain comparable.
@@ -88,6 +89,8 @@ The report charges the mechanism for its own overhead:
   failures. **This cost scales with connection arrival rate, not byte rate**, so at high connection
   churn it can exceed the datapath cycles saved. `install_cycles_vs_core_wall` expresses it as a
   fraction of one RX core.
+* `rule_management.*` — the **whole** rule-management core, not just its PMD calls. See below;
+  `install_cycles` alone understates the mechanism, and the report prints the factor by which.
 * `ground_truth.discarded_packets` — read back from each rule's indirect `RTE_FLOW_ACTION_TYPE_COUNT`
   handle. If this is zero in arm B, the experiment measured nothing, regardless of what the cycle
   numbers say.
@@ -95,6 +98,73 @@ The report charges the mechanism for its own overhead:
 
 The install worker runs on its own core (`--worker-cores`), outside the RX set; the app panics if
 they overlap, since sharing would let install work steal cycles from the datapath being measured.
+
+## Charging the mechanism for its core, not just its syscalls
+
+`install_cycles` brackets `rte_flow_create` and nothing else. That is not what the offload costs.
+On the same core, per install, are an `rte_flow_action_handle_create` for the rule's indirect COUNT
+action — a firmware round-trip of the same order as the create, and previously untimed — plus the
+rule-table lock, the dedup set and FIFO, the pattern and action marshalling, the dispatcher's
+per-batch counters, and the loop that takes events off the queue. A core the offload occupies is a
+core the application does not get, whichever instruction it happened to be executing.
+
+So `rule_management` measures the core. **The headline is `busy_fraction`**, and the report prints
+`understatement_vs_install_cycles`: how many times larger the real figure is than what
+`install_cycles` charged.
+
+### Why this takes two clocks
+
+Unlike the RX cores, the worker parks when its queue is empty, so its utilisation is a real number
+rather than a busy-poll constant. But `rte_rdtsc` cannot measure it — crossbeam's `Select` spins
+before it parks, and the TSC counts through both the spin and the sleep. In the control arm the
+worker reports **~1.0e9 cycles in `blocked` and ~0.0006 cores of CPU time**: by the TSC it looks
+fully occupied, and it is doing nothing at all.
+
+* `cpu_seconds` / `busy_fraction` / `cores_busy` come from `CLOCK_THREAD_CPUTIME_ID`, which
+  advances only while the thread is on-CPU. **These are the cost.**
+* the cycle buckets (`handler`, `bookkeeping`, `dispatch`, `blocked`) are `rte_rdtsc` spans that
+  partition wall time. They say where the busy time *went*, not how much of it there was.
+* `spin_fraction` crosses the two: the share of "blocked" time that was really spinning. Near zero
+  confirms the worker gives the core back; `tools/paired_ab.py` rejects a run above 0.5, where
+  utilisation stops meaning anything.
+
+Attribution here is exact, not sampled. The datapath samples because an empty `rx_burst` is ~100
+cycles against a ~24-cycle read; an `rte_flow_create` is ~12 us, so a read is under 0.1% of it.
+
+### The number to quote
+
+`sustainable_offload_rate` — offload requests per second at 100% of one core. It does not depend on
+the offered load of the run that measured it, so it can be compared directly against a TLS
+connection arrival rate. This is the crossover predicted in "Where the hypothesis may fail" below,
+as a measurement rather than an estimate.
+
+`tools/paired_ab.py` then reports **net cores freed** = datapath credit (`budget.cores_idle`,
+B − A) − rule-management debit (`rule_management.cores_busy`, B − A), with a sign test. That
+subtraction is the whole accounting, and it can come out negative — which is a result.
+
+### Reading the buckets honestly
+
+* `handler_unbracketed_fraction` is the share of handler time no bucket covers: closure dispatch,
+  batch iteration, the bucket updates, prologue and epilogue. It is ~15% at low install rates and
+  has **not** been attributed further — packing the buckets onto one cache line was tried on the
+  theory that their atomics dominated, and made no measurable difference. It does not put the
+  headline at risk, since `busy_fraction` comes from the CPU clock rather than from these buckets.
+* Per-request cycle figures measured at a low install rate are **cold-core** figures. A worker that
+  parks for millions of cycles between installs takes every access cold, which is why a `HashSet`
+  insert shows up at thousands of cycles. Do not extrapolate them to high install rates.
+* `loop_residual_fraction` must be ~0, exactly like the datapath's `residual_fraction`.
+* `lock_wait_cycles` tests a claim the code makes: the `RULES` mutex is never held across a PMD
+  call, so with several `--worker-cores` this should stay small. If it does not, adding worker
+  cores buys contention rather than install throughput.
+* `dispatch_failures` is offloads lost to a full worker queue — the worker, not the rule table,
+  being the bottleneck. Without it a saturated worker is indistinguishable from a low connection
+  arrival rate, so `paired_ab.py` rejects any run with a non-zero count.
+
+### The worker runs in both arms
+
+The control arm stands the worker up too, with nothing dispatched to it. It parks immediately, so
+its utilisation is the measured floor rather than an assumed zero, and both arms hold the same
+number of cores — which is what lets `cores_busy` be differenced rather than just reported.
 
 ## Running it
 

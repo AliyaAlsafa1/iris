@@ -172,11 +172,28 @@ def check_run(report):
     if b.get("sampled_iters", 0) < 1000:
         problems.append(f"only {b.get('sampled_iters', 0)} sampled iterations: "
                         "cycle fractions are too noisy")
+    # The rule-management core's own accounting. Absent from reports written before it existed,
+    # in which case there is nothing to gate on and the run is judged on the rest.
+    rm = report.get("rule_management")
+    if rm:
+        if abs(rm.get("loop_residual_fraction", 0.0)) > 1e-3:
+            problems.append(f"worker loop budget does not close "
+                            f"(residual {rm['loop_residual_fraction']:.2%})")
+        # A worker that spun instead of parking was consuming a core the whole run, so
+        # `busy_fraction` is not the cost and the utilisation figure cannot be read as one.
+        if rm.get("spin_fraction", 0.0) > 0.5 and rm.get("blocked_cycles", 0) > 0:
+            problems.append(f"worker spun for {rm['spin_fraction']:.0%} of its idle time rather "
+                            "than parking: utilisation is not interpretable")
     if report["drop_mode"] == "hardware":
         if report["ground_truth"]["discarded_packets"] == 0:
             problems.append("treatment arm shed nothing: NIC COUNT handles read zero")
         if report["control_plane"]["install_failures"] > 0:
             problems.append(f"{report['control_plane']['install_failures']} rule installs failed")
+        if rm and rm.get("dispatch_failures", 0) > 0:
+            # The datapath asked for offloads the worker could not take. Whatever the cycle
+            # numbers say, this run measured a worker-limited shed fraction, not the policy's.
+            problems.append(f"{rm['dispatch_failures']} offloads dropped by a full worker queue: "
+                            "the shed fraction is worker-limited")
     return problems
 
 
@@ -315,6 +332,32 @@ def analyze(reports, args):
               f"{m(lambda r: r['budget']['cores_idle']):>11.3f}"
               f"{m(lambda r: r['budget']['cycles_per_idle_poll']):>14.1f}")
 
+    # ---- per-arm rule-management core ----
+    if any(r.get("rule_management") for rs in by_arm.values() for r in rs):
+        print("\n" + "=" * 78)
+        print("M5  RULE-MANAGEMENT CORE (means over usable runs)")
+        print("=" * 78)
+        print(f"{'arm':<4}{'n':>3}  {'util%':>9}{'cores':>8}{'req/s cap':>12}"
+              f"{'cyc/req':>10}{'unbrack%':>10}{'spin%':>8}")
+        for arm in sorted(by_arm):
+            rs = [r for r in by_arm[arm] if r.get("rule_management")]
+            if not rs:
+                continue
+            def rm(fn, rs=rs):
+                return statistics.fmean(fn(r["rule_management"]) for r in rs)
+            reqs = rm(lambda m: m.get("offload_requests", 0))
+            print(f"{arm:<4}{len(rs):>3}  "
+                  f"{100*rm(lambda m: m['busy_fraction']):>8.4f}%"
+                  f"{rm(lambda m: m['cores_busy']):>8.4f}"
+                  f"{rm(lambda m: m['sustainable_offload_rate']):>12.0f}"
+                  f"{(rm(lambda m: m['handler_cycles']) / reqs if reqs else 0):>10.0f}"
+                  f"{100*rm(lambda m: m.get('handler_unbracketed_fraction', 0)):>9.2f}%"
+                  f"{100*rm(lambda m: m['spin_fraction']):>7.2f}%")
+        print("  util% is from CLOCK_THREAD_CPUTIME_ID, the only clock here that stops while the "
+              "worker is parked.")
+        print("  req/s cap is offload requests sustainable at 100% of one core: compare it "
+              "against the TLS connection arrival rate.")
+
     # ---- paired M1 ----
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
     if len(arms) >= 2:
@@ -375,6 +418,44 @@ def analyze(reports, args):
             if refused > 0:
                 print(f"  {refused:.0f} offloads refused (--max-rules reached): the shed fraction "
                       "is capacity-limited, not policy-limited")
+
+            # Net cores freed: the datapath credit minus the rule-management debit.
+            #
+            # Paired and differenced on both terms. Differencing the debit as well as the credit
+            # matters because the control arm also stands a worker up (parked, so its utilisation
+            # is the floor rather than zero), and subtracting that floor keeps the comparison
+            # about installing rules rather than about owning a thread.
+            #
+            # Only computable here: a single run cannot see the other arm. The full accounting is
+            # also only as good as its narrowest term — `cores_idle` is a *pool* of freed cycles,
+            # not cycles an application can certainly use, so read this as an upper bound on the
+            # benefit and a lower bound on nothing.
+            rm_pairs = [(a, b) for _, a, b, _ in pairs
+                        if a.get("rule_management") and b.get("rule_management")]
+            if rm_pairs:
+                credits = [b["budget"]["cores_idle"] - a["budget"]["cores_idle"]
+                           for a, b in rm_pairs]
+                debits = [b["rule_management"]["cores_busy"] - a["rule_management"]["cores_busy"]
+                          for a, b in rm_pairs]
+                credit, debit = statistics.fmean(credits), statistics.fmean(debits)
+                nets = [c - d for c, d in zip(credits, debits)]
+                net = statistics.fmean(nets)
+                print(f"\nnet cores freed by {b_arm} over {a_arm} (n={len(rm_pairs)}):")
+                print(f"  datapath credit:        {credit:+.4f} cores (idle-poll pool)")
+                print(f"  rule-management debit:  {-debit:+.4f} cores (worker utilisation)")
+                print(f"  net:                    {net:+.4f} cores")
+                if len(nets) >= 2:
+                    # sign_test counts negatives, which is "favours B" for a cycle delta but
+                    # "costs cores" here, so the positive count is the one to report.
+                    n_st, k_neg, p_st = sign_test(nets)
+                    print(f"  sign test: n={n_st}, {n_st - k_neg} pairs net-positive, "
+                          f"p={p_st:.4f}")
+                if net <= 0:
+                    print("  -> the mechanism does not pay for itself at this connection arrival "
+                          "rate. That is a result, not a failed run.")
+                elif debit > 0.1 * credit:
+                    print(f"  -> the debit is {100*debit/credit:.0f}% of the credit; it is not a "
+                          "rounding term and must be reported alongside the saving.")
 
     # ---- M3 regression ----
     print("\n" + "=" * 78)
@@ -448,6 +529,48 @@ def write_plot(fits, out_dir):
     print(f"\nwrote {path}")
 
 
+def rule_management_columns(rm):
+    """Flatten the rule-management section for the tidy CSV.
+
+    Every column is blank when the section is absent, so reports written before the worker core was
+    instrumented still produce readable rows rather than zeros that look like measurements.
+    """
+    fields = {
+        "rm_cores": "cores",
+        "rm_cpu_seconds": "cpu_seconds",
+        "rm_busy_fraction": "busy_fraction",
+        "rm_cores_busy": "cores_busy",
+        "rm_sustainable_offload_rate": "sustainable_offload_rate",
+        "rm_offload_requests": "offload_requests",
+        "rm_handler_cycles": "handler_cycles",
+        "rm_bookkeeping_cycles": "bookkeeping_cycles",
+        "rm_preamble_cycles": "preamble_cycles",
+        "rm_lock_wait_cycles": "lock_wait_cycles",
+        "rm_table_cycles": "table_cycles",
+        "rm_install_span_cycles": "install_span_cycles",
+        "rm_evict_span_cycles": "evict_span_cycles",
+        "rm_install_glue_cycles": "install_glue_cycles",
+        "rm_understatement_vs_install_cycles": "understatement_vs_install_cycles",
+        "rm_spin_fraction": "spin_fraction",
+        "rm_loop_residual_fraction": "loop_residual_fraction",
+        "rm_handler_unbracketed_fraction": "handler_unbracketed_fraction",
+        "rm_dedup_hits": "dedup_hits",
+        "rm_dispatch_failures": "dispatch_failures",
+        "rm_nonvoluntary_ctxt_switches": "nonvoluntary_ctxt_switches",
+    }
+    if not rm:
+        out = {k: "" for k in fields}
+        out["rm_pmd_install_cycles"] = ""
+        out["rm_pmd_handle_create_cycles"] = ""
+        return out
+
+    out = {col: rm.get(key, "") for col, key in fields.items()}
+    pmd = rm.get("pmd") or {}
+    out["rm_pmd_install_cycles"] = pmd.get("install_cycles", "")
+    out["rm_pmd_handle_create_cycles"] = pmd.get("handle_create_cycles", "")
+    return out
+
+
 def write_tidy_csv(reports, out_dir):
     """One row per run, for downstream analysis in whatever tool you prefer."""
     if not reports:
@@ -461,6 +584,15 @@ def write_tidy_csv(reports, out_dir):
         "ingress_good_pkts", "discarded_packets", "installs", "install_failures",
         "mean_install_cycles", "install_cycles_vs_core_wall", "rx_cores", "tsc_hz",
         "sample_stride", "sampled_iters", "est_poll_idle_cycles",
+        # Rule-management core. Blank for runs written before it was instrumented.
+        "rm_cores", "rm_cpu_seconds", "rm_busy_fraction", "rm_cores_busy",
+        "rm_sustainable_offload_rate", "rm_offload_requests", "rm_handler_cycles",
+        "rm_bookkeeping_cycles", "rm_preamble_cycles", "rm_lock_wait_cycles", "rm_table_cycles",
+        "rm_install_span_cycles", "rm_evict_span_cycles", "rm_install_glue_cycles",
+        "rm_pmd_install_cycles", "rm_pmd_handle_create_cycles",
+        "rm_understatement_vs_install_cycles", "rm_spin_fraction",
+        "rm_loop_residual_fraction", "rm_handler_unbracketed_fraction",
+        "rm_dedup_hits", "rm_dispatch_failures", "rm_nonvoluntary_ctxt_switches",
     ]
     with path.open("w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=fields)
@@ -489,6 +621,7 @@ def write_tidy_csv(reports, out_dir):
                 "sample_stride": b.get("sample_stride", 1),
                 "sampled_iters": b.get("sampled_iters", 0),
                 "est_poll_idle_cycles": b.get("est_poll_idle_cycles", 0.0),
+                **rule_management_columns(r.get("rule_management")),
             })
     print(f"wrote {path}")
 

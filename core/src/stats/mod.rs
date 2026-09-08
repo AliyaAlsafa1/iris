@@ -4,6 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "prometheus")]
 mod prometheus;
 
+mod worker;
+pub use worker::{publish_worker_thread, worker_budget, WorkerBudget, WorkerProbe};
+
 /// Datapath busy cycles (rte_rdtsc) and received packets, summed across RX cores.
 /// Only non-empty rx_bursts are counted, so idle poll-spin is excluded — this is
 /// the actual per-packet processing cost, unlike `perf`'s cycles (which include

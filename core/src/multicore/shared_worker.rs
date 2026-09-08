@@ -1,4 +1,5 @@
 use super::{pin_thread_to_core, ChannelDispatcher, SubscriptionStats};
+use crate::stats::WorkerProbe;
 use crate::CoreId;
 use crossbeam::channel::{Receiver, Select, TryRecvError};
 use serde::Serialize;
@@ -22,6 +23,7 @@ where
     dispatchers: Vec<Arc<ChannelDispatcher<T>>>,
     handlers: Vec<Box<dyn Fn(T) + Send + Sync>>,
     batch_size: usize,
+    measure_utilisation: bool,
 }
 
 /// Handle for managing a group of shared worker threads.
@@ -47,6 +49,7 @@ where
             dispatchers: Vec::new(),
             handlers: Vec::new(),
             batch_size: 1,
+            measure_utilisation: false,
         }
     }
 
@@ -59,6 +62,18 @@ where
     /// Sets the batch size for processing messages.
     pub fn set_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size.max(1);
+        self
+    }
+
+    /// Accounts for the worker cores' time, readable afterwards via
+    /// [`crate::stats::worker_budget`].
+    ///
+    /// Off by default. The cost is a handful of `rte_rdtsc` reads per batch, negligible against
+    /// any real handler, but it publishes into process-wide totals — so leaving it off keeps those
+    /// totals meaning "the worker pool someone asked about" rather than "whichever pools happen to
+    /// exist".
+    pub fn measure_utilisation(mut self, measure: bool) -> Self {
+        self.measure_utilisation = measure;
         self
     }
 
@@ -95,6 +110,7 @@ where
         let handlers = Arc::new(self.handlers);
         let dispatchers = Arc::new(self.dispatchers);
         let batch_size = self.batch_size;
+        let measure = self.measure_utilisation;
         let worker_cores = self
             .worker_cores
             .expect("Cores must be set via set_cores()");
@@ -127,6 +143,7 @@ where
                     &dispatchers_ref,
                     batch_size,
                     &shutdown_ref,
+                    measure,
                 );
             });
 
@@ -144,10 +161,16 @@ where
     }
 
     /// Process channel messages in batches.
+    ///
+    /// With a `probe`, the handler calls and the counter updates around them are timed separately.
+    /// Keeping them apart matters on a worker that parks between batches: the three atomics are
+    /// cold read-modify-writes there, and folding them into the handler's bucket would overstate
+    /// what the handler's own work costs.
     fn process_batch(
         batch: Vec<T>,
         handler: &(dyn Fn(T) + Send + Sync),
         dispatcher: &Arc<ChannelDispatcher<T>>,
+        mut probe: Option<&mut WorkerProbe>,
     ) {
         if batch.is_empty() {
             return;
@@ -159,9 +182,15 @@ where
             .stats()
             .actively_processing
             .fetch_add(batch_size, Ordering::Relaxed);
+        if let Some(p) = probe.as_mut() {
+            p.end_bookkeeping();
+        }
 
         for data in batch {
             handler(data);
+        }
+        if let Some(p) = probe.as_mut() {
+            p.end_handler(batch_size);
         }
 
         dispatcher
@@ -172,21 +201,34 @@ where
             .stats()
             .actively_processing
             .fetch_sub(batch_size, Ordering::Relaxed);
+        if let Some(p) = probe.as_mut() {
+            p.end_bookkeeping();
+        }
     }
 
     /// Main worker loop that uses crossbeam Select to efficiently wait on multiple channels.
     /// Routes each subscription to the appropriate handler and updates processing statistics.
+    ///
+    /// With `measure` set, the loop's time is attributed to the buckets of
+    /// [`crate::stats::WorkerBudget`]. Timestamps are chained, so the `end_*` calls below have to
+    /// track the control flow: the shutdown paths `break` mid-iteration and leave a span open,
+    /// which lands in `residual_fraction` as the one-off it is.
     fn run_worker_loop(
         tagged_receivers: &[(usize, Arc<Receiver<T>>)],
         handlers: &[Box<dyn Fn(T) + Send + Sync>],
         dispatchers: &[Arc<ChannelDispatcher<T>>],
         batch_size: usize,
         shutdown_signal: &Arc<AtomicBool>,
+        measure: bool,
     ) {
         let mut select = Select::new();
         for (_, receiver) in tagged_receivers.iter() {
             select.recv(receiver);
         }
+
+        // Started here rather than at thread spawn: the CPU clock it reads is per-thread, and the
+        // pinning and startup barrier before this point are not the worker's own work.
+        let mut probe = measure.then(WorkerProbe::start);
 
         loop {
             if shutdown_signal.load(Ordering::Relaxed) {
@@ -194,6 +236,9 @@ where
             }
 
             let oper = select.select();
+            if let Some(p) = probe.as_mut() {
+                p.end_blocked();
+            }
             let oper_index = oper.index();
             let (handler_index, receiver) = &tagged_receivers[oper_index];
             let handler = &handlers[*handler_index];
@@ -224,8 +269,12 @@ where
                 }
             }
 
+            if let Some(p) = probe.as_mut() {
+                p.end_dispatch();
+            }
+
             if !batch.is_empty() {
-                Self::process_batch(batch, handler.as_ref(), dispatcher);
+                Self::process_batch(batch, handler.as_ref(), dispatcher, probe.as_mut());
             }
 
             if let Some(err) = recv_error {
@@ -238,6 +287,10 @@ where
                     }
                 }
             }
+        }
+
+        if let Some(p) = probe {
+            p.finish();
         }
     }
 }

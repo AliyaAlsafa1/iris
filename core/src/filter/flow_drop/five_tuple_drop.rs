@@ -34,22 +34,85 @@ pub static DISCARDED_PACKETS: AtomicU64 = AtomicU64::new(0);
 pub static DISCARDED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Cost of the control plane, so hardware offload can be charged for its overhead.
+///
+/// Every PMD entry point on the install and teardown paths is timed, not just `rte_flow_create`.
+/// Timing only the create understates the mechanism by roughly half: each rule also needs an
+/// `rte_flow_action_handle_create` for its indirect COUNT action, which is a firmware round-trip
+/// of the same order, and teardown pays a query and two destroys.
 pub static RULE_INSTALL_CYCLES: AtomicU64 = AtomicU64::new(0);
 pub static RULE_INSTALLS: AtomicU64 = AtomicU64::new(0);
 pub static RULE_INSTALL_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub static RULE_DESTROY_CYCLES: AtomicU64 = AtomicU64::new(0);
 pub static RULE_DESTROYS: AtomicU64 = AtomicU64::new(0);
+/// `rte_flow_action_handle_create` for the per-rule indirect COUNT action.
+pub static RULE_HANDLE_CREATE_CYCLES: AtomicU64 = AtomicU64::new(0);
+pub static RULE_HANDLE_CREATES: AtomicU64 = AtomicU64::new(0);
+/// `rte_flow_action_handle_destroy`, on teardown and on failed-install cleanup.
+pub static RULE_HANDLE_DESTROY_CYCLES: AtomicU64 = AtomicU64::new(0);
+pub static RULE_HANDLE_DESTROYS: AtomicU64 = AtomicU64::new(0);
+/// `rte_flow_action_handle_query`, i.e. reading a rule's drop counter back.
+pub static RULE_QUERY_CYCLES: AtomicU64 = AtomicU64::new(0);
+pub static RULE_QUERIES: AtomicU64 = AtomicU64::new(0);
 
-/// Snapshot of the control-plane cost: (install cycles, installs, install failures, destroy
-/// cycles, destroys).
-pub fn rule_control_cost() -> (u64, u64, u64, u64, u64) {
-    (
-        RULE_INSTALL_CYCLES.load(Ordering::Relaxed),
-        RULE_INSTALLS.load(Ordering::Relaxed),
-        RULE_INSTALL_FAILURES.load(Ordering::Relaxed),
-        RULE_DESTROY_CYCLES.load(Ordering::Relaxed),
-        RULE_DESTROYS.load(Ordering::Relaxed),
-    )
+/// Cycles and call counts for every PMD entry point the rule control plane uses.
+///
+/// A struct rather than a tuple because there are now six pairs of these; a twelve-element tuple
+/// is unreadable at the call site and silently reorderable.
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+pub struct RuleControlCost {
+    /// Cycles in `rte_flow_create`.
+    pub install_cycles: u64,
+    pub installs: u64,
+    pub install_failures: u64,
+    /// Cycles in `rte_flow_destroy`.
+    pub destroy_cycles: u64,
+    pub destroys: u64,
+    /// Cycles in `rte_flow_action_handle_create`.
+    pub handle_create_cycles: u64,
+    pub handle_creates: u64,
+    /// Cycles in `rte_flow_action_handle_destroy`.
+    pub handle_destroy_cycles: u64,
+    pub handle_destroys: u64,
+    /// Cycles in `rte_flow_action_handle_query`.
+    pub query_cycles: u64,
+    pub queries: u64,
+}
+
+impl RuleControlCost {
+    /// Every PMD cycle the control plane spent, install and teardown together.
+    pub fn total_cycles(&self) -> u64 {
+        self.install_cycles
+            + self.destroy_cycles
+            + self.handle_create_cycles
+            + self.handle_destroy_cycles
+            + self.query_cycles
+    }
+
+    /// Cycles to put one rule in the NIC: the create plus its COUNT handle.
+    pub fn cycles_per_install(&self) -> f64 {
+        if self.installs == 0 {
+            0.0
+        } else {
+            (self.install_cycles + self.handle_create_cycles) as f64 / self.installs as f64
+        }
+    }
+}
+
+/// Snapshot of the control-plane cost.
+pub fn rule_control_cost() -> RuleControlCost {
+    RuleControlCost {
+        install_cycles: RULE_INSTALL_CYCLES.load(Ordering::Relaxed),
+        installs: RULE_INSTALLS.load(Ordering::Relaxed),
+        install_failures: RULE_INSTALL_FAILURES.load(Ordering::Relaxed),
+        destroy_cycles: RULE_DESTROY_CYCLES.load(Ordering::Relaxed),
+        destroys: RULE_DESTROYS.load(Ordering::Relaxed),
+        handle_create_cycles: RULE_HANDLE_CREATE_CYCLES.load(Ordering::Relaxed),
+        handle_creates: RULE_HANDLE_CREATES.load(Ordering::Relaxed),
+        handle_destroy_cycles: RULE_HANDLE_DESTROY_CYCLES.load(Ordering::Relaxed),
+        handle_destroys: RULE_HANDLE_DESTROYS.load(Ordering::Relaxed),
+        query_cycles: RULE_QUERY_CYCLES.load(Ordering::Relaxed),
+        queries: RULE_QUERIES.load(Ordering::Relaxed),
+    }
 }
 
 /// Returns a table in [2..=14] using dest port low nibble for TCP/UDP.
@@ -207,6 +270,29 @@ fn build_pattern(tuple: &FiveTuple, storage: &mut PatternStorage) -> Result<[rte
 }
 
 /// Create an indirect (shared) COUNT action handle for a port.
+/// Destroy an indirect COUNT handle, charging the PMD call to the control-plane budget. Returns
+/// the DPDK return code; callers word their own diagnostics.
+///
+/// Wrapped rather than timed inline because the failed-install cleanup paths call this too, and
+/// those cycles are as much a cost of the mechanism as the successful ones.
+fn destroy_count_handle(port_id: u16, handle: *mut rte_flow_action_handle) -> i32 {
+    let mut error: rte_flow_error = unsafe { mem::zeroed() };
+    let start = unsafe { dpdk::rte_rdtsc() };
+    let ret = unsafe { rte_flow_action_handle_destroy(port_id, handle, &mut error) };
+
+    RULE_HANDLE_DESTROY_CYCLES.fetch_add(
+        unsafe { dpdk::rte_rdtsc() }.wrapping_sub(start),
+        Ordering::Relaxed,
+    );
+    RULE_HANDLE_DESTROYS.fetch_add(1, Ordering::Relaxed);
+
+    if ret != 0 {
+        let msg = unsafe { CStr::from_ptr(error.message).to_string_lossy().into_owned() };
+        eprintln!("Failed to destroy count handle on port {port_id}: {msg}");
+    }
+    ret
+}
+
 fn create_count_handle(port_id: u16) -> Result<*mut rte_flow_action_handle> {
     let mut conf: rte_flow_indir_action_conf = unsafe { mem::zeroed() };
     conf.set_ingress(1);
@@ -218,8 +304,15 @@ fn create_count_handle(port_id: u16) -> Result<*mut rte_flow_action_handle> {
     };
 
     let mut error: rte_flow_error = unsafe { mem::zeroed() };
+    let start = unsafe { dpdk::rte_rdtsc() };
     let handle =
         unsafe { rte_flow_action_handle_create(port_id, &conf, &count_action, &mut error) };
+
+    RULE_HANDLE_CREATE_CYCLES.fetch_add(
+        unsafe { dpdk::rte_rdtsc() }.wrapping_sub(start),
+        Ordering::Relaxed,
+    );
+    RULE_HANDLE_CREATES.fetch_add(1, Ordering::Relaxed);
 
     if handle.is_null() {
         let msg = unsafe { CStr::from_ptr(error.message).to_string_lossy().into_owned() };
@@ -276,8 +369,7 @@ where
             RULE_INSTALL_FAILURES.fetch_add(1, Ordering::Relaxed);
             let msg = unsafe { CStr::from_ptr(error.message).to_string_lossy().into_owned() };
             // Clean up the handle we just created since the rule failed.
-            let mut derr: rte_flow_error = unsafe { mem::zeroed() };
-            unsafe { rte_flow_action_handle_destroy(port_id.raw(), handle, &mut derr) };
+            destroy_count_handle(port_id.raw(), handle);
             anyhow::bail!("Failed to install flow on port {}: {}", port_id.raw(), msg);
         }
 
@@ -324,8 +416,7 @@ where
                     .to_string_lossy()
                     .into_owned()
             };
-            let mut derr: rte_flow_error = unsafe { mem::zeroed() };
-            unsafe { rte_flow_action_handle_destroy(port_id.raw(), handle, &mut derr) };
+            destroy_count_handle(port_id.raw(), handle);
             anyhow::bail!("Failed to install flow on port {}: {}", port_id.raw(), msg);
         }
 
@@ -459,16 +550,7 @@ pub fn uninstall_flow(
         // Destroy the indirect counter handle after the rule referencing it
         // is gone.
         if !handle.is_null() {
-            let mut derr: rte_flow_error = unsafe { mem::zeroed() };
-            let dret = unsafe { rte_flow_action_handle_destroy(port_id.raw(), handle, &mut derr) };
-            if dret != 0 {
-                let msg = unsafe { CStr::from_ptr(derr.message).to_string_lossy().into_owned() };
-                eprintln!(
-                    "Failed to destroy count handle on port {}: {}",
-                    port_id.raw(),
-                    msg
-                );
-            }
+            destroy_count_handle(port_id.raw(), handle);
         }
     }
 
@@ -531,6 +613,7 @@ fn query_flow_stats(port_id: u16, handle: *mut rte_flow_action_handle) -> Result
 
     let mut error: rte_flow_error = unsafe { mem::zeroed() };
 
+    let start = unsafe { dpdk::rte_rdtsc() };
     let ret = unsafe {
         rte_flow_action_handle_query(
             port_id,
@@ -539,6 +622,12 @@ fn query_flow_stats(port_id: u16, handle: *mut rte_flow_action_handle) -> Result
             &mut error,
         )
     };
+
+    RULE_QUERY_CYCLES.fetch_add(
+        unsafe { dpdk::rte_rdtsc() }.wrapping_sub(start),
+        Ordering::Relaxed,
+    );
+    RULE_QUERIES.fetch_add(1, Ordering::Relaxed);
 
     if ret != 0 {
         let msg = unsafe { CStr::from_ptr(error.message).to_string_lossy().into_owned() };
