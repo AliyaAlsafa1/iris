@@ -534,8 +534,9 @@ def analyze_memory(usable, args):
 
     # ---- N2 decomposition, per arm per socket ----
     print("\n--- N2  where the memory traffic comes from (means over usable runs) ---")
-    print(f"{'arm':<4}{'sock':>5}{'n':>3}{'DRAM GB':>10}{'IO%':>7}{'DRAM/phy':>10}"
-          f"{'core/phy':>10}{'IO/phy':>8}{'PCIe/phy':>10}{'LLC MiB':>9}")
+    print(f"{'arm':<4}{'sock':>5}{'n':>3}{'DRAM/phy':>10}{'rd/phy':>8}{'wr/phy':>8}"
+          f"{'PCIe/phy':>10}{'wr-PCIe':>9}{'IO%':>7}{'core/phy':>10}{'LLC MiB':>9}"
+          f"{'DRAM GB':>10}")
     per_arm_socket = defaultdict(list)
     for (arm, idx) in have:
         mem, _ = mem_by_run[(arm, idx)]
@@ -556,15 +557,24 @@ def analyze_memory(usable, args):
         # the same number of surviving runs (see `n`), so their raw totals are not commensurate.
         def per_phy(v):
             return v / phy_mean if phy_mean else 0.0
-        print(f"{arm:<4}{socket:>5}{len(entries):>3}{imc / 1e9:>10.2f}"
-              f"{100 * (io / imc if imc else 0):>6.1f}%{per_phy(imc):>10.3f}"
-              f"{per_phy(core):>10.3f}{per_phy(io):>8.3f}{per_phy(pcie):>10.2f}"
-              f"{mean('llc_occupancy_bytes_mean') / (1 << 20):>9.2f}")
+        rd, wr = mean("imc_read_bytes"), mean("imc_write_bytes")
+        # wr/phy minus PCIe/phy is the write traffic NOT explained by DMA'd payload being
+        # evicted once. It is what separates "we are writing packet bodies" from "we are writing
+        # something else we never read": payload writes track DMA, per-packet metadata and
+        # application writes do not. Expect a small, arm-stable offset.
+        excess = per_phy(wr) - per_phy(pcie)
+        print(f"{arm:<4}{socket:>5}{len(entries):>3}{per_phy(imc):>10.3f}"
+              f"{per_phy(rd):>8.3f}{per_phy(wr):>8.3f}{per_phy(pcie):>10.2f}"
+              f"{excess:>+9.3f}{100 * (io / imc if imc else 0):>6.1f}%"
+              f"{per_phy(core):>10.3f}"
+              f"{mean('llc_occupancy_bytes_mean') / (1 << 20):>9.2f}{imc / 1e9:>10.2f}")
     print("  core = RDT MBM (traffic the RX cores originated). IO = IMC minus MBM, i.e. DDIO/IIO")
     print("  traffic, which carries no RMID on this microarchitecture. IO% is the headline for")
     print("  'do packet writes or the application dominate memory usage'.")
     print("  DRAM GB is load-dependent and NOT comparable across arms; the /phy columns are.")
     print("  PCIe/phy should sit near 1: far from it means the wrong IIO stack was read.")
+    print("  wr-PCIe is write traffic beyond DMA'd payload evicted once — per-packet metadata and")
+    print("  application writes. A small, arm-stable value means the writes really are payload.")
 
     # ---- N1 paired ----
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
