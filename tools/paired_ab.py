@@ -611,7 +611,7 @@ def analyze_memory(usable, args):
     # ---- N2 decomposition, per arm per socket ----
     print("\n--- N2  where the memory traffic comes from (means over usable runs) ---")
     print(f"{'arm':<4}{'sock':>5}{'n':>3}{'DRAM/phy':>10}{'rd/phy':>8}{'wr/phy':>8}"
-          f"{'PCIe/phy':>10}{'wr-PCIe':>9}{'IO%':>7}{'core/phy':>10}{'LLC MiB':>9}"
+          f"{'PCIe/phy':>10}{'wr-PCIe':>9}{'core/phy':>10}{'IO/phy':>8}{'IO%':>7}{'LLC MiB':>9}"
           f"{'DDIO MiB':>10}{'DRAM GB':>10}")
     per_arm_socket = defaultdict(list)
     for (arm, idx) in have:
@@ -648,16 +648,17 @@ def analyze_memory(usable, args):
         ddio_col = f"{'-':>10}" if ddio is None else f"{ddio / (1 << 20):>10.2f}"
         print(f"{arm:<4}{socket:>5}{len(entries):>3}{per_phy(imc):>10.3f}"
               f"{per_phy(rd):>8.3f}{per_phy(wr):>8.3f}{per_phy(pcie):>10.2f}"
-              f"{excess:>+9.3f}{100 * (io / imc if imc else 0):>6.1f}%"
-              f"{per_phy(core):>10.3f}"
+              f"{excess:>+9.3f}{per_phy(core):>10.3f}{per_phy(io):>8.3f}"
+              f"{100 * (io / imc if imc else 0):>6.1f}%"
               f"{mean('llc_occupancy_bytes_mean') / (1 << 20):>9.2f}{ddio_col}"
               f"{imc / 1e9:>10.2f}")
     print("  core = RDT MBM mbm_local, RX cores PLUS every other CPU (resctrl root group), so")
     print("  other processes are not misattributed. IO = IMC minus that: traffic the memory")
     print("  controller saw with no core behind it, i.e. DDIO/IIO, which carries no RMID here.")
-    print("  IO% answers 'do packet writes or the application dominate memory usage' — note its")
-    print("  denominator is imc_bytes, not ingress, so it is a composition share and barely moves")
-    print("  between arms even when the /phy columns do. The effect lives in the /phy columns.")
+    print("  IO/phy is DRAM traffic packets caused per ingress byte — the load-normalised I/O")
+    print("  figure, and the one that moves with the mechanism. IO% is the same quantity over")
+    print("  imc_bytes rather than ingress, so it answers 'packets or application?' but is a")
+    print("  composition share: it barely shifts between arms even when IO/phy falls sharply.")
     print("  DRAM GB is load-dependent and NOT comparable across arms; the /phy columns are.")
     print("  PCIe/phy should sit near 1: far from it means the wrong IIO stack was read.")
     print("  wr-PCIe is write traffic beyond DMA'd payload evicted once — per-packet metadata and")
@@ -964,6 +965,8 @@ def write_tidy_mem_csv(reports, out_dir, args):
                                                 if phy_bytes else 0.0),
                 "pcie_bytes_per_ingress_byte": (vals["iio_in_bytes"] / phy_bytes
                                                 if phy_bytes else 0.0),
+                "io_dram_bytes_per_ingress_byte": (vals["io_dram_bytes"] / phy_bytes
+                                                   if phy_bytes else 0.0),
                 "phy_available": ing.get(socket, {}).get("phy_available", False),
             })
     if not rows:
