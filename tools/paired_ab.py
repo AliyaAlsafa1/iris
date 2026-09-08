@@ -383,18 +383,28 @@ MEM_SUM_FIELDS = ("imc_bytes", "imc_read_bytes", "imc_write_bytes", "iio_in_byte
                   "mbm_other_local_bytes", "core_dram_bytes", "io_dram_bytes",
                   "io_dram_clamped")
 
+# Occupancies, not deltas: these belong nowhere near MEM_SUM_FIELDS. Adding a gauge across
+# intervals produces a number that grows with run length and means nothing at all.
+MEM_GAUGE_FIELDS = ("llc_occupancy_bytes", "llc_occupancy_all_bytes", "llc_ddio_bytes",
+                    "llc_ddio_fraction")
+
 
 def load_mem_totals(out_dir, arm, index):
     """Totals per socket for one run's mem_sample CSV, plus mean LLC occupancy.
 
-    Byte columns are per-interval deltas, so they sum. `llc_occupancy_bytes` is a gauge, so it is
+    Byte columns are per-interval deltas, so they sum. The `llc_*` columns are gauges, so they are
     averaged instead — summing an occupancy would be meaningless.
+
+    A gauge whose column is missing or blank throughout gives a mean of None rather than 0.0, which
+    is what a mem_sample CSV written before the `llc_ddio_*` columns existed, or written on a host
+    whose LLC size could not be read, looks like. `llc_occupancy_bytes_mean` keeps its old 0.0
+    because `check_mem_run` gates on it.
     """
     path = out_dir / f"mem_sample_{arm}_{index:03d}.csv"
     if not path.exists():
         return None
     totals = defaultdict(lambda: defaultdict(float))
-    occ = defaultdict(list)
+    gauges = defaultdict(lambda: defaultdict(list))
     intervals = defaultdict(int)
     with path.open() as fh:
         for row in csv.DictReader(fh):
@@ -407,16 +417,23 @@ def load_mem_totals(out_dir, arm, index):
                     totals[socket][f] += float(row.get(f) or 0.0)
                 except ValueError:
                     pass
-            try:
-                occ[socket].append(float(row.get("llc_occupancy_bytes") or 0.0))
-            except ValueError:
-                pass
+            for f in MEM_GAUGE_FIELDS:
+                raw = row.get(f)
+                if raw is None or not str(raw).strip():
+                    continue
+                try:
+                    gauges[socket][f].append(float(raw))
+                except ValueError:
+                    pass
             intervals[socket] += 1
     out = {}
     for socket, vals in totals.items():
         d = dict(vals)
         d["intervals"] = intervals[socket]
-        d["llc_occupancy_bytes_mean"] = statistics.fmean(occ[socket]) if occ[socket] else 0.0
+        for f in MEM_GAUGE_FIELDS:
+            seen = gauges[socket][f]
+            d[f"{f}_mean"] = statistics.fmean(seen) if seen else None
+        d["llc_occupancy_bytes_mean"] = d["llc_occupancy_bytes_mean"] or 0.0
         out[socket] = d
     return out or None
 
@@ -553,7 +570,7 @@ def analyze_memory(usable, args):
     print("\n--- N2  where the memory traffic comes from (means over usable runs) ---")
     print(f"{'arm':<4}{'sock':>5}{'n':>3}{'DRAM/phy':>10}{'rd/phy':>8}{'wr/phy':>8}"
           f"{'PCIe/phy':>10}{'wr-PCIe':>9}{'IO%':>7}{'core/phy':>10}{'LLC MiB':>9}"
-          f"{'DRAM GB':>10}")
+          f"{'DDIO MiB':>10}{'DRAM GB':>10}")
     per_arm_socket = defaultdict(list)
     for (arm, idx) in have:
         mem, _ = mem_by_run[(arm, idx)]
@@ -563,6 +580,11 @@ def analyze_memory(usable, args):
         entries = per_arm_socket[(arm, socket)]
         def mean(f):
             return statistics.fmean(v[f] for v, _ in entries)
+        # A gauge is None for a run whose sampler did not record it; those runs drop out of the
+        # mean rather than being read as zero, and a column no run recorded stays absent.
+        def gauge_mean(f):
+            seen = [v[f] for v, _ in entries if v.get(f) is not None]
+            return statistics.fmean(seen) if seen else None
         report_by_idx = {r["_index"]: r for r, _ in usable if r["_arm"] == arm}
         phys = [ingress_by_socket(report_by_idx[i]).get(socket, {}).get("phy_bytes", 0)
                 for _, i in entries]
@@ -580,11 +602,14 @@ def analyze_memory(usable, args):
         # something else we never read": payload writes track DMA, per-packet metadata and
         # application writes do not. Expect a small, arm-stable offset.
         excess = per_phy(wr) - per_phy(pcie)
+        ddio = gauge_mean("llc_ddio_bytes_mean")
+        ddio_col = f"{'-':>10}" if ddio is None else f"{ddio / (1 << 20):>10.2f}"
         print(f"{arm:<4}{socket:>5}{len(entries):>3}{per_phy(imc):>10.3f}"
               f"{per_phy(rd):>8.3f}{per_phy(wr):>8.3f}{per_phy(pcie):>10.2f}"
               f"{excess:>+9.3f}{100 * (io / imc if imc else 0):>6.1f}%"
               f"{per_phy(core):>10.3f}"
-              f"{mean('llc_occupancy_bytes_mean') / (1 << 20):>9.2f}{imc / 1e9:>10.2f}")
+              f"{mean('llc_occupancy_bytes_mean') / (1 << 20):>9.2f}{ddio_col}"
+              f"{imc / 1e9:>10.2f}")
     print("  core = RDT MBM mbm_local, RX cores PLUS every other CPU (resctrl root group), so")
     print("  other processes are not misattributed. IO = IMC minus that: traffic the memory")
     print("  controller saw with no core behind it, i.e. DDIO/IIO, which carries no RMID here.")
@@ -595,6 +620,14 @@ def analyze_memory(usable, args):
     print("  PCIe/phy should sit near 1: far from it means the wrong IIO stack was read.")
     print("  wr-PCIe is write traffic beyond DMA'd payload evicted once — per-packet metadata and")
     print("  application writes. A small, arm-stable value means the writes really are payload.")
+    print("  LLC MiB is CMT occupancy for the RX cores only. DDIO MiB is the same gap read through")
+    print("  CMT: LLC size minus occupancy summed over every RMID (RX groups plus resctrl root),")
+    print("  i.e. cache lines no core brought in, which here means packet DMA. It is the direct")
+    print("  form of 'do packets evict the connection table', where IO% only says where bytes go.")
+    print("  It over-counts when the LLC is not full (invalid lines carry no RMID either), reads")
+    print("  high for a few seconds after group creation while resctrl drains recycled RMIDs, and")
+    print("  is instantaneous state — a burst between two samples leaves no trace. '-' means the")
+    print("  sampler did not record it: an older CSV, or a host whose LLC size could not be read.")
 
     # ---- N1 paired ----
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
@@ -858,6 +891,10 @@ def write_tidy_mem_csv(reports, out_dir, args):
         for socket, vals in sorted(mem.items()):
             phy_bytes = ing.get(socket, {}).get("phy_bytes", 0)
             phy_pkts = ing.get(socket, {}).get("phy_packets", 0)
+
+            def blank_or_int(f, vals=vals):
+                return "" if vals[f] is None else int(vals[f])
+
             rows.append({
                 "arm": r["_arm"], "index": r["_index"], "socket": socket,
                 "intervals": vals["intervals"],
@@ -872,6 +909,12 @@ def write_tidy_mem_csv(reports, out_dir, args):
                 "mbm_total_bytes": int(vals["mbm_total_bytes"]),
                 "mbm_local_bytes": int(vals["mbm_local_bytes"]),
                 "llc_occupancy_bytes_mean": int(vals["llc_occupancy_bytes_mean"]),
+                # Blank, not 0, when the sampler never recorded it: zero here would read as
+                # "packets held no LLC", which is a stronger claim than the CSV can support.
+                "llc_occupancy_all_bytes_mean": blank_or_int("llc_occupancy_all_bytes_mean"),
+                "llc_ddio_bytes_mean": blank_or_int("llc_ddio_bytes_mean"),
+                "llc_ddio_fraction_mean": ("" if vals["llc_ddio_fraction_mean"] is None
+                                           else round(vals["llc_ddio_fraction_mean"], 6)),
                 "ingress_phy_bytes": phy_bytes,
                 "ingress_phy_packets": phy_pkts,
                 # N1 and its PCIe cross-check, precomputed so the CSV is usable as-is.

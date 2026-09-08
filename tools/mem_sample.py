@@ -31,6 +31,15 @@ The ratios between them are the results, not the raw numbers:
                                  answered without touching DDIO — and it decides whether a DDIO way
                                  sweep is worth running at all.
 
+  `llc_size - sum(CMT)`          **LLC held by packet DMA.** The same hardware gap, read through
+                                 CMT instead of MBM: an RMID tags lines a *core* brought in, so
+                                 DDIO's fills from the IIO belong to no RMID. Summing occupancy
+                                 over every RMID — the RX groups and the resctrl root — and
+                                 subtracting from the cache size leaves the LLC that no core is
+                                 holding. That is the direct form of "do packets evict Iris's
+                                 connection table", which the byte ratios above only answer
+                                 indirectly. Its caveats are in `csv_fields`.
+
 ## What this deliberately does not do
 
 Nothing here runs in the Iris process. Programming per-socket uncore PMUs via `perf_event_open`
@@ -827,6 +836,22 @@ def csv_fields(port_devices):
         # Subtracted alongside the RX cores so it is not misattributed to DDIO.
         "mbm_other_local_bytes",
         "llc_occupancy_bytes",
+        # The CMT half of the decomposition: LLC no RMID accounts for, i.e. lines DDIO put there.
+        # `llc_occupancy_all_bytes` sums the RX groups and the resctrl root, so it covers every
+        # core on the box, and the shortfall against the cache size is what packet DMA holds.
+        #
+        # Three things it cannot distinguish, all of which inflate llc_ddio_bytes:
+        #
+        # * An invalid or never-filled line carries no RMID either, so on a cache that is not full
+        #   this counts free space as DDIO. Under a busy datapath the LLC is full and the error is
+        #   small, but on an idle or short run it is the whole number.
+        # * resctrl drains a recycled RMID's occupancy lazily ("limbo"), so for some seconds after
+        #   the monitoring groups are created the sum reads low and the DDIO figure reads high.
+        # * CMT is instantaneous state, sampled once per interval. A burst that fills and drains
+        #   the LLC between two samples leaves no trace here, unlike the MBM/IMC byte counters.
+        "llc_occupancy_all_bytes",
+        "llc_ddio_bytes",
+        "llc_ddio_fraction",
         # The decomposition. IO-originated = everything the memory controller saw that the cores
         # did not originate; on Skylake-SP that is DDIO/IIO traffic, which carries no RMID.
         "core_dram_bytes",
@@ -911,9 +936,15 @@ def main():
                  "unknown for this vendor; check ingress[] in a smoke run"))
 
     llc = llc_geometry()
+    # Read once here rather than per interval: the geometry cannot change under us, and the DDIO
+    # occupancy columns are blank rather than zero when it is unknown — zero would read as "packets
+    # hold no LLC", which is a claim this host cannot support.
+    llc_size = llc["size_bytes"] if llc else None
     if llc:
         print(f"LLC             {llc['size_bytes'] / (1 << 20):.2f} MiB per socket, "
               f"{llc['ways']} ways, {llc['bytes_per_way'] / (1 << 10):.0f} KiB per way")
+    else:
+        print("LLC             size unknown on this host; llc_ddio_* columns will be blank")
 
     # Cross-NUMA polling misattributes N2 between sockets, so this is a gate, not a note.
     numa_problems = check_numa_locality(layout)
@@ -1023,11 +1054,14 @@ def main():
                         # socket's memory, which never crossed this socket's controllers.
                         # Subtracting it over-subtracts and inflates the IO share.
                         d = {}
-                        occ = 0
+                        occ = occ_all = 0
                         for (grp, dom, field), v in rdt.items():
                             if v is None or dom != socket:
                                 continue
                             if field == "llc_occupancy":
+                                # Every group, including root, so `occ_all` covers every RMID on
+                                # the socket; whatever is left of the cache is held by no core.
+                                occ_all += v
                                 if grp == socket:      # RX cores' own occupancy only
                                     occ += v
                                 continue
@@ -1049,6 +1083,15 @@ def main():
                         rec["mbm_remote_bytes"] = max(0, rx_total - rx_local)
                         rec["mbm_other_local_bytes"] = other_local
                         rec["llc_occupancy_bytes"] = occ
+                        rec["llc_occupancy_all_bytes"] = occ_all
+                        # Clamped for the same reason io_dram is: a sum over RMIDs that exceeds the
+                        # cache size means CMT and the reported geometry disagree, and a negative
+                        # "LLC held by DDIO" is not a quantity.
+                        ddio = max(0, llc_size - occ_all) if llc_size else None
+                        rec["llc_ddio_bytes"] = "" if ddio is None else ddio
+                        rec["llc_ddio_fraction"] = (
+                            "" if ddio is None else round(ddio / llc_size, 6)
+                        )
 
                         # The headline decomposition. Core-originated is the RX cores plus every
                         # other CPU on the box; whatever the memory controller saw beyond that had
