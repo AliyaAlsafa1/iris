@@ -85,6 +85,30 @@ RESCTRL = Path("/sys/fs/resctrl")
 CPU_DIR = Path("/sys/devices/system/cpu")
 BYTES_PER_CAS = 64  # a CAS command moves one cache line
 
+# Byte units perf may report a counter in. When a row carries one of these, perf has ALREADY
+# applied the event's sysfs `.scale`, so the value must be converted from that unit and the scale
+# must not be applied a second time.
+#
+# Getting this wrong is silent and enormous rather than marginal: uncore_imc/cas_count_read/ has
+# scale 6.103515625e-5 with unit MiB, so treating perf's already-scaled MiB figure as a raw CAS
+# count and multiplying by 64 understates DRAM traffic by 1048576/64 = 16384x. It looks like a
+# nearly idle memory system instead of a busy one, which is exactly how it was first noticed.
+UNIT_BYTES = {"B": 1, "Bytes": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
+
+
+def value_to_bytes(value: float, unit, bytes_per_count: float) -> float:
+    """Convert one perf counter value to bytes.
+
+    `unit` comes from perf's own JSON row, which is why `-j` is used in preference to `-x,`: the
+    output states whether it has already scaled the counter, so this does not have to be assumed
+    from the perf version or the kernel.
+    """
+    u = (unit or "").strip()
+    if u in UNIT_BYTES:
+        return value * UNIT_BYTES[u]
+    # No unit: the value is a raw event count, so apply the per-event byte size ourselves.
+    return value * bytes_per_count
+
 
 # --------------------------------------------------------------------------- topology
 
@@ -325,10 +349,10 @@ def iio_stacks() -> dict:
 
 
 def iio_scale(pmu_index: int) -> float:
-    """Bytes per unit of a `bw_in_portN` count, from the PMU's own scale/unit attributes.
+    """Bytes per **raw count** of a `bw_in_portN` event, from the PMU's sysfs attributes.
 
-    On this host the scale is 3.814697266e-6 with unit MiB, i.e. 4 bytes per count. Read rather
-    than hardcoded, because getting this wrong scales every PCIe number silently.
+    Only used when perf reports the counter with no unit, i.e. unscaled; see [`value_to_bytes`].
+    On this host the scale is 3.814697266e-6 with unit MiB, giving 4 bytes per count.
     """
     base = PMU_DIR / f"uncore_iio_free_running_{pmu_index}" / "events"
     try:
@@ -336,8 +360,7 @@ def iio_scale(pmu_index: int) -> float:
         unit = (base / "bw_in_port0.unit").read_text().strip()
     except OSError:
         return 4.0  # documented default for this counter family
-    mult = {"MiB": 1 << 20, "KiB": 1 << 10, "Bytes": 1, "B": 1}.get(unit, 1 << 20)
-    return scale * mult
+    return scale * UNIT_BYTES.get(unit, 1 << 20)
 
 
 # --------------------------------------------------------------------------- config
@@ -489,7 +512,7 @@ def build_events(layout):
             "event": f"uncore_imc/{name}/",
             "kind": f"imc_{name}",
             "socket": None,          # resolved from the row's own socket field
-            "scale": BYTES_PER_CAS,
+            "bytes_per_count": BYTES_PER_CAS,
         })
 
     # PCIe inbound bytes, for the stack each configured NIC actually sits on. All four ports of
@@ -508,7 +531,7 @@ def build_events(layout):
                 "event": f"uncore_iio_free_running_{idx}/bw_in_port{p}/",
                 "kind": f"iio_in::{port['device']}",
                 "socket": die,
-                "scale": scale,
+                "bytes_per_count": scale,
             })
 
     args = []
@@ -548,6 +571,9 @@ def parse_perf_json_line(line: str):
         "event": (row.get("event") or "").strip(),
         "socket": int(m.group(1)) if m else None,
         "value": value,
+        # Whether perf already applied the event's sysfs `.scale`, and in what unit. See
+        # `value_to_bytes`: this is the whole reason `-j` is preferred over `-x,`.
+        "unit": row.get("unit"),
     }
 
 
@@ -746,7 +772,8 @@ def aggregate_interval(rows, specs_by_event, port_devices):
             if socket is None:
                 continue
             kind = spec["kind"]
-            scaled = r["value"] * spec["scale"]
+            scaled = value_to_bytes(r["value"], r.get("unit"),
+                                    spec["bytes_per_count"])
             if kind.startswith("imc_"):
                 bump(socket, kind, scaled)
                 bump(socket, "imc_bytes", scaled)
@@ -924,6 +951,10 @@ def main():
         # MBM counters are cumulative per RMID, so bandwidth is a delta; occupancy is a gauge.
         prev_rdt = groups.read()
         seen_events, advanced, written = set(), set(), 0
+        # Per-socket byte totals, so the selftest can report observed *rates*. An order-of-
+        # magnitude error in counter scaling is invisible in a pass/fail check but obvious in
+        # GB/s — a busy datapath does not move 0.6 MB/s of DRAM traffic.
+        totals = collections.defaultdict(lambda: {"imc": 0.0, "pcie": 0.0, "core": 0.0})
 
         # No SIGINT handler. An earlier version installed one that only set a flag, and checked
         # that flag solely on an interval boundary — so when perf emitted nothing the flag was
@@ -997,6 +1028,9 @@ def main():
                         )
                         wtr.writerow(rec)
                         written += 1
+                        totals[socket]["imc"] += rec["imc_bytes"]
+                        totals[socket]["pcie"] += rec["iio_in_bytes"]
+                        totals[socket]["core"] += core
                     fh.flush()
 
                     prev_rdt = rdt
@@ -1048,6 +1082,18 @@ def main():
                     if ev not in advanced:
                         failures.append(f"{ev}: did not advance")
         print(f"  rows written: {written}")
+
+        # Rates, not just liveness. Scaling errors pass a pass/fail check and are obvious here.
+        elapsed = max(time.time() - started, 1e-9)
+        if totals:
+            print("\n  observed rates (sanity-check these against the offered load):")
+            for socket, t in sorted(totals.items()):
+                print(f"    socket {socket}: DRAM {t['imc'] / elapsed / 1e9:6.2f} GB/s, "
+                      f"PCIe in {t['pcie'] / elapsed / 1e9:6.2f} GB/s, "
+                      f"core-originated {t['core'] / elapsed / 1e9:6.2f} GB/s")
+            print("    A busy datapath moves GB/s, not MB/s. Rates orders of magnitude below the "
+                  "offered\n    load mean a counter is being scaled wrongly, not that memory is "
+                  "idle.")
 
         if failures:
             print("\nselftest FAILED:", file=sys.stderr)
