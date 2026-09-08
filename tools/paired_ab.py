@@ -75,11 +75,14 @@ def parse_args():
                    help="comma-separated arms to alternate through (default: A,B)")
     p.add_argument("--app-cycles", type=int, default=0,
                    help="synthetic application work per TLS connection, in TSC cycles")
-    p.add_argument("--max-rules", type=int, default=0,
-                   help="cap on concurrently installed NIC rules (0 = unbounded)")
-    p.add_argument("--table-full-policy", choices=("refuse", "evict"), default="refuse",
+    p.add_argument("--max-rules", type=int, default=100_000,
+                   help="cap on concurrently offloaded connections, not rules (0 = unbounded; "
+                        "default: 100000). Each connection costs four rte_flow rules, so the "
+                        "default caps the NIC at roughly 400k.")
+    p.add_argument("--table-full-policy", choices=("refuse", "evict"), default="evict",
                    help="at --max-rules: refuse further offloads, or evict the least recently "
-                        "added rule (FIFO) to make room (default: refuse)")
+                        "added rule (FIFO) to make room (default: evict, so a bounded table keeps "
+                        "tracking current traffic rather than freezing on the first arrivals)")
     p.add_argument("--worker-cores", default="13",
                    help="cores for the rte_flow install worker (default: 13 — NUMA-local to "
                         "the node-0 CX-5 and outside the RX set in configs/online-cx5-eval.toml. "

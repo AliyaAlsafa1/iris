@@ -523,17 +523,28 @@ struct Args {
     #[clap(long, default_value = "0")]
     app_cycles: u64,
 
-    /// Cap on concurrently installed NIC rules (0 = unbounded). Bounds the run so it does not
-    /// silently turn into a rule-table capacity test.
-    #[clap(long, default_value = "0")]
+    /// Cap on concurrently *connections* offloaded, not rules (0 = unbounded). Bounds the run so
+    /// it does not silently turn into a rule-table capacity test.
+    ///
+    /// Each offloaded connection costs four `rte_flow` rules — forward and reverse on each of two
+    /// ports — so the default caps the NIC at roughly 400k rules. `rte_flow_create` on mlx5 runs
+    /// at order 10^3-10^4 rules/sec, so a cap also bounds how much of the run is spent installing.
+    #[clap(long, default_value = "100000")]
     max_rules: usize,
 
     /// What to do once `--max-rules` is reached: `refuse` the offload, or `evict` the least
     /// recently added rule to make room.
     ///
-    /// Defaults to `refuse`, which is what earlier runs did — switching the default would silently
-    /// change what `--max-rules N` means and break comparison with reports already collected.
-    #[clap(long, arg_enum, default_value = "refuse")]
+    /// Defaults to `evict`, so a bounded table keeps tracking current traffic instead of freezing
+    /// on whichever connections happened to arrive first — those are disproportionately
+    /// long-lived, a biased sample of what the mechanism would shed in practice. Evicted rules
+    /// still have their COUNT handles read back before teardown, so their drops stay in the
+    /// ground truth and their churn is charged to `destroy_cycles`.
+    ///
+    /// Note reports collected before this default changed used `refuse` with no cap at all;
+    /// `max_rules` and `table_full_policy` are recorded in every report precisely so a comparison
+    /// across that boundary is visible rather than silent.
+    #[clap(long, arg_enum, default_value = "evict")]
     table_full_policy: TableFullPolicy,
 
     /// Cores for the off-datapath rule-install worker (comma-separated). Must not overlap the RX

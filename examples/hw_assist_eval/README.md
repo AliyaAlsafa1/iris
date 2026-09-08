@@ -157,7 +157,10 @@ These are findings, not excuses.
    [`examples/flow_test`](../flow_test) carries a LightGBM "elephant flow" model to *select* which
    connections to offload is strong evidence this was already hit in practice. The honest result is
    likely a curve of net freed cycles against offload selectivity, with a crossover. `--max-rules`
-   bounds a run; `offload_refused` reports when the cap bit.
+   bounds a run and defaults to 100k *connections* — roughly 400k NIC rules, since each connection
+   installs forward and reverse on both ports. `offload_refused` and `evictions` report when the
+   cap bit, and a run that hits it is measuring capacity-limited shedding rather than the
+   mechanism's ceiling. Pass `--max-rules 0` for unbounded.
 2. **The tail packets are already the cheapest ones.** If ciphertext is 60% of packets but 15% of
    datapath cycles, 15% is the ceiling, and install overhead eats into it.
 3. **Live-traffic variance may exceed the effect.** M3 is the mitigation. If the slopes are
