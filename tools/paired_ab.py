@@ -447,6 +447,25 @@ def check_mem_run(report, mem):
     if not mem:
         return ["no mem_sample CSV for this run"]
     ing = ingress_by_socket(report)
+
+    # A zero ingress denominator is the one failure that used to pass silently: every /phy column
+    # renders as 0.000 and N1 reports "no complete pairs", which reads like a pairing problem
+    # rather than the missing input it is. Two distinct causes, so name both.
+    if not ing:
+        problems.append(
+            "the report's ingress[] carries no socket_id, so ingress cannot be attributed per "
+            "socket. This means the binary predates that field — rebuild with scripts/build.sh"
+        )
+    else:
+        for socket in sorted(mem):
+            phy = ing.get(socket, {}).get("phy_bytes", 0)
+            if not phy:
+                problems.append(
+                    f"socket {socket}: rx_phy_bytes is 0, so there is no N1 denominator — "
+                    "either no traffic reached the ports on this socket during the run, or the "
+                    "PMD exposed no counters (check ingress[] in the report)"
+                )
+
     for socket, vals in sorted(mem.items()):
         if vals["intervals"] < 10:
             problems.append(f"socket {socket}: only {vals['intervals']} sampled intervals")
