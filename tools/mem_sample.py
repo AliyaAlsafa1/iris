@@ -1015,9 +1015,8 @@ def main():
                         for d in port_devices:
                             rec[f"iio_in_bytes::{d}"] = int(vals.get(f"iio_in_bytes::{d}", 0))
 
-                        # RDT deltas for this socket's group, summed over its L3 domains.
-                        # Deltas keyed by (group, field), restricted to the L3 domain that matches
-                        # this socket.
+                        # RDT deltas keyed by (group, field), restricted to the L3 domain that
+                        # matches this socket.
                         #
                         # `mbm_local_bytes`, not `mbm_total_bytes`, is what may be subtracted from
                         # imc_bytes: total includes traffic those cores sent to the *other*

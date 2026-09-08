@@ -585,9 +585,12 @@ def analyze_memory(usable, args):
               f"{excess:>+9.3f}{100 * (io / imc if imc else 0):>6.1f}%"
               f"{per_phy(core):>10.3f}"
               f"{mean('llc_occupancy_bytes_mean') / (1 << 20):>9.2f}{imc / 1e9:>10.2f}")
-    print("  core = RDT MBM (traffic the RX cores originated). IO = IMC minus MBM, i.e. DDIO/IIO")
-    print("  traffic, which carries no RMID on this microarchitecture. IO% is the headline for")
-    print("  'do packet writes or the application dominate memory usage'.")
+    print("  core = RDT MBM mbm_local, RX cores PLUS every other CPU (resctrl root group), so")
+    print("  other processes are not misattributed. IO = IMC minus that: traffic the memory")
+    print("  controller saw with no core behind it, i.e. DDIO/IIO, which carries no RMID here.")
+    print("  IO% answers 'do packet writes or the application dominate memory usage' — note its")
+    print("  denominator is imc_bytes, not ingress, so it is a composition share and barely moves")
+    print("  between arms even when the /phy columns do. The effect lives in the /phy columns.")
     print("  DRAM GB is load-dependent and NOT comparable across arms; the /phy columns are.")
     print("  PCIe/phy should sit near 1: far from it means the wrong IIO stack was read.")
     print("  wr-PCIe is write traffic beyond DMA'd payload evicted once — per-packet metadata and")
