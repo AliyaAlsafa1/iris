@@ -530,11 +530,15 @@ fn print_hw_arm_report(run_elapsed: Duration) {
     );
     println!("  spin overshoot ratio: {:.4}", nl.spin_overshoot_ratio());
     println!("  trace wraps: {}", nl.trace_wraps);
-    // Teardown runs unpaced by design. Printing the count keeps that on the record, rather than
-    // leaving an unexplained gap between rules installed and deletes paced.
+    // Teardown deletes run unpaced by design. Printing the count keeps that on the record,
+    // rather than leaving an unexplained gap between rules installed and deletes paced.
     println!(
-        "  unpaced at teardown: {} inserts, {} deletes",
-        nl.unpaced_teardown_inserts, nl.unpaced_teardown_deletes
+        "  unpaced deletes at teardown: {}",
+        nl.unpaced_teardown_deletes
+    );
+    println!(
+        "  inserts after teardown (worker backlog): {}",
+        nl.inserts_after_teardown
     );
     let wall_cycles = (run_elapsed.as_secs_f64() * nl.tsc_hz as f64) as u64;
     println!(
@@ -542,22 +546,27 @@ fn print_hw_arm_report(run_elapsed: Duration) {
         nl.worker_busy_fraction(wall_cycles, 1)
     );
 
-    // The teardown exemption is only sound while teardown is a small tail of the run. A saturated
-    // worker flushes its whole queued backlog at shutdown, and those installs run at native speed,
-    // so the majority of the run's rule installs can end up unemulated. That invalidates the run
-    // rather than merely degrading it.
-    let unpaced = nl.unpaced_teardown_inserts + nl.unpaced_teardown_deletes;
+    // Joining the install worker waits for its queue to drain, so a deep channel plus a saturated
+    // worker means most installs land after the run rather than during it. They are still paced,
+    // but they shed no traffic and describe no steady state.
     let paced = nl.paced_inserts + nl.paced_deletes;
-    if unpaced > paced {
+    if nl.inserts_after_teardown * 4 > nl.paced_inserts {
         log::warn!(
-            "{unpaced} operations ran unpaced at teardown against {paced} paced during the run:              most of this run's rule installs were not emulated, because the install worker              flushed a large backlog at shutdown. Reduce the offered connection rate or add              --worker-cores until the backlog is small."
+            "{} of {} paced inserts happened after the run ended, draining the install \
+             worker's backlog. Those rules shed nothing. Lower --flow-channel-size so \
+             requests are refused promptly instead of queueing: at this install cost a deep \
+             channel only converts refusals into installs for connections that already finished.",
+            nl.inserts_after_teardown,
+            nl.paced_inserts
         );
     }
 
     // A trace this non-stationary only replays its own distribution if enough of it is consumed.
     if nl.trace_wraps == 0 && paced < nl.trace_ops as u64 {
         log::warn!(
-            "only {paced} of {} trace ops were consumed, so the replayed latencies are a              contiguous slice of the trace rather than its distribution -- compare the means above              against that prefix, not against the whole-trace means.",
+            "only {paced} of {} trace ops were consumed, so the replayed latencies are a \
+             contiguous slice of the trace rather than its distribution -- compare the means \
+             above against that prefix, not against the whole-trace means.",
             nl.trace_ops
         );
     }

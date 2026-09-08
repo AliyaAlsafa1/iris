@@ -21,9 +21,17 @@
 //!
 //! # Not paced
 //!
-//! * **Teardown**, from [`suspend`] onwards: draining thousands of resident rules, plus the
-//!   install worker's backlog flush, would add minutes that measure nothing. Skips are still
-//!   counted ([`NicLatencyStats::unpaced_teardown_deletes`]), so the exemption is auditable.
+//! * **Deletes during teardown**, from [`suspend`] onwards: draining thousands of resident rules
+//!   at the emulated cost would add minutes that measure nothing. Skips are still counted
+//!   ([`NicLatencyStats::unpaced_teardown_deletes`]), so the exemption is auditable.
+//!
+//! Inserts are *never* exempt. Nothing legitimately installs a rule during cleanup, and the
+//! install worker outlives [`suspend`] — it is joined after the runtime returns, and its join
+//! waits for its queue to empty. Exempting inserts therefore let a saturated worker flush its
+//! whole queued backlog at native speed once the measurement window closed, which is precisely
+//! the cost the emulation exists to impose. Inserts after teardown are counted separately
+//! ([`NicLatencyStats::inserts_after_teardown`]) because a large count means most of the run's
+//! installs landed after it ended, and the run does not describe steady state.
 //! * **Startup rules** in `super::raw_drop` and `crate::filter::hardware`: installed once per
 //!   port, never churned.
 //!
@@ -107,10 +115,10 @@ const STATE_SUSPENDED: u8 = 3;
 static STATE: AtomicU8 = AtomicU8::new(STATE_UNCONFIGURED);
 static PACER: OnceLock<Pacer> = OnceLock::new();
 
-/// Operations that ran at native speed because teardown had begun. Global rather than per-pacer:
-/// a property of shutdown, and touched only once pacing is over.
-static UNPACED_TEARDOWN_INSERTS: AtomicU64 = AtomicU64::new(0);
+/// Deletes that ran at native speed because teardown had begun, and inserts that were still
+/// paced but happened after it. Global rather than per-pacer: both are properties of shutdown.
 static UNPACED_TEARDOWN_DELETES: AtomicU64 = AtomicU64::new(0);
+static INSERTS_AFTER_TEARDOWN: AtomicU64 = AtomicU64::new(0);
 
 /// Snapshot of the emulation's activity.
 #[derive(Debug, Clone, Copy, Default)]
@@ -138,9 +146,11 @@ pub struct NicLatencyStats {
     pub spun_cycles_delete: u64,
     /// Times the cursor ran off the end of the trace and restarted.
     pub trace_wraps: u64,
-    /// Operations that ran at native speed because teardown had begun.
-    pub unpaced_teardown_inserts: u64,
+    /// Deletes that ran at native speed because teardown had begun.
     pub unpaced_teardown_deletes: u64,
+    /// Inserts paced after teardown began, i.e. the install worker's queued backlog. Included in
+    /// `paced_inserts`. Large relative to it means most installs landed after the run ended.
+    pub inserts_after_teardown: u64,
 }
 
 impl NicLatencyStats {
@@ -245,8 +255,8 @@ fn install(pacer: Pacer, enabled: bool) -> Result<()> {
     Ok(())
 }
 
-/// Stop pacing, permanently. Called once the RX cores have exited, so the shutdown drain and the
-/// install worker's backlog flush run at native speed. Nothing re-arms it.
+/// Stop pacing deletes, permanently, so the shutdown drain of the resident rule set runs at
+/// native speed. Called once the RX cores have exited. Inserts stay paced; nothing re-arms it.
 pub fn suspend() {
     // Leave `OFF` and `UNCONFIGURED` alone, so the reported state still says why nothing was paced.
     let _ = STATE.compare_exchange(
@@ -265,17 +275,20 @@ pub fn suspend() {
 #[inline]
 pub fn charge(phase: Phase) {
     let state = STATE.load(Ordering::Relaxed);
-    if state != STATE_ACTIVE {
-        if state == STATE_SUSPENDED {
-            match phase {
-                Phase::Insert => &UNPACED_TEARDOWN_INSERTS,
-                Phase::Delete => &UNPACED_TEARDOWN_DELETES,
-            }
-            .fetch_add(1, Ordering::Relaxed);
-        }
+    if state == STATE_UNCONFIGURED || state == STATE_OFF {
         return;
     }
     let Some(pacer) = PACER.get() else { return };
+
+    if state == STATE_SUSPENDED {
+        // Deletes are exempt: teardown drains the resident rule set, which at emulated cost is
+        // minutes of cleanup measuring nothing. Inserts are not -- see the module docs.
+        if phase == Phase::Delete {
+            UNPACED_TEARDOWN_DELETES.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        INSERTS_AFTER_TEARDOWN.fetch_add(1, Ordering::Relaxed);
+    }
     pacer.charge(phase);
 }
 
@@ -499,8 +512,8 @@ impl Pacer {
             spun_cycles_insert: c.spun_cycles_insert.load(Ordering::Relaxed),
             spun_cycles_delete: c.spun_cycles_delete.load(Ordering::Relaxed),
             trace_wraps: c.trace_wraps.load(Ordering::Relaxed),
-            unpaced_teardown_inserts: UNPACED_TEARDOWN_INSERTS.load(Ordering::Relaxed),
             unpaced_teardown_deletes: UNPACED_TEARDOWN_DELETES.load(Ordering::Relaxed),
+            inserts_after_teardown: INSERTS_AFTER_TEARDOWN.load(Ordering::Relaxed),
         }
     }
 }
@@ -776,7 +789,7 @@ op_id,phase,us
         assert_eq!(stats.paced_inserts, 1);
         assert_eq!(stats.unpaced_teardown_deletes, 0);
 
-        // Teardown: nothing is paced from here on, but skips are counted.
+        // Teardown: deletes stop being paced, inserts do not.
         suspend();
         assert!(!nic_latency_cost().active);
         // Still `armed`: a report runs after this point and must not call the run "off".
@@ -787,9 +800,11 @@ op_id,phase,us
         charge(Phase::Insert);
         let stats = nic_latency_cost();
         assert_eq!(stats.paced_deletes, 1, "no further deletes should be paced");
-        assert_eq!(stats.paced_inserts, 1, "no further inserts should be paced");
         assert_eq!(stats.unpaced_teardown_deletes, 3);
-        assert_eq!(stats.unpaced_teardown_inserts, 1);
+        // The install worker outlives `suspend`, so its backlog must still pay: an exempt insert
+        // would let a saturated worker install for free once the run was over.
+        assert_eq!(stats.paced_inserts, 2, "inserts stay paced after teardown");
+        assert_eq!(stats.inserts_after_teardown, 1);
         assert!(stats.configured, "state still records that a trace loaded");
 
         // Suspension is permanent, and still distinguishable from never having been armed.
