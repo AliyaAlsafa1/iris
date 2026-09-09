@@ -32,6 +32,7 @@ result.** This harness reports it only for contrast.
 | **M3** | duty cycle regressed on offered load, per arm; the slope gap is the effect size | `cycle_budget.csv`, fitted by `tools/paired_ab.py` |
 | **M4** | max zero-loss throughput at fixed `--app-cycles` | `tests/functionality/zero_loss/zlt.py` |
 | **M5** | total utilisation of the rule-management core, and where its busy time went | `rule_management.*` |
+| **M6** | host memory the control plane holds, split into the part that scales with rules and the part that does not | `control_plane_memory.*` |
 
 M1 is the headline because it is load-normalised: the numerator falls when the NIC sheds traffic
 and the denominator does not, so paired runs on non-stationary live traffic remain comparable.
@@ -162,6 +163,50 @@ subtraction is the whole accounting, and it can come out negative — which is a
 * `dispatch_failures` is offloads lost to a full worker queue — the worker, not the rule table,
   being the bottleneck. Without it a saturated worker is indistinguishable from a low connection
   arrival rate, so `paired_ab.py` rejects any run with a non-zero count.
+
+## Control-plane memory, and why it is not just the rule table
+
+The obvious answer to "what does the offload cost in host memory" is the shadow rule table — the
+dedup `HashSet` and the FIFO `VecDeque` in `examples/hw_assist_eval`, plus the three `Vec`s each
+`FlowEntry` owns for its ports, flow pointers and COUNT handles. That is measured, per term, with
+`bytes_per_rule` as the figure that projects.
+
+It is also the smaller half. `ChannelDispatcher::new` is called with `ChannelMode::PerCore`, and
+per-core mode allocates **one bounded crossbeam channel per RX core**, each `--flow-channel-size`
+slots deep, in full at startup. At the default of 32768 slots that is ~2.5 MiB per RX core whether
+or not a single rule is ever installed. Measured on the one-core offline config:
+
+```
+  shadow rule table:              18 KiB over 60 rules (peak 60), 309 B/rule
+  dispatch channel:             2560 KiB over 32768 slots  <- fixed, allocated at startup
+  total:                        2578 KiB (99.3% of it fixed, i.e. independent of rule count)
+```
+
+The channel is 142x the table. On a four-core online config it is ~10 MiB. `fixed_share` reports
+this directly, and `--flow-channel-size 256` moves it from 99.3% to 52.5% — so the headline number
+is a configuration choice, not a property of the mechanism.
+
+Which term dominates depends on the rule count. At ~309 B/rule the table overtakes a
+32768-slot-per-core channel somewhere around 8500 rules per RX core, so a run capped well below
+that is measuring the channel and a run at `--max-rules 100000` is measuring the table. Report both
+terms rather than a total.
+
+Because the worker and its channel are stood up in **both** arms (see below), the fixed term is
+common to A and B, so differencing `control_plane_memory.total_bytes` across a pair isolates the
+shadow table on its own. The control arm reports the channel with an empty table, which is the
+cleanest statement of what the fixed cost is.
+
+Two caveats on the numbers:
+
+* They are **payload from live capacities, not RSS**. The allocator's per-allocation rounding and
+  headers are excluded, which is why `allocations` sits next to the byte counts — the table is not
+  one block but two backing stores plus up to three `Vec`s per entry.
+* `dedup_set_bytes` and `dispatch_channel_bytes` are **estimates of unstable internals**:
+  hashbrown's bucket count and load factor, and crossbeam's per-slot stamp. They track the real
+  allocations rather than reporting them.
+* Offline, `entry_vec_bytes` is legitimately **zero** and `allocations` is 2. No ports resolve, so
+  every `FlowEntry`'s vectors are empty and hold no allocation. Like the PMD cycle counters, this
+  part of the measurement only becomes non-trivial on the CX-5.
 
 ### The worker runs in both arms
 

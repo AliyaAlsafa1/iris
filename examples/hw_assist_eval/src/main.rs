@@ -90,6 +90,9 @@ static SHED_CONNS: AtomicU64 = AtomicU64::new(0);
 static OFFLOAD_REFUSED: AtomicU64 = AtomicU64::new(0);
 /// Rules evicted to make room, under `--table-full-policy evict`.
 static RULE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+/// Highest number of concurrently resident rules reached. The shadow table's backing stores never
+/// shrink, so this is what its memory was sized by, whatever the count is at shutdown.
+static RULES_PEAK: AtomicU64 = AtomicU64::new(0);
 
 // Cycle buckets for the rule-management core, measured on the worker thread itself. These cover
 // the part of the install path that lives in this binary; the PMD calls underneath are timed in
@@ -254,6 +257,7 @@ fn reserve(
 
     // Reserve before installing so a concurrent worker cannot double-install.
     table.resident.insert(*tuple);
+    RULES_PEAK.fetch_max(table.resident.len() as u64, Ordering::Relaxed);
     Reservation::Proceed { victim }
 }
 
@@ -362,6 +366,84 @@ fn install_hw_drop(tuple: &FiveTuple) {
     INSTALL_BUCKETS
         .table
         .fetch_add(t_done.wrapping_sub(t_locked), Ordering::Relaxed);
+}
+
+/// Size the control plane's host memory.
+///
+/// **Must run before [`drain_rules`]**, which empties the FIFO and frees every entry's `Vec`s. Run
+/// afterwards it reports an empty table, and the `HashSet`/`VecDeque` backing stores would be the
+/// only thing left — the two allocations that survive a clear, which is exactly the misleading
+/// subset.
+///
+/// Sizes are derived from live capacities rather than from a config or an allocator hook. Capacity
+/// is what the process actually holds: `--max-rules` bounds the count, but the `HashSet` and
+/// `VecDeque` grow geometrically and never shrink, so a table that briefly reached its cap keeps
+/// the memory afterwards.
+fn measure_control_plane_memory(rx_cores: usize, channel_size: usize) -> ControlPlaneMemory {
+    use std::mem::size_of;
+
+    let table = RULES.lock().unwrap();
+
+    // hashbrown rounds its bucket count to a power of two and keeps at most 7/8 of them occupied.
+    let dedup_buckets = if table.resident.capacity() == 0 {
+        0
+    } else {
+        (table.resident.capacity() * 8)
+            .div_ceil(7)
+            .next_power_of_two()
+    };
+    let dedup_set_bytes = (dedup_buckets * (size_of::<FiveTuple>() + 1)) as u64;
+    let fifo_bytes = (table.fifo.capacity() * size_of::<FlowEntry>()) as u64;
+
+    // Walked rather than multiplied out: an entry's vectors are sized by the port count, and
+    // nothing guarantees every entry saw the same ports.
+    let mut entry_vec_bytes: u64 = 0;
+    let mut entry_allocations: u64 = 0;
+    for e in &table.fifo {
+        entry_vec_bytes += (e.ports.capacity() * size_of::<PortId>()
+            + e.flow_ptrs.capacity() * size_of::<FlowPtr>()
+            + e.handle_ptrs.capacity() * size_of::<HandlePtr>()) as u64;
+        // An empty `Vec` holds no allocation, so count the ones that do rather than assuming
+        // three per entry. Offline that distinction is the whole answer: no ports resolve, so
+        // every entry's vectors are empty and the per-entry cost is genuinely zero.
+        entry_allocations += [
+            e.ports.capacity(),
+            e.flow_ptrs.capacity(),
+            e.handle_ptrs.capacity(),
+        ]
+        .iter()
+        .filter(|c| **c > 0)
+        .count() as u64;
+    }
+
+    let resident_rules = table.resident.len() as u64;
+    let allocations = entry_allocations + u64::from(dedup_buckets > 0) + u64::from(fifo_bytes > 0);
+    drop(table);
+
+    // crossbeam pairs each slot's value with a stamp; the layout is internal, so this tracks it
+    // rather than reporting it.
+    let slot_bytes = size_of::<FlowEvent>().next_multiple_of(8) + size_of::<usize>();
+    let dispatch_channel_slots = (rx_cores * channel_size) as u64;
+    let dispatch_channel_bytes = dispatch_channel_slots * slot_bytes as u64;
+
+    let shadow_table_bytes = dedup_set_bytes + fifo_bytes + entry_vec_bytes;
+    let total_bytes = shadow_table_bytes + dispatch_channel_bytes;
+    let peak_resident_rules = RULES_PEAK.load(Ordering::Relaxed);
+
+    ControlPlaneMemory {
+        resident_rules,
+        peak_resident_rules,
+        dedup_set_bytes,
+        fifo_bytes,
+        entry_vec_bytes,
+        allocations,
+        shadow_table_bytes,
+        bytes_per_rule: div(shadow_table_bytes, peak_resident_rules),
+        dispatch_channel_bytes,
+        dispatch_channel_slots,
+        total_bytes,
+        fixed_share: div(dispatch_channel_bytes, total_bytes),
+    }
 }
 
 /// Read every still-resident rule's COUNT handle, then tear the rules down. Both paths accumulate
@@ -653,6 +735,66 @@ struct RuleManagementReport {
     nonvoluntary_ctxt_switches: u64,
 }
 
+/// Host memory the control plane holds — distinct from the NIC-side rule capacity it consumes.
+///
+/// Two allocations dominate, and they are split apart here because they scale with different
+/// things. The shadow rule table grows with the number of offloaded connections. The dispatch
+/// channel is sized once, from `--flow-channel-size` times the RX core count, and never moves. At
+/// the defaults the fixed term can be the larger of the two, so the offload's memory cost is not
+/// one number that scales with rules — which is what `fixed_share` is for.
+///
+/// Byte counts are payload computed from live capacities, not RSS. They therefore exclude the
+/// allocator's own per-allocation rounding and headers, which is why `allocations` is reported
+/// next to them: the shadow table is not one contiguous block but three separate `Vec`s per entry
+/// plus two backing stores, so real RSS sits above these figures by an allocator-dependent margin.
+#[derive(Serialize)]
+struct ControlPlaneMemory {
+    /// Connections with a rule installed or in flight when the measurement was taken.
+    resident_rules: u64,
+    /// Highest `resident_rules` reached during the run. The backing stores never shrink, so this
+    /// is what sized them, and it is the count to project from.
+    peak_resident_rules: u64,
+
+    /// The dedup `HashSet`'s backing store.
+    ///
+    /// Estimated, not read: hashbrown keeps at most 7/8 of its buckets occupied and rounds the
+    /// bucket count to a power of two, and neither figure is exposed. This assumes that layout
+    /// and one control byte per bucket, so it tracks the real allocation but is not authoritative.
+    dedup_set_bytes: u64,
+    /// The FIFO `VecDeque`'s backing store: `capacity` inline `FlowEntry` slots.
+    fifo_bytes: u64,
+    /// The three `Vec`s every `FlowEntry` owns — ports, flow pointers, COUNT handles — summed over
+    /// live entries. Small individually and easy to overlook, but it is three allocations per
+    /// offloaded connection.
+    entry_vec_bytes: u64,
+    /// Live heap allocations the table holds: up to three per entry — ports, flow pointers, COUNT
+    /// handles — plus the two backing stores. Counted by which vectors actually hold capacity, so
+    /// an entry whose vectors are empty contributes nothing.
+    allocations: u64,
+    /// `dedup_set_bytes + fifo_bytes + entry_vec_bytes`.
+    shadow_table_bytes: u64,
+    /// Shadow-table bytes per offloaded connection, against `peak_resident_rules`.
+    ///
+    /// The figure to project from, but only once the table is large: both backing stores round
+    /// their capacity up to a power of two, so at a few dozen rules this is dominated by slack and
+    /// overstates the marginal cost. It converges from above as the rule count grows.
+    bytes_per_rule: f64,
+
+    /// The dispatch channels' pre-allocated slot arrays, one bounded channel per RX core.
+    ///
+    /// Allocated in full at startup whether or not anything is ever dispatched, so this is a floor
+    /// the mechanism pays in both arms. Also an estimate: crossbeam's slot carries a stamp
+    /// alongside the value, and that layout is internal.
+    dispatch_channel_bytes: u64,
+    /// `--flow-channel-size` times the number of RX cores.
+    dispatch_channel_slots: u64,
+
+    total_bytes: u64,
+    /// Share of `total_bytes` that does not scale with the number of rules. Near 1 means the run
+    /// measured the channel's fixed cost rather than the table's.
+    fixed_share: f64,
+}
+
 #[derive(Serialize)]
 struct GroundTruth {
     /// Packets/bytes the NIC's drop rules actually matched, read from the rules' indirect COUNT
@@ -679,6 +821,7 @@ struct Report {
     budget: CycleBudgetReport,
     normalised: NormalisedMetrics,
     control_plane: ControlPlaneCost,
+    control_plane_memory: ControlPlaneMemory,
     rule_management: RuleManagementReport,
     ground_truth: GroundTruth,
     ingress: Vec<IngressCounters>,
@@ -770,6 +913,7 @@ fn main() {
     // control arm, so it parks immediately and should report ~0 utilisation — which is worth
     // measuring rather than assuming, and which keeps the two arms holding the same number of
     // cores so "cores consumed" can be compared directly instead of across different machines.
+    let rx_core_count = config.get_all_rx_core_ids().len();
     let worker_handle = {
         let rx_cores = config.get_all_rx_core_ids();
         if let Some(overlap) = args
@@ -835,6 +979,10 @@ fn main() {
     // on the main thread, scales with how many rules happened to still be resident, and is not a
     // cost the mechanism pays per install.
     let mut worker_pmd = RuleControlCost::default();
+    // Sized in the pre-stop hook for the same reason as `worker_pmd`: `drain_rules` below frees
+    // every entry, and measuring after it would report only the two backing stores that survive
+    // a clear.
+    let mut cp_memory = None;
     {
         let mut worker_handle = Some(worker_handle);
         let mut pre_stop = || {
@@ -842,6 +990,10 @@ fn main() {
                 h.shutdown(None);
             }
             worker_pmd = rule_control_cost();
+            cp_memory = Some(measure_control_plane_memory(
+                rx_core_count,
+                args.flow_channel_size,
+            ));
 
             // Read the NIC-side ground truth while the rules are still resident.
             drain_rules(!args.keep_rules);
@@ -860,7 +1012,17 @@ fn main() {
         runtime.run_with_pre_stop(&mut pre_stop);
     }
 
-    let report = build_report(&args, &ingress, &worker_pmd, cycles_per_rdtsc_read, tsc_hz);
+    // The hook always runs, so the `None` case means the runtime never reached shutdown.
+    let cp_memory = cp_memory
+        .unwrap_or_else(|| measure_control_plane_memory(rx_core_count, args.flow_channel_size));
+    let report = build_report(
+        &args,
+        &ingress,
+        &worker_pmd,
+        cp_memory,
+        cycles_per_rdtsc_read,
+        tsc_hz,
+    );
     print_summary(&report);
 
     if let Some(path) = &args.report {
@@ -879,6 +1041,7 @@ fn build_report(
     args: &Args,
     ingress: &[IngressCounters],
     worker_pmd: &RuleControlCost,
+    cp_memory: ControlPlaneMemory,
     cycles_per_rdtsc_read: f64,
     tsc_hz: u64,
 ) -> Report {
@@ -960,6 +1123,7 @@ fn build_report(
             evictions: RULE_EVICTIONS.load(Ordering::Relaxed),
             install_cycles_vs_core_wall: div(cp.install_cycles, per_core_wall),
         },
+        control_plane_memory: cp_memory,
         rule_management: build_rule_management_report(&w, worker_pmd, tsc_hz),
         ground_truth: GroundTruth {
             discarded_packets: DISCARDED_PACKETS.load(Ordering::Relaxed),
@@ -1135,6 +1299,34 @@ fn print_summary(r: &Report) {
         r.ground_truth.ingress_reconciliation_gap
     );
     print_rule_management_summary(&r.rule_management);
+    print_control_plane_memory(&r.control_plane_memory);
+}
+
+/// Host memory the control plane holds. Printed as two terms because only one of them scales with
+/// the number of offloaded connections.
+fn print_control_plane_memory(m: &ControlPlaneMemory) {
+    println!("--- control-plane memory (host, payload from live capacities) ---");
+    println!(
+        "  shadow rule table:      {:>10} KiB over {} rules (peak {}), {:.0} B/rule",
+        m.shadow_table_bytes / 1024,
+        m.resident_rules,
+        m.peak_resident_rules,
+        m.bytes_per_rule
+    );
+    println!(
+        "    dedup set {} B, fifo {} B, entry vecs {} B across {} allocations",
+        m.dedup_set_bytes, m.fifo_bytes, m.entry_vec_bytes, m.allocations
+    );
+    println!(
+        "  dispatch channel:       {:>10} KiB over {} slots  <- fixed, allocated at startup",
+        m.dispatch_channel_bytes / 1024,
+        m.dispatch_channel_slots
+    );
+    println!(
+        "  total:                  {:>10} KiB ({:.1}% of it fixed, i.e. independent of rule count)",
+        m.total_bytes / 1024,
+        100.0 * m.fixed_share
+    );
 }
 
 fn per_request(cycles: u64, requests: u64) -> String {

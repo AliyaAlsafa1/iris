@@ -529,6 +529,16 @@ def write_plot(fits, out_dir):
     print(f"\nwrote {path}")
 
 
+def prefixed(section, prefix, keys):
+    """Flatten `keys` out of a report section into `prefix`-named columns.
+
+    Missing sections and missing keys both yield blanks rather than zeros, so a report written
+    before the section existed produces readable rows instead of numbers that look measured.
+    """
+    section = section or {}
+    return {f"{prefix}{k}": section.get(k, "") for k in keys}
+
+
 def rule_management_columns(rm):
     """Flatten the rule-management section for the tidy CSV.
 
@@ -587,6 +597,11 @@ def write_tidy_csv(reports, out_dir):
         "rm_understatement_vs_install_cycles", "rm_spin_fraction",
         "rm_loop_residual_fraction", "rm_handler_unbracketed_fraction",
         "rm_dedup_hits", "rm_dispatch_failures", "rm_nonvoluntary_ctxt_switches",
+        # Control-plane host memory. Blank for runs written before it was measured.
+        "cpm_resident_rules", "cpm_peak_resident_rules", "cpm_shadow_table_bytes",
+        "cpm_dedup_set_bytes", "cpm_fifo_bytes", "cpm_entry_vec_bytes", "cpm_allocations",
+        "cpm_bytes_per_rule", "cpm_dispatch_channel_bytes", "cpm_dispatch_channel_slots",
+        "cpm_total_bytes", "cpm_fixed_share",
     ]
     with path.open("w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=fields)
@@ -616,6 +631,12 @@ def write_tidy_csv(reports, out_dir):
                 "sampled_iters": b.get("sampled_iters", 0),
                 "est_poll_idle_cycles": b.get("est_poll_idle_cycles", 0.0),
                 **rule_management_columns(r.get("rule_management")),
+                **prefixed(r.get("control_plane_memory"), "cpm_", (
+                    "resident_rules", "peak_resident_rules", "shadow_table_bytes",
+                    "dedup_set_bytes", "fifo_bytes", "entry_vec_bytes", "allocations",
+                    "bytes_per_rule", "dispatch_channel_bytes", "dispatch_channel_slots",
+                    "total_bytes", "fixed_share",
+                )),
             })
     print(f"wrote {path}")
 
