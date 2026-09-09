@@ -395,13 +395,19 @@ def load_budget_rows(out_dir, arm):
 MEM_SUM_FIELDS = ("imc_bytes", "imc_read_bytes", "imc_write_bytes", "iio_in_bytes",
                   "mbm_total_bytes", "mbm_local_bytes", "mbm_remote_bytes",
                   "mbm_other_local_bytes", "core_dram_bytes", "io_dram_bytes",
-                  "io_dram_clamped", "io_dram_deficit_bytes")
+                  "io_dram_clamped", "io_dram_deficit_bytes",
+                  # Core PMU counters. MPKI is computed from these run totals rather than by
+                  # averaging per-interval MPKI, which would weight a quiet interval as heavily
+                  # as a busy one.
+                  "instructions", "llc_misses", "llc_load_misses")
 
 # Occupancies, not deltas: these belong nowhere near MEM_SUM_FIELDS. Adding a gauge across
 # intervals produces a number that grows with run length and means nothing at all.
 MEM_GAUGE_FIELDS = ("llc_occupancy_bytes", "llc_occupancy_root_bytes",
                     "llc_occupancy_all_bytes", "llc_size_bytes", "llc_ddio_bytes",
-                    "llc_ddio_fraction")
+                    "llc_ddio_fraction",
+                    # Fractions, not counts: averaged over intervals like the occupancies.
+                    "memory_bound_frac", "core_running_pct")
 
 
 def load_mem_totals(out_dir, arm, index):
@@ -552,6 +558,16 @@ def check_mem_run(report, mem, clamp_tolerance=0.05):
                     f"socket {socket}: {100 * remote_share:.0f}% of RX-core memory traffic went "
                     "to the other socket, so this socket's core/IO split is mixed across domains"
                 )
+        # Core PMU events are multiplexed when more are requested than the hardware has counters,
+        # and TMA L2 alone exceeds a hyperthreaded core's four. Perf scales the counts, so the
+        # numbers stay usable for an A/B comparison where the error largely cancels — but below a
+        # quarter of the interval there is more extrapolation than measurement.
+        running = vals.get("core_running_pct_mean")
+        if running is not None and running < 25.0:
+            problems.append(
+                f"{DECOMP_GATE}: socket {socket}: core PMU events ran for only {running:.0f}% of "
+                "each interval, so MPKI and memory-bound are mostly extrapolated"
+            )
         if vals["llc_occupancy_bytes_mean"] <= 0:
             problems.append(f"socket {socket}: LLC occupancy read zero — the resctrl monitoring "
                             "group held no RX cores, so N3 is invalid")
@@ -704,6 +720,49 @@ def analyze_memory(usable, args):
     print("  DDIO fills carry no RMID. A '-' means the sampler predates these columns.")
     print("  Caveats: free lines carry no RMID either, so I/O is overstated on a cache that is")
     print("  not full; resctrl drains recycled RMIDs lazily; CMT is sampled instantaneous state.")
+
+    # ---- N6 core stalls and miss rates ----
+    #
+    # Everything above is volume: how many bytes moved, how much cache is held. This is rate and
+    # impact — how often a lookup misses, and whether the core is actually stalled waiting. A
+    # workload can move a lot of bytes without stalling (prefetched, pipelined) or stall heavily
+    # while moving few (dependent pointer chases), so neither is derivable from the other.
+    #
+    # MPKI is per *received* work, not per ingress byte, and deliberately so. Elsewhere the
+    # denominator is ingress, because shedding must not be able to shrink it. Here the question is
+    # the opposite one — does the work that remains get cheaper? — so instructions retired is the
+    # right denominator, and a fall means each surviving packet costs fewer misses.
+    rows = [(a, s_, e) for (a, s_), e in sorted(per_arm_socket.items())]
+    if any(v.get("instructions", 0) for _, _, es in rows for v, _ in es):
+        print("\n--- N6  core stalls and miss rates, RX cores only (means over usable runs) ---")
+        print(f"{'arm':<4}{'sock':>5}{'n':>3}{'Ginstr':>10}{'L3 MPKI':>10}"
+              f"{'load MPKI':>11}{'mem-bound':>11}{'sched':>8}")
+        for arm, socket, entries in rows:
+            def total(f):
+                return sum(v.get(f, 0.0) for v, _ in entries)
+
+            def gauge(f):
+                seen = [v[f] for v, _ in entries if v.get(f) is not None]
+                return statistics.fmean(seen) if seen else None
+
+            instrs = total("instructions")
+            # From run totals, so a busy interval counts for more than a quiet one.
+            def mpki(f):
+                return f"{1000.0 * total(f) / instrs:>10.2f}" if instrs else f"{'-':>10}"
+            # load_mem_totals stores gauges under a _mean suffix; the raw name holds nothing.
+            mb = gauge("memory_bound_frac_mean")
+            run = gauge("core_running_pct_mean")
+            print(f"{arm:<4}{socket:>5}{len(entries):>3}{instrs / 1e9:>10.1f}"
+                  f"{mpki('llc_misses')}{mpki('llc_load_misses')[1:]}"
+                  + (f"{100 * mb:>10.1f}%" if mb is not None else f"{'-':>11}")
+                  + (f"{run:>7.0f}%" if run is not None else f"{'-':>8}"))
+        print("  L3 MPKI counts every LLC miss (longest_lat_cache.miss: prefetch and RFO too);")
+        print("  load MPKI counts only retired demand loads, which is what stalls the core.")
+        print("  mem-bound is the Top-down share of issue slots stalled on the memory subsystem.")
+        print("  sched is how much of each interval the events were actually scheduled — core")
+        print("  PMUs have four counters with SMT on and TMA L2 needs more, so perf multiplexes")
+        print("  and scales. Below ~25% the absolute values are mostly extrapolation, though the")
+        print("  A/B difference stays usable because the error largely cancels.")
     print("  DRAM GB is load-dependent and NOT comparable across arms; the /phy columns are.")
     print("  PCIe/phy should sit near 1: far from it means the wrong IIO stack was read.")
     print("  wr-PCIe is write traffic beyond DMA'd payload evicted once — per-packet metadata and")
@@ -1012,6 +1071,15 @@ def write_tidy_mem_csv(reports, out_dir, args):
                                                 if phy_bytes else 0.0),
                 "io_dram_bytes_per_ingress_byte": (vals["io_dram_bytes"] / phy_bytes
                                                    if phy_bytes else 0.0),
+                "instructions": int(vals.get("instructions", 0)),
+                "llc_misses": int(vals.get("llc_misses", 0)),
+                "llc_load_misses": int(vals.get("llc_load_misses", 0)),
+                "l3_mpki": (1000.0 * vals.get("llc_misses", 0) / vals["instructions"]
+                            if vals.get("instructions") else ""),
+                "l3_load_mpki": (1000.0 * vals.get("llc_load_misses", 0) / vals["instructions"]
+                                 if vals.get("instructions") else ""),
+                "memory_bound_frac": vals.get("memory_bound_frac_mean", ""),
+                "core_running_pct": vals.get("core_running_pct_mean", ""),
                 "phy_available": ing.get(socket, {}).get("phy_available", False),
             })
     if not rows:

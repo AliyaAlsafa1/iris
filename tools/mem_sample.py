@@ -563,6 +563,13 @@ def build_events(layout):
 PERF_INTERVAL_KEYS = ("interval", "counter-value", "event", "socket", "unit", "event-runtime")
 
 
+def _opt_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_perf_json_line(line: str):
     """Parse one line of `perf stat -j -I` output.
 
@@ -577,13 +584,17 @@ def parse_perf_json_line(line: str):
         row = json.loads(line)
     except json.JSONDecodeError:
         return None
-    if "counter-value" not in row and "value" not in row:
+    has_metric = row.get("metric-value") is not None
+    if "counter-value" not in row and "value" not in row and not has_metric:
         return None
     raw = row.get("counter-value", row.get("value"))
     try:
         value = float(raw)
     except (TypeError, ValueError):
-        return None  # "<not counted>" / "<not supported>"
+        # "<not counted>" / "<not supported>", or a standalone metric row with no counter.
+        if not has_metric:
+            return None
+        value = 0.0
     socket = row.get("socket") or row.get("cpu") or ""
     m = re.search(r"S(\d+)", str(socket))
     return {
@@ -594,6 +605,12 @@ def parse_perf_json_line(line: str):
         # Whether perf already applied the event's sysfs `.scale`, and in what unit. See
         # `value_to_bytes`: this is the whole reason `-j` is preferred over `-x,`.
         "unit": row.get("unit"),
+        # Present only on rows carrying a `-M` metric. Exactly one metric is ever requested, so
+        # the value needs no name matching; see `CORE_METRIC`.
+        "metric_value": _opt_float(row.get("metric-value")),
+        # Share of the interval the event was actually scheduled. Below 100 means perf multiplexed
+        # and the counts are extrapolated.
+        "pcnt_running": _opt_float(row.get("pcnt-running")),
     }
 
 
@@ -641,6 +658,115 @@ def check_events_exist(event_args):
     return problems
 
 
+# Core-PMU metrics for the RX cores. Separate from the uncore sampler because these are per-CPU
+# events, so they need `-C <rx cores>` rather than `-a`: counting system-wide would fold in the
+# sampler, the install worker and every idle CPU, none of which is the datapath.
+#
+# Two quantities, answering questions the byte counters cannot:
+#
+#   memory_bound   Fraction of issue slots stalled on the memory subsystem, from Intel's Top-down
+#                  Microarchitecture Analysis. The byte counters say how much traffic there is;
+#                  this says whether the core is actually *waiting* for it. Traffic can be high
+#                  with no stall (prefetched, pipelined) or low with heavy stalling (dependent
+#                  pointer chases), so it is not derivable from the other metrics.
+#
+#   L3 MPKI        LLC misses per thousand instructions — the miss *rate*, which occupancy and
+#                  DRAM traffic between them do not give. This is the quantity the LLC-pollution
+#                  hypothesis is actually about: whether packet DMA evicting the connection table
+#                  makes each lookup miss more often.
+#
+# Reported in two flavours because they answer different questions and are routinely conflated:
+# `longest_lat_cache.miss` counts every LLC miss including prefetches and RFOs (the classic MPKI),
+# while `mem_load_retired.l3_miss` counts only retired demand loads, which is what actually stalls
+# the core.
+CORE_EVENTS = ("instructions", "longest_lat_cache.miss", "mem_load_retired.l3_miss")
+
+# Exactly one -M metric is requested, which makes the JSON unambiguous: any row carrying a
+# `metric-value` belongs to it. Asking for several would mean matching on `metric-unit` text,
+# whose format varies between perf releases.
+CORE_METRIC = "tma_memory_bound"
+
+
+class CoreSampler:
+    """Runs a second `perf stat` over the RX cores and keeps the latest per-socket values.
+
+    Its rows are folded by a thread rather than driving the main loop, because the main loop is
+    already paced by the uncore sampler's intervals. Both run at the same `-I`, so the snapshot the
+    main loop reads is at most one interval stale — the same order of skew already present between
+    IMC and resctrl, and negligible against a run summed over 120 intervals.
+    """
+
+    def __init__(self, cores_by_socket, interval_ms, sampler_core):
+        cpu_list = ",".join(str(c) for socket in sorted(cores_by_socket)
+                            for c in cores_by_socket[socket])
+        event_args = ["-M", CORE_METRIC]
+        for ev in CORE_EVENTS:
+            event_args += ["-e", ev]
+        self.sampler = PerfSampler([], event_args, interval_ms, sampler_core,
+                                   scope=("-C", cpu_list))
+        self.cpu_list = cpu_list
+        self._lock = threading.Lock()
+        self._latest = {}
+        self._batch, self._interval = {}, None
+        self._thread = None
+        self._stop = threading.Event()
+
+    @property
+    def cmd(self):
+        return self.sampler.cmd
+
+    def start(self):
+        self.sampler.start()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self):
+        try:
+            for row in self.sampler.rows(first_row_timeout=60.0):
+                if self._stop.is_set():
+                    return
+                if self._interval is None:
+                    self._interval = row["interval"]
+                if row["interval"] != self._interval:
+                    with self._lock:
+                        self._latest = self._batch
+                    self._batch, self._interval = {}, row["interval"]
+                self._fold(row)
+        except SystemExit:
+            # The sampler gives up when perf produces nothing parseable. Core metrics then stay
+            # empty and their columns read blank; the DRAM measurement is unaffected, so this must
+            # not take the whole run down with it.
+            pass
+
+    def _fold(self, row):
+        socket = row["socket"]
+        if socket is None:
+            return
+        d = self._batch.setdefault(socket, {})
+        if row.get("metric_value") is not None:
+            # `tma_memory_bound` is reported as a percentage of issue slots.
+            d["memory_bound_frac"] = row["metric_value"] / 100.0
+        ev = row["event"]
+        if ev in CORE_EVENTS:
+            d[ev] = row["value"]
+            # Lowest running share across this socket's events bounds how much of the interval any
+            # of them was actually scheduled. Core PMUs have four general-purpose counters with
+            # hyperthreading on, and TMA L2 alone needs more than that, so multiplexing is
+            # expected and the values perf reports are extrapolated from it.
+            pct = row.get("pcnt_running")
+            if pct is not None:
+                d["running_pct"] = min(d.get("running_pct", 100.0), pct)
+
+    def latest(self):
+        with self._lock:
+            return dict(self._latest)
+
+    def stop(self):
+        self._stop.set()
+        return self.sampler.stop()
+
+
 class PerfSampler:
     """Runs `perf stat` as a child and hands back its interval rows.
 
@@ -656,13 +782,16 @@ class PerfSampler:
       restricting) meant waiting forever. The queue lets the caller apply a deadline.
     """
 
-    def __init__(self, specs, event_args, interval_ms, sampler_core):
+    def __init__(self, specs, event_args, interval_ms, sampler_core, scope=("-a",)):
         self.specs = specs
         self.event_args = event_args
+        # `scope` selects which CPUs perf counts. Uncore events are per-socket regardless, so the
+        # DRAM/PCIe sampler passes `-a`; core events are per-CPU, so the core sampler passes
+        # `-C <rx cores>` to exclude every CPU that is not part of the datapath.
         self.cmd = [
             "perf", "stat",
             "-j",                       # self-describing output; see parse_perf_json_line
-            "-a", "--per-socket",
+            *scope, "--per-socket",
             "-I", str(interval_ms),
             *event_args,
         ]
@@ -861,6 +990,24 @@ def csv_fields(port_devices):
         "core_dram_bytes",
         "io_dram_bytes",
         "io_dram_fraction",
+        # Core PMU, over the RX cores only. Blank when the core sampler produced nothing.
+        #
+        # memory_bound_frac is the Top-down share of issue slots stalled on the memory subsystem:
+        # whether the core is *waiting* on memory, which the byte counters cannot say. The two
+        # MPKI figures are miss rates rather than volumes — the quantity the LLC-pollution
+        # question is actually about.
+        #
+        # core_running_pct below 100 means perf multiplexed these events: TMA L2 needs more
+        # counters than a hyperthreaded core has, so the values are extrapolated from a fraction
+        # of the interval. Comparative A/B use is still sound because the error largely cancels,
+        # but absolute values should not be quoted without it.
+        "instructions",
+        "llc_misses",
+        "llc_load_misses",
+        "l3_mpki",
+        "l3_load_mpki",
+        "memory_bound_frac",
+        "core_running_pct",
         # 1 when MBM claimed more local traffic than the IMC saw, i.e. the counters disagree.
         "io_dram_clamped",
         # How much io_dram was clamped away, so the run total can be corrected and the bias sized.
@@ -1000,7 +1147,10 @@ def main():
             f"s{s}: {g['cpus_list']}" for s, g in groups.groups.items()))
 
         sampler = PerfSampler(specs, event_args, interval_ms, args.sampler_core).start()
-        print(f"perf            {' '.join(sampler.cmd)}\n")
+        print(f"perf uncore     {' '.join(sampler.cmd)}")
+        core_sampler = CoreSampler(layout["cores_by_socket"], interval_ms,
+                                   args.sampler_core).start()
+        print(f"perf core       {' '.join(core_sampler.cmd)}\n")
 
         started = time.time()
         # MBM counters are cumulative per RMID, so bandwidth is a delta; occupancy is a gauge.
@@ -1037,6 +1187,7 @@ def main():
                     cur_interval = row["interval"]
                 if row["interval"] != cur_interval:
                     rdt = groups.read()
+                    core_now = core_sampler.latest()
                     agg = aggregate_interval(batch, specs_by_event, port_devices)
                     now_ms = int(time.time() * 1000)
                     for socket, vals in sorted(agg.items()):
@@ -1104,6 +1255,28 @@ def main():
                             "" if ddio is None else round(ddio / llc_size, 6)
                         )
 
+                        # Core PMU snapshot, at most one interval stale; see `CoreSampler`.
+                        cm = core_now.get(socket, {})
+                        instrs = cm.get("instructions")
+                        misses = cm.get("longest_lat_cache.miss")
+                        load_misses = cm.get("mem_load_retired.l3_miss")
+
+                        def mpki(m):
+                            # Blank rather than zero when either input is missing: a zero MPKI
+                            # asserts a perfect cache, which is the opposite of "not measured".
+                            return round(1000.0 * m / instrs, 4) if (m and instrs) else ""
+
+                        rec["instructions"] = int(instrs) if instrs is not None else ""
+                        rec["llc_misses"] = int(misses) if misses is not None else ""
+                        rec["llc_load_misses"] = (int(load_misses) if load_misses is not None
+                                                  else "")
+                        rec["l3_mpki"] = mpki(misses)
+                        rec["l3_load_mpki"] = mpki(load_misses)
+                        mb = cm.get("memory_bound_frac")
+                        rec["memory_bound_frac"] = round(mb, 6) if mb is not None else ""
+                        rp = cm.get("running_pct")
+                        rec["core_running_pct"] = round(rp, 2) if rp is not None else ""
+
                         # The headline decomposition. Core-originated is the RX cores plus every
                         # other CPU on the box; whatever the memory controller saw beyond that had
                         # no core behind it, which on this microarchitecture means DDIO/IIO.
@@ -1145,6 +1318,7 @@ def main():
                 batch.append(row)
 
         err = sampler.stop()
+        core_err = core_sampler.stop()
 
     if args.selftest:
         print("=== selftest ===")
@@ -1184,6 +1358,27 @@ def main():
                     if ev not in advanced:
                         failures.append(f"{ev}: did not advance")
         print(f"  rows written: {written}")
+
+        # Core PMU: report rather than gate. These events are multiplexed by design, and whether
+        # the metric resolves at all depends on the perf build's TMA tables, so a hard pass/fail
+        # here would reject working hosts. Printing what came back is what makes it diagnosable.
+        core_now = core_sampler.latest()
+        print("\n  core PMU over the RX cores (perf -M / -e, multiplexed):")
+        if not core_now:
+            print("    NOTHING RETURNED — the -C/--per-socket combination or the TMA metric may")
+            print(f"    be unsupported here. Try: perf stat -C {core_sampler.cpu_list} "
+                  f"--per-socket -M {CORE_METRIC} -- sleep 1")
+        for socket, cm in sorted(core_now.items()):
+            instrs = cm.get("instructions")
+            miss = cm.get("longest_lat_cache.miss")
+            mb = cm.get("memory_bound_frac")
+            run = cm.get("running_pct")
+            mpki = f"{1000.0 * miss / instrs:.2f}" if (miss and instrs) else "-"
+            print(f"    socket {socket}: instr {instrs or 0:,.0f}, L3 MPKI {mpki}, "
+                  f"mem-bound {f'{100 * mb:.1f}%' if mb is not None else '-'}, "
+                  f"scheduled {f'{run:.0f}%' if run is not None else '-'}")
+        if core_err.strip():
+            print("    perf (core) said:", core_err.strip().splitlines()[-1][:120])
 
         # Rates, not just liveness. Scaling errors pass a pass/fail check and are obvious here.
         elapsed = max(time.time() - started, 1e-9)
