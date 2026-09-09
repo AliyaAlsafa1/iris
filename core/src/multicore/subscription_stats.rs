@@ -72,9 +72,41 @@ impl SubscriptionStats {
         self.actively_processing.load(Ordering::Relaxed)
     }
 
+    /// Mark `count` messages as being processed until the returned guard is dropped.
+    ///
+    /// A guard rather than a bare `fetch_add`/`fetch_sub` pair around the handler calls, because
+    /// the decrement has to survive a panicking handler. `wait_for_completion` blocks until this
+    /// counter reaches zero, so a single lost decrement does not merely skew a statistic — it
+    /// wedges shutdown forever, and in an application that writes its results from a shutdown
+    /// hook that means one panicking message costs the whole run.
+    pub fn begin_processing(&self, count: u64) -> InFlight {
+        self.actively_processing.fetch_add(count, Ordering::Relaxed);
+        InFlight {
+            counter: Arc::clone(&self.actively_processing),
+            count,
+        }
+    }
+
     /// Returns the current number of messages flushed to disk.
     pub fn get_flushed(&self) -> u64 {
         self.flushed.load(Ordering::Relaxed)
+    }
+}
+
+/// Outstanding work registered by [`SubscriptionStats::begin_processing`], released on drop.
+///
+/// Drop it explicitly if the decrement needs to land at a particular point — worker loops that
+/// attribute their own cycles care where it happens — otherwise let it fall out of scope.
+#[must_use = "actively_processing is only decremented when the guard drops, so it must be held \
+              for as long as the batch is being processed"]
+pub struct InFlight {
+    counter: Arc<AtomicU64>,
+    count: u64,
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(self.count, Ordering::Relaxed);
     }
 }
 
