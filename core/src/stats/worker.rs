@@ -29,11 +29,12 @@
 
 use crate::dpdk;
 use cpu_time::ThreadTime;
-use std::sync::atomic::{AtomicU64, Ordering};
+use lazy_static::lazy_static;
+use std::sync::Mutex;
 
 /// Where an off-datapath worker thread's time went, summed across worker threads.
 ///
-/// The three cycle buckets are disjoint and sum to `wall` by construction, which is what
+/// The four cycle buckets are disjoint and sum to `wall` by construction, which is what
 /// [`Self::residual_fraction`] checks. `cpu_ns` is measured on a different clock and is *not* part
 /// of that sum — see the module docs for why both are needed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -57,23 +58,17 @@ pub struct WorkerBudget {
     /// these are three cold atomic read-modify-writes, not the handful of cycles they look like:
     /// left inside `handler` they would inflate the apparent per-item cost of the actual work.
     pub bookkeeping: u64,
-    /// Batches the handler was invoked for.
-    pub batches: u64,
     /// Items handled.
     pub items: u64,
     /// Worker threads that contributed. `wall` is a sum across them, so per-core figures need it
     /// as a divisor.
     pub threads: u64,
-    /// Context switches over the run, read from `/proc/thread-self/status`.
+    /// Involuntary context switches over the run, from `/proc/thread-self/status`.
     ///
-    /// On a properly isolated core the nonvoluntary count should be ~0. A large one means the
-    /// scheduler put something else on the core, in which case `cpu_ns` still measures this
-    /// thread honestly but no longer describes what the core as a whole was doing.
-    pub voluntary_ctxt_switches: u64,
+    /// On a properly isolated core this should be ~0. A large value means the scheduler put
+    /// something else on the core, in which case `cpu_ns` still measures this thread honestly but
+    /// no longer describes what the core as a whole was doing.
     pub nonvoluntary_ctxt_switches: u64,
-    /// `rte_rdtsc()` calls the instrumentation made, for the same overhead bound
-    /// `DatapathBudget` reports.
-    pub rdtsc_reads: u64,
 }
 
 impl WorkerBudget {
@@ -103,17 +98,6 @@ impl WorkerBudget {
         fraction(self.items as f64 * 1e9, self.cpu_ns as f64)
     }
 
-    /// Mean handler cycles per item. The per-install cost that generalises to other install rates.
-    pub fn cycles_per_item(&self) -> f64 {
-        fraction(self.handler as f64, self.items as f64)
-    }
-
-    /// Share of `wall` spent in the handler. Note this is a share of *wall*, not of busy time: a
-    /// worker that is 2% utilised and spends all of it installing rules reports ~0.02 here.
-    pub fn handler_fraction(&self) -> f64 {
-        fraction(self.handler as f64, self.wall as f64)
-    }
-
     /// How far the buckets miss `wall`, as a fraction of it. Should be ~0; a non-zero value means
     /// the loop has a path this does not bracket and the attribution cannot be trusted.
     pub fn residual_fraction(&self) -> f64 {
@@ -135,6 +119,20 @@ impl WorkerBudget {
         let on_cpu_while_blocked = self.cpu_cycles(tsc_hz) - busy;
         fraction(on_cpu_while_blocked, self.blocked as f64).clamp(0.0, 1.0)
     }
+
+    /// Fold one thread's budget into a running total. Every field is additive, `threads`
+    /// included, which is what makes the summed `wall` a meaningful divisor.
+    fn merge(&mut self, other: &Self) {
+        self.cpu_ns += other.cpu_ns;
+        self.wall += other.wall;
+        self.blocked += other.blocked;
+        self.dispatch += other.dispatch;
+        self.handler += other.handler;
+        self.bookkeeping += other.bookkeeping;
+        self.items += other.items;
+        self.threads += other.threads;
+        self.nonvoluntary_ctxt_switches += other.nonvoluntary_ctxt_switches;
+    }
 }
 
 fn fraction(num: f64, den: f64) -> f64 {
@@ -151,10 +149,15 @@ fn fraction(num: f64, den: f64) -> f64 {
 /// sum to the loop's span the same way `DatapathBudget`'s do. The calls must therefore follow the
 /// loop's actual control flow — a path that skips one leaves a gap, which is what
 /// [`WorkerBudget::residual_fraction`] is for.
+///
+/// Publishing happens in [`Drop`], so simply letting the probe fall out of scope records the
+/// thread. That is deliberate rather than tidy: a handler that panics unwinds past any explicit
+/// call, and a thread whose budget went unpublished is indistinguishable in the report from a
+/// worker that was configured but never used.
 pub struct WorkerProbe {
     budget: WorkerBudget,
     cpu_start: ThreadTime,
-    ctxt_start: (u64, u64),
+    nonvol_ctxt_start: u64,
     wall_start: u64,
     cursor: u64,
 }
@@ -167,11 +170,10 @@ impl WorkerProbe {
         Self {
             budget: WorkerBudget {
                 threads: 1,
-                rdtsc_reads: 1,
                 ..Default::default()
             },
             cpu_start: ThreadTime::now(),
-            ctxt_start: read_ctxt_switches(),
+            nonvol_ctxt_start: read_nonvoluntary_ctxt_switches(),
             wall_start: now,
             cursor: now,
         }
@@ -180,7 +182,6 @@ impl WorkerProbe {
     /// Close the open span and open the next, returning its length.
     fn split(&mut self) -> u64 {
         let now = unsafe { dpdk::rte_rdtsc() };
-        self.budget.rdtsc_reads += 1;
         let span = now.wrapping_sub(self.cursor);
         self.cursor = now;
         span
@@ -196,85 +197,59 @@ impl WorkerProbe {
 
     pub fn end_handler(&mut self, items: u64) {
         self.budget.handler += self.split();
-        self.budget.batches += 1;
         self.budget.items += items;
     }
 
     pub fn end_bookkeeping(&mut self) {
         self.budget.bookkeeping += self.split();
     }
+}
 
-    /// Close the run and publish into the process-wide totals.
-    pub fn finish(mut self) {
+impl Drop for WorkerProbe {
+    fn drop(&mut self) {
         let end = unsafe { dpdk::rte_rdtsc() };
-        self.budget.rdtsc_reads += 1;
         self.budget.wall = end.wrapping_sub(self.wall_start);
         self.budget.cpu_ns = self.cpu_start.elapsed().as_nanos() as u64;
-
-        let (vol, nonvol) = read_ctxt_switches();
-        self.budget.voluntary_ctxt_switches = vol.saturating_sub(self.ctxt_start.0);
-        self.budget.nonvoluntary_ctxt_switches = nonvol.saturating_sub(self.ctxt_start.1);
+        self.budget.nonvoluntary_ctxt_switches =
+            read_nonvoluntary_ctxt_switches().saturating_sub(self.nonvol_ctxt_start);
 
         publish_worker_thread(&self.budget);
     }
 }
 
-/// `(voluntary, nonvoluntary)` context switches for the calling thread.
+/// Involuntary context switches for the calling thread.
 ///
 /// Read from `/proc/thread-self`, which the kernel resolves to the calling thread, so this needs
-/// no `gettid` and no extra crate feature. Returns zeroes if the file is unreadable; the counts are
-/// a diagnostic, so failing to read them should not take the rest of the budget down with it.
-fn read_ctxt_switches() -> (u64, u64) {
+/// no `gettid` and no extra crate feature. Returns 0 if the file is unreadable: the count is a
+/// diagnostic, so failing to read it should not take the rest of the budget down with it.
+fn read_nonvoluntary_ctxt_switches() -> u64 {
     let Ok(status) = std::fs::read_to_string("/proc/thread-self/status") else {
-        return (0, 0);
+        return 0;
     };
-    let mut vol = 0;
-    let mut nonvol = 0;
-    for line in status.lines() {
-        let Some((key, val)) = line.split_once(':') else {
-            continue;
-        };
-        let parsed = val.trim().parse().unwrap_or(0);
-        match key {
-            "voluntary_ctxt_switches" => vol = parsed,
-            "nonvoluntary_ctxt_switches" => nonvol = parsed,
-            _ => {}
-        }
-    }
-    (vol, nonvol)
+    status
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(key, _)| *key == "nonvoluntary_ctxt_switches")
+        .and_then(|(_, val)| val.trim().parse().ok())
+        .unwrap_or(0)
 }
 
-static W_CPU_NS: AtomicU64 = AtomicU64::new(0);
-static W_WALL: AtomicU64 = AtomicU64::new(0);
-static W_BLOCKED: AtomicU64 = AtomicU64::new(0);
-static W_DISPATCH: AtomicU64 = AtomicU64::new(0);
-static W_HANDLER: AtomicU64 = AtomicU64::new(0);
-static W_BOOKKEEPING: AtomicU64 = AtomicU64::new(0);
-static W_BATCHES: AtomicU64 = AtomicU64::new(0);
-static W_ITEMS: AtomicU64 = AtomicU64::new(0);
-static W_THREADS: AtomicU64 = AtomicU64::new(0);
-static W_VOL_CTXT: AtomicU64 = AtomicU64::new(0);
-static W_NONVOL_CTXT: AtomicU64 = AtomicU64::new(0);
-static W_RDTSC_READS: AtomicU64 = AtomicU64::new(0);
+lazy_static! {
+    /// Every finished worker thread's budget, folded together.
+    ///
+    /// A mutex rather than a bank of atomics because publication happens exactly once per thread,
+    /// at thread exit. `publish_datapath_delta` needs atomics since the monitor reads the datapath
+    /// budget *during* the run to log a duty cycle against each interval's load; a worker core's
+    /// utilisation is a whole-run figure, so there is no concurrent reader to design for.
+    static ref TOTALS: Mutex<WorkerBudget> = Mutex::new(WorkerBudget::default());
+}
 
-/// Add one finished worker thread's budget to the process-wide totals.
-///
-/// Published once, at thread exit, rather than incrementally as `publish_datapath_delta` is: the
-/// datapath's budget has to be readable mid-run so the monitor can log a duty cycle against each
-/// interval's load, whereas a worker core's utilisation is a whole-run figure.
+/// Add one finished worker thread's budget to the process-wide total.
 pub fn publish_worker_thread(b: &WorkerBudget) {
-    W_CPU_NS.fetch_add(b.cpu_ns, Ordering::Relaxed);
-    W_WALL.fetch_add(b.wall, Ordering::Relaxed);
-    W_BLOCKED.fetch_add(b.blocked, Ordering::Relaxed);
-    W_DISPATCH.fetch_add(b.dispatch, Ordering::Relaxed);
-    W_HANDLER.fetch_add(b.handler, Ordering::Relaxed);
-    W_BOOKKEEPING.fetch_add(b.bookkeeping, Ordering::Relaxed);
-    W_BATCHES.fetch_add(b.batches, Ordering::Relaxed);
-    W_ITEMS.fetch_add(b.items, Ordering::Relaxed);
-    W_THREADS.fetch_add(b.threads, Ordering::Relaxed);
-    W_VOL_CTXT.fetch_add(b.voluntary_ctxt_switches, Ordering::Relaxed);
-    W_NONVOL_CTXT.fetch_add(b.nonvoluntary_ctxt_switches, Ordering::Relaxed);
-    W_RDTSC_READS.fetch_add(b.rdtsc_reads, Ordering::Relaxed);
+    // Tolerate a poisoned lock instead of unwrapping: this runs from `WorkerProbe::drop`, which
+    // may itself be executing during a panic, and a second panic there would abort the process
+    // rather than record the thread.
+    TOTALS.lock().unwrap_or_else(|e| e.into_inner()).merge(b);
 }
 
 /// Worker time summed over every worker thread that has exited its loop.
@@ -282,18 +257,5 @@ pub fn publish_worker_thread(b: &WorkerBudget) {
 /// Read after the workers are joined. `threads` is 0 if nothing was instrumented, which is the
 /// signal that the run had no worker cores rather than fully idle ones.
 pub fn worker_budget() -> WorkerBudget {
-    WorkerBudget {
-        cpu_ns: W_CPU_NS.load(Ordering::Relaxed),
-        wall: W_WALL.load(Ordering::Relaxed),
-        blocked: W_BLOCKED.load(Ordering::Relaxed),
-        dispatch: W_DISPATCH.load(Ordering::Relaxed),
-        handler: W_HANDLER.load(Ordering::Relaxed),
-        bookkeeping: W_BOOKKEEPING.load(Ordering::Relaxed),
-        batches: W_BATCHES.load(Ordering::Relaxed),
-        items: W_ITEMS.load(Ordering::Relaxed),
-        threads: W_THREADS.load(Ordering::Relaxed),
-        voluntary_ctxt_switches: W_VOL_CTXT.load(Ordering::Relaxed),
-        nonvoluntary_ctxt_switches: W_NONVOL_CTXT.load(Ordering::Relaxed),
-        rdtsc_reads: W_RDTSC_READS.load(Ordering::Relaxed),
-    }
+    *TOTALS.lock().unwrap_or_else(|e| e.into_inner())
 }

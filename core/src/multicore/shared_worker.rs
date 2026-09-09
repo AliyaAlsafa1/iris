@@ -288,10 +288,6 @@ where
                 }
             }
         }
-
-        if let Some(p) = probe {
-            p.finish();
-        }
     }
 }
 

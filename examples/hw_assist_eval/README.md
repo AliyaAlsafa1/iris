@@ -145,10 +145,13 @@ subtraction is the whole accounting, and it can come out negative — which is a
 ### Reading the buckets honestly
 
 * `handler_unbracketed_fraction` is the share of handler time no bucket covers: closure dispatch,
-  batch iteration, the bucket updates, prologue and epilogue. It is ~15% at low install rates and
-  has **not** been attributed further — packing the buckets onto one cache line was tried on the
-  theory that their atomics dominated, and made no measurable difference. It does not put the
-  headline at risk, since `busy_fraction` comes from the CPU clock rather than from these buckets.
+  batch iteration, the bucket updates, prologue and epilogue. Offline it has measured anywhere from
+  12% to 24%, and that spread is **machine state, not install rate**: across two days on one host
+  the `table` bucket moved 19% while `handler` moved 10%, so the bracketed share shrank faster than
+  the total and the residual grew with no code change. Do not quote a single figure for it. It has
+  **not** been attributed further — packing the buckets onto one cache line was tried on the theory
+  that their atomics dominated, and made no measurable difference. It does not put the headline at
+  risk, since `busy_fraction` comes from the CPU clock rather than from these buckets.
 * Per-request cycle figures measured at a low install rate are **cold-core** figures. A worker that
   parks for millions of cycles between installs takes every access cold, which is why a `HashSet`
   insert shows up at thousands of cycles. Do not extrapolate them to high install rates.

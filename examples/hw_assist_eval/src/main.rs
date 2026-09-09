@@ -106,9 +106,6 @@ static RULE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 /// line was tried as a way to cut the attribution's own cost and measurably did not help, so
 /// nothing here depends on their layout.
 struct InstallBuckets {
-    /// Handler entry up to the first lock attempt: three `OnceLock` reads and the `RULES` deref.
-    /// Nominally a few dozen cycles, and more in practice, since a parked core takes them cold.
-    preamble: AtomicU64,
     /// Waiting for the `RULES` mutex. The lock is deliberately never held across an `rte_flow`
     /// call, so with one worker core this is pure uncontended-acquire cost; with several it is the
     /// figure that says whether more worker cores buy install throughput or just contention.
@@ -125,7 +122,6 @@ struct InstallBuckets {
 }
 
 static INSTALL_BUCKETS: InstallBuckets = InstallBuckets {
-    preamble: AtomicU64::new(0),
     lock_wait: AtomicU64::new(0),
     table: AtomicU64::new(0),
     install_span: AtomicU64::new(0),
@@ -268,8 +264,6 @@ fn reserve(
 /// the PMD counters in `iris_core::filter::flow_drop` should account for
 /// `WorkerBudget::handler`, which is measured independently from inside the worker loop.
 fn install_hw_drop(tuple: &FiveTuple) {
-    let t_entry = unsafe { iris_core::rte_rdtsc() };
-
     let ports = match PORT_IDS.get() {
         Some(p) => p,
         None => {
@@ -289,10 +283,7 @@ fn install_hw_drop(tuple: &FiveTuple) {
         drop(table);
         let t_done = unsafe { iris_core::rte_rdtsc() };
 
-        // All three updates after the last read, so that no bucket absorbs another's write.
-        INSTALL_BUCKETS
-            .preamble
-            .fetch_add(t_enter.wrapping_sub(t_entry), Ordering::Relaxed);
+        // Both updates after the last read, so that neither bucket absorbs the other's write.
         INSTALL_BUCKETS
             .lock_wait
             .fetch_add(t_locked.wrapping_sub(t_enter), Ordering::Relaxed);
@@ -589,6 +580,9 @@ struct RuleManagementReport {
     /// dedup or be refused. Requests are the unit to compare against a TLS connection arrival
     /// rate, which is the crossover the README predicts as the binding constraint. Independent of
     /// this run's offered load, unlike a utilisation fraction.
+    ///
+    /// Computed by [`iris_core::stats::WorkerBudget::sustainable_item_rate`], which is named for
+    /// the generic worker it lives on; an "item" there is one offload request here.
     sustainable_offload_rate: f64,
 
     /// Cycles spanned by the worker loop, and the buckets it splits into.
@@ -612,9 +606,6 @@ struct RuleManagementReport {
     /// Offload requests the worker handled. The denominator for the per-request means, and the
     /// unit `sustainable_offload_rate` is expressed in.
     offload_requests: u64,
-    /// Handler entry to the first lock attempt. Larger than its instruction count suggests, since
-    /// a parked core takes these accesses cold.
-    preamble_cycles: u64,
     /// Waiting for the `RULES` mutex. With one worker core this is uncontended-acquire cost; with
     /// several it is the figure that says whether more worker cores buy install throughput.
     lock_wait_cycles: u64,
@@ -636,10 +627,11 @@ struct RuleManagementReport {
     ///
     /// What lives in this region is per-call overhead outside every span: the boxed-closure
     /// dispatch, the batch iteration, the bucket updates themselves, and the handler's own
-    /// prologue and epilogue. It has not been attributed more finely than that. Packing the
-    /// buckets onto one cache line was tried on the theory that their read-modify-writes dominated
-    /// and made no difference, so the cause is not established — treat it as cold-core per-call
-    /// cost, and expect it to shrink as a share once the install rate keeps the core warm.
+    /// prologue and epilogue. It has not been attributed more finely than that, and it is not
+    /// stable: offline it has ranged over 12-24% across days on one host, because the buckets and
+    /// the total are both cold-miss dominated and do not move together. Packing the buckets onto
+    /// one cache line was tried on the theory that their read-modify-writes dominated and made no
+    /// difference, so the cause is not established.
     ///
     /// It is also the cross-check between the two instrumentation layers: `handler_cycles` is
     /// timed independently inside the worker loop, so a jump here means a span stopped being
@@ -992,12 +984,11 @@ fn build_rule_management_report(
     pmd: &RuleControlCost,
     tsc_hz: u64,
 ) -> RuleManagementReport {
-    let preamble = INSTALL_BUCKETS.preamble.load(Ordering::Relaxed);
     let lock_wait = INSTALL_BUCKETS.lock_wait.load(Ordering::Relaxed);
     let table = INSTALL_BUCKETS.table.load(Ordering::Relaxed);
     let install_span = INSTALL_BUCKETS.install_span.load(Ordering::Relaxed);
     let evict_span = INSTALL_BUCKETS.evict_span.load(Ordering::Relaxed);
-    let accounted = preamble + lock_wait + table + install_span + evict_span;
+    let accounted = lock_wait + table + install_span + evict_span;
 
     RuleManagementReport {
         cores: w.threads,
@@ -1013,7 +1004,6 @@ fn build_rule_management_report(
         spin_fraction: w.spin_fraction(tsc_hz),
         loop_residual_fraction: w.residual_fraction(),
         offload_requests: w.items,
-        preamble_cycles: preamble,
         lock_wait_cycles: lock_wait,
         table_cycles: table,
         install_span_cycles: install_span,
@@ -1205,11 +1195,6 @@ fn print_rule_management_summary(m: &RuleManagementReport) {
     println!(
         "      install glue:       {:>12} cyc (pattern/action marshalling, by residual)",
         m.install_glue_cycles
-    );
-    println!(
-        "      preamble:           {:>12} cyc ({} per request, cold on a parked core)",
-        m.preamble_cycles,
-        per_request(m.preamble_cycles, m.offload_requests)
     );
     println!(
         "      lock wait:          {:>12} cyc ({} per request)",

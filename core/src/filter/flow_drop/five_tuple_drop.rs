@@ -78,26 +78,6 @@ pub struct RuleControlCost {
     pub queries: u64,
 }
 
-impl RuleControlCost {
-    /// Every PMD cycle the control plane spent, install and teardown together.
-    pub fn total_cycles(&self) -> u64 {
-        self.install_cycles
-            + self.destroy_cycles
-            + self.handle_create_cycles
-            + self.handle_destroy_cycles
-            + self.query_cycles
-    }
-
-    /// Cycles to put one rule in the NIC: the create plus its COUNT handle.
-    pub fn cycles_per_install(&self) -> f64 {
-        if self.installs == 0 {
-            0.0
-        } else {
-            (self.install_cycles + self.handle_create_cycles) as f64 / self.installs as f64
-        }
-    }
-}
-
 /// Snapshot of the control-plane cost.
 pub fn rule_control_cost() -> RuleControlCost {
     RuleControlCost {
@@ -275,7 +255,7 @@ fn build_pattern(tuple: &FiveTuple, storage: &mut PatternStorage) -> Result<[rte
 ///
 /// Wrapped rather than timed inline because the failed-install cleanup paths call this too, and
 /// those cycles are as much a cost of the mechanism as the successful ones.
-fn destroy_count_handle(port_id: u16, handle: *mut rte_flow_action_handle) -> i32 {
+fn destroy_count_handle(port_id: u16, handle: *mut rte_flow_action_handle) {
     let mut error: rte_flow_error = unsafe { mem::zeroed() };
     let start = unsafe { dpdk::rte_rdtsc() };
     let ret = unsafe { rte_flow_action_handle_destroy(port_id, handle, &mut error) };
@@ -290,7 +270,6 @@ fn destroy_count_handle(port_id: u16, handle: *mut rte_flow_action_handle) -> i3
         let msg = unsafe { CStr::from_ptr(error.message).to_string_lossy().into_owned() };
         eprintln!("Failed to destroy count handle on port {port_id}: {msg}");
     }
-    ret
 }
 
 fn create_count_handle(port_id: u16) -> Result<*mut rte_flow_action_handle> {

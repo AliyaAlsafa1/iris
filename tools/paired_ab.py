@@ -181,7 +181,7 @@ def check_run(report):
                             f"(residual {rm['loop_residual_fraction']:.2%})")
         # A worker that spun instead of parking was consuming a core the whole run, so
         # `busy_fraction` is not the cost and the utilisation figure cannot be read as one.
-        if rm.get("spin_fraction", 0.0) > 0.5 and rm.get("blocked_cycles", 0) > 0:
+        if rm.get("spin_fraction", 0.0) > 0.5:
             problems.append(f"worker spun for {rm['spin_fraction']:.0%} of its idle time rather "
                             "than parking: utilisation is not interpretable")
     if report["drop_mode"] == "hardware":
@@ -544,7 +544,6 @@ def rule_management_columns(rm):
         "rm_offload_requests": "offload_requests",
         "rm_handler_cycles": "handler_cycles",
         "rm_bookkeeping_cycles": "bookkeeping_cycles",
-        "rm_preamble_cycles": "preamble_cycles",
         "rm_lock_wait_cycles": "lock_wait_cycles",
         "rm_table_cycles": "table_cycles",
         "rm_install_span_cycles": "install_span_cycles",
@@ -558,12 +557,7 @@ def rule_management_columns(rm):
         "rm_dispatch_failures": "dispatch_failures",
         "rm_nonvoluntary_ctxt_switches": "nonvoluntary_ctxt_switches",
     }
-    if not rm:
-        out = {k: "" for k in fields}
-        out["rm_pmd_install_cycles"] = ""
-        out["rm_pmd_handle_create_cycles"] = ""
-        return out
-
+    rm = rm or {}
     out = {col: rm.get(key, "") for col, key in fields.items()}
     pmd = rm.get("pmd") or {}
     out["rm_pmd_install_cycles"] = pmd.get("install_cycles", "")
@@ -587,7 +581,7 @@ def write_tidy_csv(reports, out_dir):
         # Rule-management core. Blank for runs written before it was instrumented.
         "rm_cores", "rm_cpu_seconds", "rm_busy_fraction", "rm_cores_busy",
         "rm_sustainable_offload_rate", "rm_offload_requests", "rm_handler_cycles",
-        "rm_bookkeeping_cycles", "rm_preamble_cycles", "rm_lock_wait_cycles", "rm_table_cycles",
+        "rm_bookkeeping_cycles", "rm_lock_wait_cycles", "rm_table_cycles",
         "rm_install_span_cycles", "rm_evict_span_cycles", "rm_install_glue_cycles",
         "rm_pmd_install_cycles", "rm_pmd_handle_create_cycles",
         "rm_understatement_vs_install_cycles", "rm_spin_fraction",
