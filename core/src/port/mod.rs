@@ -111,10 +111,14 @@ pub(crate) struct Port {
 
     /// Redirection table mapping RSS bucket IDs to RxQueueIds
     pub(crate) reta: [RxQueueId; RSS_RETA_SIZE],
+
+    /// Whether Split queues use the two-segment buffer-split RX layout.
+    /// When false they are set up as ordinary queues (see `OnlineConfig::buffer_split`).
+    pub(crate) buffer_split: bool,
 }
 
 impl Port {
-    pub(crate) fn new(port_map: &PortMap, flow_mode: FlowMode) -> Port {
+    pub(crate) fn new(port_map: &PortMap, flow_mode: FlowMode, buffer_split: bool) -> Port {
         let port_id = PortId::new_from_device(port_map.device.clone());
 
         let mut queue_map: BTreeMap<RxQueue, CoreId> = BTreeMap::new();
@@ -196,6 +200,7 @@ impl Port {
             device: port_map.device.clone(),
             queue_map,
             reta,
+            buffer_split,
         }
     }
 
@@ -375,10 +380,11 @@ impl Port {
         }
 
         // turns on buffer split if supported and actually used
-        let has_split_queues = self
-            .queue_map
-            .keys()
-            .any(|rxq| rxq.ty == RxQueueType::Split);
+        let has_split_queues = self.buffer_split
+            && self
+                .queue_map
+                .keys()
+                .any(|rxq| rxq.ty == RxQueueType::Split);
         if has_split_queues
             && dev_info.rx_offload_capa & dpdk::RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT as u64 != 0
         {
@@ -446,7 +452,9 @@ impl Port {
     ) -> Result<()> {
         for rxqueue in self.queue_map.keys() {
             match rxqueue.ty {
-                RxQueueType::Split => self.setup_split_queue(rxqueue, split_mempool, nb_rxd)?,
+                RxQueueType::Split if self.buffer_split => {
+                    self.setup_split_queue(rxqueue, split_mempool, nb_rxd)?
+                }
                 _ => self.setup_standard_queue(rxqueue, standard_mempool, nb_rxd)?,
             };
         }

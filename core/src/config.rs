@@ -166,7 +166,19 @@ impl RuntimeConfig {
             }
             for port in online.ports.iter() {
                 eal_params.push("-a".to_owned());
-                eal_params.push(port.device.to_string());
+                // Devargs are comma-separated after the PCI address, so this
+                // composes with any the user already set (e.g. txq_mem_algn=0).
+                // Skipped if the device string already carries rx_vec_en.
+                if online.force_scalar_rx && !port.device.contains("rx_vec_en") {
+                    println!(
+                        "NOTE: force_scalar_rx = true -- appending mlx5 devarg rx_vec_en=0 to {}. \
+                         Verify every queue reads rx_burst=\"Scalar\" in the RX datapath block.",
+                        port.device
+                    );
+                    eal_params.push(format!("{},rx_vec_en=0", port.device));
+                } else {
+                    eal_params.push(port.device.to_string());
+                }
             }
         }
 
@@ -298,6 +310,14 @@ fn default_flow_mode() -> FlowMode {
     FlowMode::Standard
 }
 
+fn default_buffer_split() -> bool {
+    true
+}
+
+fn default_force_scalar_rx() -> bool {
+    false
+}
+
 /* --------------------------------------------------------------------------------- */
 
 /// Live traffic analysis options.
@@ -388,6 +408,48 @@ pub struct OnlineConfig {
     /// Defaults to `standard` (no rules installed).
     #[serde(default = "default_flow_mode")]
     pub flow_mode: FlowMode,
+
+    /// Whether Split queues are configured with the two-segment buffer-split RX
+    /// layout. Defaults to `true` (the real split datapath).
+    ///
+    /// Setting this to `false` keeps EVERYTHING else about split mode identical
+    /// -- same queue count (2 per core), same queue->core pairing, same
+    /// `rte_flow` QUEUE steering, same alternating poll loop -- but sets the
+    /// Split queues up as ordinary single-segment queues off the standard
+    /// mempool, and drops the port-level BUFFER_SPLIT/SCATTER offloads.
+    ///
+    /// This exists purely as an A/B: it separates "the port has 2*ncores queues"
+    /// from "some of those queues are buffer-split". DPDK picks ONE
+    /// `rx_pkt_burst` per DEVICE, and mlx5 only picks a vectorized one if every
+    /// configured queue qualifies, so a buffer-split queue can demote the whole
+    /// port -- Receive queues included -- to the scalar path.
+    #[serde(default = "default_buffer_split")]
+    pub buffer_split: bool,
+
+    /// Force the scalar RX burst path on every port, regardless of queue layout.
+    /// Defaults to `false` (let the driver choose).
+    ///
+    /// Implemented by appending the **mlx5-specific** `rx_vec_en=0` devarg to
+    /// each port's device string. In `mlx5_check_vec_rx_support()` that flag is
+    /// checked before the per-queue loop, so it demotes the device exactly the
+    /// way a buffer-split queue does:
+    ///
+    /// ```c
+    /// if (!priv->config.rx_vec_en)
+    ///         return -ENOTSUP;
+    /// /* All the configured queues should support. */
+    /// ```
+    ///
+    /// Why you would want this: split mode is scalar by construction, so a
+    /// vectorized standard-mode baseline measures the burst-function demotion
+    /// rather than the split datapath. Setting this on BOTH arms puts them on
+    /// the same RX path and isolates what buffer split actually costs.
+    ///
+    /// Confirm it took effect in the `=== Port N RX datapath ===` block: every
+    /// queue should read `rx_burst="Scalar"`. On a non-mlx5 PMD the devarg is
+    /// simply unknown to the driver -- check that block rather than assuming.
+    #[serde(default = "default_force_scalar_rx")]
+    pub force_scalar_rx: bool,
 
     /// If set, will pass supplementary arguments to DPDK EAL (see DPDK
     /// configuration). For instance `--no-huge`.

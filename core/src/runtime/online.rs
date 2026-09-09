@@ -51,7 +51,20 @@ where
         log::info!("Initializing Ports...");
         let mut ports: BTreeMap<PortId, Port> = BTreeMap::new();
         for port_map in options.online.ports.iter() {
-            let port = Port::new(port_map, options.online.flow_mode);
+            let port = Port::new(
+                port_map,
+                options.online.flow_mode,
+                options.online.buffer_split,
+            );
+            if options.online.flow_mode == crate::config::FlowMode::Split
+                && !options.online.buffer_split
+            {
+                println!(
+                    "NOTE: buffer_split = false -- Split queues on {} are configured as \
+                     ordinary single-segment queues (A/B control, queue count unchanged).",
+                    port_map.device
+                );
+            }
             let socket_id = port.id.socket_id();
             let mtu = if let Some(online) = &config.online {
                 online.mtu
