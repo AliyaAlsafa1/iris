@@ -26,6 +26,63 @@ use thiserror::Error;
 const HIGH_PRIORITY: u32 = 0;
 const LOW_PRIORITY: u32 = 3;
 
+/// Returns the set of distinct queue indices that RSS should hash across.
+///
+/// This is the RECEIVE queues only. Split and Sink queues are fed by explicit
+/// per-flow QUEUE rules, not by RSS, so they must be excluded here.
+///
+/// IMPORTANT: the returned Vec is what an RSS action's `queue` pointer must
+/// reference, and its length is what `queue_num` must be set to. It is NOT the
+/// reta (`port.reta`, 512 entries): the reta is the bucket->queue indirection
+/// table, whereas an RSS action's `queue` field is the flat list of distinct
+/// target queues. Passing the 512-entry reta with queue_num = queue_map.len()
+/// (the historical bug) makes the NIC read the first N reta entries as the queue
+/// set, yielding a malformed/mis-sized RSS indirection table that silently
+/// orphans a queue.
+///
+/// Callers MUST keep the returned Vec alive until after both rte_flow_validate
+/// and rte_flow_create return, because the RSS action stores a raw pointer into
+/// its buffer.
+fn receive_rss_queues(port: &Port) -> Vec<u16> {
+    port.queue_map
+        .keys()
+        .filter(|rxq| rxq.ty == RxQueueType::Receive)
+        .map(|rxq| rxq.qid.raw())
+        .collect()
+}
+
+/// Points an RSS action at the given queue set. `rss_queues` must outlive both
+/// the validate and create FFI calls made by the caller (raw pointer aliasing).
+///
+/// Emits a warning if the queue count is not a power of two: mlx5 builds a
+/// power-of-two RSS indirection table, and a non-power-of-two count rounds and
+/// can leave one or more queues with (near) zero share — a silent, rotating
+/// packet loss that is hard to diagnose from aggregate stats.
+fn point_rss_action_at(port: &Port, action: &mut FlowAction, rss_queues: &[u16]) {
+    if !rss_queues.len().is_power_of_two() {
+        warn!(
+            "Port {}: RSS queue count {} is not a power of two; mlx5 may distribute \
+             unevenly and starve a queue. Prefer a power-of-two number of receive cores.",
+            port.id,
+            rss_queues.len()
+        );
+    }
+    debug!(
+        "Port {}: RSS queue set (len {}): {:?}",
+        port.id,
+        rss_queues.len(),
+        rss_queues
+    );
+
+    for a in action.rules.iter_mut() {
+        if let dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_RSS = a.type_ {
+            action.rss[0].queue_num = rss_queues.len() as u32;
+            action.rss[0].queue = rss_queues.as_ptr();
+            a.conf = &action.rss[0] as *const _ as *const c_void;
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct HardwareFilter<'a> {
     // Patterns that will retain traffic, as layered patterns,
@@ -234,19 +291,13 @@ fn validate_rule(
     }
     flow_item::append_end(&mut pattern_rules);
 
-    // Need to update flow_action_rss here
-    // reta_raw needs to stay in scope until after rte_flow_validate() succeeds
-    let reta_raw = port.reta.iter().map(|q| q.raw()).collect::<Vec<_>>();
-    for a in action.rules.iter_mut() {
-        if let dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_RSS = a.type_ {
-            action.rss[0].queue_num = port.queue_map.len() as u32;
-            action.rss[0].queue = reta_raw.as_ptr();
-            a.conf = &action.rss[0] as *const _ as *const c_void;
-        }
-    }
+    // RSS across the RECEIVE queues only. `rss_queues` must stay in scope until
+    // after rte_flow_validate() returns (the action holds a raw pointer to it).
+    let rss_queues = receive_rss_queues(port);
+    point_rss_action_at(port, action, &rss_queues);
 
     let mut error: dpdk::rte_flow_error = unsafe { mem::zeroed() };
-    unsafe {
+    let ok = unsafe {
         let ret = dpdk::rte_flow_validate(
             port.id.raw(),
             attr.raw() as *const _,
@@ -255,7 +306,9 @@ fn validate_rule(
             &mut error as *mut _,
         );
         ret == 0
-    }
+    };
+    drop(rss_queues); // explicit: alive across the FFI call above
+    ok
 }
 
 fn install_pattern(
@@ -296,19 +349,13 @@ fn create_rule(
     }
     flow_item::append_end(&mut pattern_rules);
 
-    // Need to update flow_action_rss here
-    // reta_raw needs to stay in scope until after rte_flow_create() succeeds
-    let reta_raw = port.reta.iter().map(|q| q.raw()).collect::<Vec<_>>();
-    for a in action.rules.iter_mut() {
-        if let dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_RSS = a.type_ {
-            action.rss[0].queue_num = port.queue_map.len() as u32;
-            action.rss[0].queue = reta_raw.as_ptr();
-            a.conf = &action.rss[0] as *const _ as *const c_void;
-        }
-    }
+    // RSS across the RECEIVE queues only. `rss_queues` must stay in scope until
+    // after BOTH rte_flow_validate() and rte_flow_create() return.
+    let rss_queues = receive_rss_queues(port);
+    point_rss_action_at(port, action, &rss_queues);
 
     let mut error: dpdk::rte_flow_error = unsafe { mem::zeroed() };
-    unsafe {
+    let result = unsafe {
         let ret = dpdk::rte_flow_validate(
             port.id.raw(),
             attr.raw() as *const _,
@@ -318,10 +365,10 @@ fn create_rule(
         );
         if ret != 0 {
             let msg: &CStr = CStr::from_ptr(error.message);
-            bail!(HardwareFilterError::Validation {
+            Err(HardwareFilterError::Validation {
                 lpattern: lpattern.to_owned(),
-                reason: msg.to_str().unwrap().to_string()
-            });
+                reason: msg.to_str().unwrap().to_string(),
+            })
         } else {
             let ret = dpdk::rte_flow_create(
                 port.id.raw(),
@@ -332,15 +379,21 @@ fn create_rule(
             );
             if ret.is_null() {
                 let msg: &CStr = CStr::from_ptr(error.message);
-                bail!(HardwareFilterError::Creation {
+                Err(HardwareFilterError::Creation {
                     lpattern: lpattern.to_owned(),
-                    reason: msg.to_str().unwrap().to_string()
-                });
+                    reason: msg.to_str().unwrap().to_string(),
+                })
             } else {
                 info!("Hardware flow rule created: {}", lpattern);
                 Ok(())
             }
         }
+    };
+    drop(rss_queues); // explicit: alive across both FFI calls above
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => bail!(e),
     }
 }
 
@@ -694,17 +747,20 @@ pub fn install_dyn_hardware_rules(port: &Port) -> Result<()> {
     let mut action = FlowAction::new(port.id);
     action.append_rss();
     action.finish();
-    let reta_raw = port.reta.iter().map(|q| q.raw()).collect::<Vec<_>>();
-    for a in action.rules.iter_mut() {
-        if let dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_RSS = a.type_ {
-            action.rss[0].queue_num = port.queue_map.len() as u32;
-            action.rss[0].queue = reta_raw.as_ptr();
-            a.conf = &action.rss[0] as *const _ as *const c_void;
-        }
+
+    // RSS spreads across the RECEIVE queues only. Split/Sink queues are fed by
+    // explicit per-flow QUEUE rules, not by hash. `rss_queues` MUST outlive both
+    // rte_flow_validate and rte_flow_create below (the action holds a raw pointer
+    // into its buffer); dropping it early yields "queue index out of range" or
+    // undefined queue indices.
+    let rss_queues = receive_rss_queues(port);
+    if rss_queues.is_empty() {
+        bail!("No Receive queues to build RSS action for on Port {}", port.id);
     }
+    point_rss_action_at(port, &mut action, &rss_queues);
 
     let mut error: dpdk::rte_flow_error = unsafe { mem::zeroed() };
-    unsafe {
+    let result = unsafe {
         let ret = dpdk::rte_flow_validate(
             port.id.raw(),
             attr.raw() as *const _,
@@ -715,10 +771,10 @@ pub fn install_dyn_hardware_rules(port: &Port) -> Result<()> {
         if ret != 0 {
             error!("RSS rule failed validation.");
             let msg: &CStr = CStr::from_ptr(error.message);
-            bail!(HardwareFilterError::Validation {
+            Err(HardwareFilterError::Validation {
                 lpattern: LayeredPattern::new(),
-                reason: msg.to_str().unwrap().to_string()
-            });
+                reason: msg.to_str().unwrap().to_string(),
+            })
         } else {
             let ret = dpdk::rte_flow_create(
                 port.id.raw(),
@@ -730,14 +786,20 @@ pub fn install_dyn_hardware_rules(port: &Port) -> Result<()> {
             if ret.is_null() {
                 error!("RSS rule failed creation.");
                 let msg: &CStr = CStr::from_ptr(error.message);
-                bail!(HardwareFilterError::Creation {
+                Err(HardwareFilterError::Creation {
                     lpattern: LayeredPattern::new(),
-                    reason: msg.to_str().unwrap().to_string()
-                });
+                    reason: msg.to_str().unwrap().to_string(),
+                })
             } else {
                 info!("Created RSS rule");
+                Ok(())
             }
         }
+    };
+    drop(rss_queues); // explicit: alive across both FFI calls above
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => bail!(e),
     }
-    Ok(())
 }
