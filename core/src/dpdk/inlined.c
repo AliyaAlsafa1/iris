@@ -21,6 +21,10 @@ uint16_t rte_eth_rx_burst_(uint16_t port_id, uint16_t queue_id, struct rte_mbuf 
     return rte_eth_rx_burst(port_id, queue_id, rx_pkts, nb_pkts);
 }
 
+uint32_t rte_eth_rx_queue_count_(uint16_t port_id, uint16_t queue_id) {
+    return rte_eth_rx_queue_count(port_id, queue_id);
+}
+
 uint16_t rte_mbuf_refcnt_read_(const struct rte_mbuf* m) {
     return rte_mbuf_refcnt_read(m);
 }

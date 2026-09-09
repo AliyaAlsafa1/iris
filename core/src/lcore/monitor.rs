@@ -34,6 +34,9 @@ pub(crate) struct Monitor {
     is_running: Arc<AtomicBool>,
     prev_tcp_bytes: u64,
     prev_udp_bytes: u64,
+    prev_recv_q: u64,
+    prev_split_q: u64,
+    nb_rxd: usize,
 }
 
 impl Monitor {
@@ -105,6 +108,9 @@ impl Monitor {
             is_running,
             prev_tcp_bytes: 0,
             prev_udp_bytes: 0,
+            prev_recv_q: 0,
+            prev_split_q: 0,
+            nb_rxd: online_cfg.nb_rxd,
         }
     }
 
@@ -189,6 +195,77 @@ impl Monitor {
                                     pretty_print_unit(tcp_bps + udp_bps, "bps"),
                                 );
                             }
+
+                            // RX ring occupancy, sampled once per second from the
+                            // monitor core. THE decisive number given the time
+                            // budget: if the port is charging packets to
+                            // out-of-buffer while these read near zero, the
+                            // packets are lost before they reach the ring the RX
+                            // core polls -- the core is not too slow to drain it.
+                            //
+                            // Note: this peeks at a ring owned by another lcore.
+                            // It is a read-only diagnostic, not something to keep
+                            // on a production path.
+                            let nb_rxd = self.nb_rxd;
+                            for (port_id, queues) in self.ports.iter() {
+                                let (mut r_max, mut r_sum, mut r_n) = (0u32, 0u64, 0u32);
+                                let (mut x_max, mut x_sum, mut x_n) = (0u32, 0u64, 0u32);
+                                for q in queues.iter() {
+                                    let used = unsafe {
+                                        dpdk::rte_eth_rx_queue_count(
+                                            port_id.raw(),
+                                            q.qid.raw(),
+                                        )
+                                    };
+                                    if q.ty == RxQueueType::Split {
+                                        x_max = x_max.max(used);
+                                        x_sum += used as u64;
+                                        x_n += 1;
+                                    } else {
+                                        r_max = r_max.max(used);
+                                        r_sum += used as u64;
+                                        r_n += 1;
+                                    }
+                                }
+                                let avg = |sum: u64, n: u32| {
+                                    if n > 0 { sum as f64 / n as f64 } else { 0.0 }
+                                };
+                                println!(
+                                    "Ring occupancy p{}: receive-q avg {:.0} max {} / \
+                                     split-q avg {:.0} max {} (of {} desc)",
+                                    port_id,
+                                    avg(r_sum, r_n),
+                                    r_max,
+                                    avg(x_sum, x_n),
+                                    x_max,
+                                    nb_rxd,
+                                );
+                            }
+
+                            // Delivered per queue TYPE, across all queues (not
+                            // just the 16 with xstat slots). Compare against
+                            // rx_phy_packets and the rte_flow steer counters to
+                            // see which side of the port is losing packets.
+                            let (recv_q, split_q) = crate::stats::queue_delivered();
+                            let d_recv = recv_q.saturating_sub(self.prev_recv_q);
+                            let d_split = split_q.saturating_sub(self.prev_split_q);
+                            self.prev_recv_q = recv_q;
+                            self.prev_split_q = split_q;
+                            if secs > 0.0 {
+                                println!(
+                                    "Delivered: receive-q {:.4} Mpps / split-q {:.4} Mpps \
+                                     (cumulative {} / {}, split share {:.2}%)",
+                                    d_recv as f64 / secs / 1e6,
+                                    d_split as f64 / secs / 1e6,
+                                    recv_q,
+                                    split_q,
+                                    if recv_q + split_q > 0 {
+                                        split_q as f64 * 100.0 / (recv_q + split_q) as f64
+                                    } else {
+                                        0.0
+                                    },
+                                );
+                            }
                         }
                     }
                     Err(error) => {
@@ -210,6 +287,53 @@ impl Monitor {
         println!("----------------------------------------------");
         let tputs = Throughputs::new(prev_rx, init_rx, (prev_ts - init_ts).as_millis() as f64);
         println!("{}", tputs);
+
+        // Final delivered totals per queue type, across every queue.
+        let (recv_q, split_q) = crate::stats::queue_delivered();
+        println!(
+            "Delivered (cumulative): receive-q {} pkts / split-q {} pkts (split share {:.2}%)",
+            recv_q,
+            split_q,
+            if recv_q + split_q > 0 {
+                split_q as f64 * 100.0 / (recv_q + split_q) as f64
+            } else {
+                0.0
+            },
+        );
+
+        // Per-packet datapath cost, Receive queues vs Split queues. Non-empty
+        // bursts only (idle poll-spin excluded), so this is processing cost per
+        // packet, not a duty cycle.
+        {
+            let (all_cycles, all_pkts) = crate::stats::datapath_busy();
+            let (sp_cycles, sp_pkts) = crate::stats::datapath_busy_split();
+            let rx_cycles = all_cycles.saturating_sub(sp_cycles);
+            let rx_pkts = all_pkts.saturating_sub(sp_pkts);
+            let per = |c: u64, p: u64| if p > 0 { c as f64 / p as f64 } else { 0.0 };
+            println!(
+                "Datapath cost: receive-q {:.1} cyc/pkt ({} pkts) / split-q {:.1} cyc/pkt ({} pkts)",
+                per(rx_cycles, rx_pkts),
+                rx_pkts,
+                per(sp_cycles, sp_pkts),
+                sp_pkts,
+            );
+
+            // Complete RX-core time budget. These four sum to the rx_loop wall
+            // time, so they need no TSC frequency to interpret.
+            let (idle, gap) = crate::stats::datapath_overhead();
+            let total = all_cycles as f64 + idle as f64 + gap as f64;
+            if total > 0.0 {
+                let pct = |c: f64| 100.0 * c / total;
+                println!(
+                    "RX core time: receive-q {:.1}% / split-q {:.1}% / idle-poll {:.1}% / \
+                     outside-queues {:.1}% (check_inactive + loop)",
+                    pct(rx_cycles as f64),
+                    pct(sp_cycles as f64),
+                    pct(idle as f64),
+                    pct(gap as f64),
+                );
+            }
+        }
 
         // Final cumulative on-wire transport totals.
         let (tcp_total, udp_total) = crate::lcore::transport_meter::totals();

@@ -12,7 +12,7 @@ use self::info::PortInfo;
 use std::cmp;
 use std::collections::BTreeMap;
 use std::convert::TryInto;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fmt;
 use std::mem;
 use std::ptr;
@@ -232,6 +232,56 @@ impl Port {
 
         self.disable_flow_ctrl();
         self.configure_rss_reta();
+        self.log_rx_datapath();
+    }
+
+    /// One-shot RX datapath report, printed right after the port starts.
+    ///
+    /// DPDK selects ONE `rx_pkt_burst` function per DEVICE, not per queue, and
+    /// mlx5 only picks a vectorized one if EVERY configured queue supports it
+    /// (`mlx5_rxq_check_vec_support`: no scatter/multi-SGE, no MPRQ, no LRO).
+    /// A buffer-split queue is multi-SGE by construction, so merely CREATING
+    /// the Split queues can demote the whole port -- Receive queues included --
+    /// to the scalar burst path. Nothing in the per-queue counters shows that;
+    /// it would present as a uniform sustained RX drop in split mode only.
+    ///
+    /// This prints what the driver actually chose, per queue, so standard and
+    /// split runs can be compared line for line. Runs once at startup and
+    /// touches nothing on the fast path.
+    fn log_rx_datapath(&self) {
+        println!("=== Port {} RX datapath ===", self.id);
+        for rxqueue in self.queue_map.keys() {
+            let qid = rxqueue.qid.raw();
+
+            let mut mode: dpdk::rte_eth_burst_mode = unsafe { mem::zeroed() };
+            let burst =
+                if unsafe { dpdk::rte_eth_rx_burst_mode_get(self.id.raw(), qid, &mut mode) } == 0 {
+                    unsafe { CStr::from_ptr(mode.info.as_ptr()) }
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    "<unavailable>".to_string()
+                };
+
+            let mut qinfo: dpdk::rte_eth_rxq_info = unsafe { mem::zeroed() };
+            if unsafe { dpdk::rte_eth_rx_queue_info_get(self.id.raw(), qid, &mut qinfo) } == 0 {
+                println!(
+                    "  q{:<3} {:<2} rx_burst=\"{}\" scattered_rx={} nb_desc={} rx_buf_size={} q_offloads=0x{:x}",
+                    qid,
+                    rxqueue.ty,
+                    burst,
+                    qinfo.scattered_rx,
+                    qinfo.nb_desc,
+                    qinfo.rx_buf_size,
+                    qinfo.conf.offloads,
+                );
+            } else {
+                println!(
+                    "  q{:<3} {:<2} rx_burst=\"{}\" (rte_eth_rx_queue_info_get failed)",
+                    qid, rxqueue.ty, burst,
+                );
+            }
+        }
     }
 
     /// Flush flow rules and stop port

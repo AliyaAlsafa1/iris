@@ -202,6 +202,7 @@ extern "C" {
         rx_pkts: *mut *mut rte_mbuf,
         nb_pkts: u16,
     ) -> u16;
+    fn rte_eth_rx_queue_count_(port_id: u16, queue_id: u16) -> u32;
     fn rte_mbuf_refcnt_read_(m: *const rte_mbuf) -> u16;
     fn rte_mbuf_refcnt_update_(m: *mut rte_mbuf, value: i16) -> u16;
     fn rte_mbuf_refcnt_set_(m: *mut rte_mbuf, value: i16);
@@ -261,6 +262,14 @@ pub unsafe fn rte_eth_tx_burst(
     nb_pkts: u16,
 ) -> u16 {
     rte_eth_tx_burst_(port_id, queue_id, tx_pkts, nb_pkts)
+}
+
+/// Number of RX descriptors currently holding received packets on this queue,
+/// i.e. how backed up the ring is. `rte_eth_rx_queue_count` is a static inline
+/// in rte_ethdev.h, so it comes via the stub like the burst functions.
+#[inline]
+pub unsafe fn rte_eth_rx_queue_count(port_id: u16, queue_id: u16) -> u32 {
+    rte_eth_rx_queue_count_(port_id, queue_id)
 }
 
 #[inline]

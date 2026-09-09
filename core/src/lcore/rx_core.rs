@@ -117,14 +117,39 @@ where
         // bursts (idle poll-spin excluded), divided by received packets.
         let mut busy_cycles: u64 = 0;
         let mut busy_pkts: u64 = 0;
+        // Same accounting, restricted to Split queues, so the per-packet cost of
+        // the two-segment layout can be compared against the Receive queues on
+        // the same core in the same run.
+        let mut split_cycles: u64 = 0;
+        let mut split_pkts: u64 = 0;
+        // Everything the busy counters miss: empty polls, and the time between
+        // queue blocks (check_inactive + loop overhead). Costs one extra rdtsc
+        // per EMPTY poll versus before; non-empty polls already read it twice.
+        let mut idle_cycles: u64 = 0;
+        let mut gap_cycles: u64 = 0;
+        let mut prev_end: u64 = 0;
 
         while self.is_running.load(Ordering::Relaxed) {
             for rxqueue in self.rxqueues.iter() {
                 let t_start = unsafe { dpdk::rte_rdtsc() };
+                if prev_end != 0 {
+                    gap_cycles += t_start.wrapping_sub(prev_end);
+                }
                 let mbufs: Vec<Mbuf> = self.rx_burst(rxqueue, 32);
                 let n_recv = mbufs.len();
                 if mbufs.is_empty() {
                     IDLE_CYCLES.inc();
+                } else {
+                    // One relaxed add per burst (not per packet): attributes
+                    // delivered packets to Receive vs Split across ALL queues,
+                    // including the ones past DPDK's 16 per-queue xstat slots.
+                    match rxqueue.ty {
+                        RxQueueType::Split => {
+                            crate::stats::SPLIT_Q_PKTS.fetch_add(n_recv as u64, Ordering::Relaxed)
+                        }
+                        _ => crate::stats::RECEIVE_Q_PKTS
+                            .fetch_add(n_recv as u64, Ordering::Relaxed),
+                    };
                 }
 
                 // Apply any pending flow rules pushed by the control plane.
@@ -180,15 +205,26 @@ where
                 }
 
                 // Charge this burst's cycles to per-packet cost (skip idle polls).
+                let t_end = unsafe { dpdk::rte_rdtsc() };
+                prev_end = t_end;
+                let elapsed = t_end.wrapping_sub(t_start);
                 if n_recv > 0 {
-                    busy_cycles += unsafe { dpdk::rte_rdtsc() } - t_start;
+                    busy_cycles += elapsed;
                     busy_pkts += n_recv as u64;
+                    if rxqueue.ty == RxQueueType::Split {
+                        split_cycles += elapsed;
+                        split_pkts += n_recv as u64;
+                    }
+                } else {
+                    idle_cycles += elapsed;
                 }
             }
             conn_table.check_inactive(&self.subscription, now);
         }
 
         crate::stats::add_datapath_busy(busy_cycles, busy_pkts);
+        crate::stats::add_datapath_busy_split(split_cycles, split_pkts);
+        crate::stats::add_datapath_overhead(idle_cycles, gap_cycles);
 
         // // Deliver remaining data in table from unfinished connections
         conn_table.drain(&self.subscription);
