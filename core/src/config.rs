@@ -379,6 +379,19 @@ pub struct OnlineConfig {
     #[serde(default = "default_dyn_hardware_assist")]
     pub dyn_hardware_assist: bool,
 
+    /// Measure datapath cycles on one in every `budget_sample_stride` poll-loop iterations.
+    ///
+    /// Only the cycles are sampled; the packet, burst and idle-poll counters stay exact.
+    /// Defaults to 64.
+    ///
+    /// ## Remarks
+    /// Sampled rather than exact because an `rte_rdtsc` is ~24 cycles against a ~100-cycle empty
+    /// `rte_eth_rx_burst`, and the inflation would scale with the idle-poll count.
+    /// Set to 1 to measure every iteration, or to 0 to disable cycle attribution
+    /// while leaving the exact counters running.
+    #[serde(default = "default_budget_sample_stride")]
+    pub budget_sample_stride: u64,
+
     /// If set, install an Intel-ICE raw-pattern rule that drops TLS
     /// Application-Data records (type=0x17) over TCP at port startup.
     #[serde(default = "default_drop_tls_raw")]
@@ -433,6 +446,10 @@ fn default_hardware_assist() -> bool {
 
 fn default_dyn_hardware_assist() -> bool {
     false
+}
+
+fn default_budget_sample_stride() -> u64 {
+    64
 }
 
 fn default_drop_tls_raw() -> bool {

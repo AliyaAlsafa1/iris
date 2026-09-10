@@ -3,6 +3,9 @@ use crate::config::{ConnTrackConfig, FlowTableConfig};
 use crate::conntrack::{ConnTracker, TrackerConfig};
 use crate::dpdk;
 use crate::filter::sw_flow::{FlowAction, FlowTable};
+use crate::lcore::datapath_budget::{
+    measure_rdtsc_overhead, publish_datapath_delta, DatapathBudget,
+};
 use crate::memory::mbuf::Mbuf;
 use crate::port::{RxQueue, RxQueueType};
 use crate::stats::{
@@ -17,6 +20,10 @@ use std::time::Instant;
 
 use itertools::Itertools;
 
+/// Number of mbufs requested per `rte_eth_rx_burst` call, and the unit in which datapath
+/// maintenance is amortised.
+const RX_BURST_SIZE: u16 = 32;
+
 /// A RxCore polls from `rxqueues` and reduces the stream of packets into
 /// a stream of higher-level network events to be processed by the user.
 pub(crate) struct RxCore<S>
@@ -27,6 +34,9 @@ where
     pub(crate) rxqueues: Vec<RxQueue>,
     pub(crate) conntrack: ConnTrackConfig,
     pub(crate) flow_table: Option<FlowTableConfig>,
+    /// Attribute cycles on one in every this many loop iterations. See
+    /// `config::OnlineConfig::budget_sample_stride`.
+    pub(crate) budget_sample_stride: u64,
     #[cfg(feature = "prometheus")]
     pub(crate) is_prometheus_enabled: bool,
     pub(crate) subscription: Arc<Subscription<S>>,
@@ -42,6 +52,7 @@ where
         rxqueues: Vec<RxQueue>,
         conntrack: ConnTrackConfig,
         flow_table: Option<FlowTableConfig>,
+        budget_sample_stride: u64,
         #[cfg(feature = "prometheus")] is_prometheus_enabled: bool,
         subscription: Arc<Subscription<S>>,
         is_running: Arc<AtomicBool>,
@@ -51,6 +62,7 @@ where
             rxqueues,
             conntrack,
             flow_table,
+            budget_sample_stride,
             #[cfg(feature = "prometheus")]
             is_prometheus_enabled,
             subscription,
@@ -113,18 +125,77 @@ where
 
         let mut now = Instant::now();
 
-        // rte_rdtsc-based per-packet cost: accumulate cycles only for non-empty
-        // bursts (idle poll-spin excluded), divided by received packets.
-        let mut busy_cycles: u64 = 0;
-        let mut busy_pkts: u64 = 0;
+        // Cycle budget for this lcore. See `DatapathBudget`.
+        // Timestamps within a sampled iteration are chained.
+        // Each span has one read's cost subtracted to avoid skewing short spans.
+        let attribute_cycles = self.budget_sample_stride != 0;
+        let sample_stride = self.budget_sample_stride.max(1);
+        let rdtsc_cost = if attribute_cycles {
+            measure_rdtsc_overhead(4096).round() as u64
+        } else {
+            0
+        };
+        let mut budget = DatapathBudget {
+            // The configured value so a report can tell
+            // "attribution off" (0) from "attribution exact" (1).
+            sample_stride: self.budget_sample_stride,
+            rdtsc_cost,
+            ..Default::default()
+        };
+        let loop_start = unsafe { dpdk::rte_rdtsc() };
+        let mut rdtsc_reads: u64 = 1;
+        // Last snapshot pushed to the global atomics. The budget is published incrementally.
+        let mut published = DatapathBudget::default();
+        // Note: countdown rather than `iter % stride` to avoid u64 division.
+        let mut countdown: u64 = 1;
 
         while self.is_running.load(Ordering::Relaxed) {
+            // Sample decision for this iteration.
+            // Taken once so every bucket within it is either attributed or not.
+            countdown -= 1;
+            let due = countdown == 0;
+            if due {
+                countdown = sample_stride;
+            }
+            // Let the countdown keep cycling even with attribution off, so it cannot underflow.
+            let sampled = due && attribute_cycles;
+            let mut t_cursor = if sampled {
+                rdtsc_reads += 1;
+                unsafe { dpdk::rte_rdtsc() }
+            } else {
+                0
+            };
+            let iter_start = t_cursor;
+            // Spans closed within this iteration, i.e. how many read latencies its own span
+            // absorbed, so the same correction can be taken off `sampled_wall`.
+            let mut spans_closed: u64 = 0;
+
             for rxqueue in self.rxqueues.iter() {
-                let t_start = unsafe { dpdk::rte_rdtsc() };
-                let mbufs: Vec<Mbuf> = self.rx_burst(rxqueue, 32);
+                let mbufs: Vec<Mbuf> = self.rx_burst(rxqueue, RX_BURST_SIZE);
                 let n_recv = mbufs.len();
-                if mbufs.is_empty() {
+
+                if sampled {
+                    // Close poll bucket
+                    let t_after_poll = unsafe { dpdk::rte_rdtsc() };
+                    rdtsc_reads += 1;
+                    spans_closed += 1;
+                    let poll_span = t_after_poll
+                        .wrapping_sub(t_cursor)
+                        .saturating_sub(rdtsc_cost);
+                    t_cursor = t_after_poll;
+                    if n_recv == 0 {
+                        budget.poll_idle += poll_span;
+                    } else {
+                        budget.poll_busy += poll_span;
+                    }
+                }
+                if n_recv == 0 {
+                    // exact counters
+                    budget.idle_polls += 1;
                     IDLE_CYCLES.inc();
+                } else {
+                    budget.bursts += 1;
+                    budget.recv_pkts += n_recv as u64;
                 }
 
                 // Apply any pending flow rules pushed by the control plane.
@@ -179,16 +250,49 @@ where
                     }
                 }
 
-                // Charge this burst's cycles to per-packet cost (skip idle polls).
-                if n_recv > 0 {
-                    busy_cycles += unsafe { dpdk::rte_rdtsc() } - t_start;
-                    busy_pkts += n_recv as u64;
+                if sampled && n_recv > 0 {
+                    // Close the pipeline bucket, if applicable.
+                    let t_after_pipeline = unsafe { dpdk::rte_rdtsc() };
+                    rdtsc_reads += 1;
+                    spans_closed += 1;
+                    budget.pipeline += t_after_pipeline
+                        .wrapping_sub(t_cursor)
+                        .saturating_sub(rdtsc_cost);
+                    t_cursor = t_after_pipeline;
                 }
             }
+            // Run every iteration, so the `maint` bucket below measures the whole cost. Note this
+            // means its cost per delivered packet rises as the core goes idle.
             conn_table.check_inactive(&self.subscription, now);
+
+            if sampled {
+                // Close the maintenance bucket (timer-wheel expiry).
+                let t_after_maint = unsafe { dpdk::rte_rdtsc() };
+                rdtsc_reads += 1;
+                spans_closed += 1;
+                budget.maint += t_after_maint
+                    .wrapping_sub(t_cursor)
+                    .saturating_sub(rdtsc_cost);
+                // Same total correction, so the buckets still sum to `sampled_wall`.
+                budget.sampled_wall += t_after_maint
+                    .wrapping_sub(iter_start)
+                    .saturating_sub(spans_closed * rdtsc_cost);
+                budget.sampled_iters += 1;
+
+                // Publish the delta periodically so the monitor can log cycles beside each
+                // interval's ingress rate. Only on sampled iterations.
+                if budget.sampled_iters & 1023 == 0 {
+                    budget.wall = t_after_maint.wrapping_sub(loop_start);
+                    budget.rdtsc_reads = rdtsc_reads;
+                    publish_datapath_delta(&budget, &mut published);
+                }
+            }
         }
 
-        crate::stats::add_datapath_busy(busy_cycles, busy_pkts);
+        budget.wall = unsafe { dpdk::rte_rdtsc() }.wrapping_sub(loop_start);
+        budget.rdtsc_reads = rdtsc_reads + 1;
+        // Final flush of the not-yet-published remainder.
+        publish_datapath_delta(&budget, &mut published);
 
         // // Deliver remaining data in table from unfinished connections
         conn_table.drain(&self.subscription);
@@ -215,7 +319,7 @@ where
 
         while self.is_running.load(Ordering::Relaxed) {
             for (i, rxqueue) in self.rxqueues.iter().enumerate() {
-                let mbufs: Vec<Mbuf> = self.rx_burst(rxqueue, 32);
+                let mbufs: Vec<Mbuf> = self.rx_burst(rxqueue, RX_BURST_SIZE);
                 for mbuf in mbufs.into_iter() {
                     per_queue[i].0 += 1;
                     per_queue[i].1 += mbuf.data_len() as u64;

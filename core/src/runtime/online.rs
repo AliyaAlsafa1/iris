@@ -95,6 +95,7 @@ where
                 rxqueues,
                 options.conntrack.clone(),
                 options.flow_table.clone(),
+                options.online.budget_sample_stride,
                 #[cfg(feature = "prometheus")]
                 options.online.prometheus.is_some(),
                 Arc::clone(&subscription),
@@ -116,6 +117,16 @@ where
 
     pub(crate) fn run(&mut self) {
         self.start_ports();
+
+        // Declared before the cores launch, so `wall` can be turned into a per-core duty cycle
+        // during the run. Sink queues poll for the throughput sweep rather than doing datapath
+        // work, so they are not part of the budget's denominator.
+        let budget_cores = self
+            .rx_cores
+            .values()
+            .filter(|rx_core| rx_core.rxqueues.first().map(|q| q.ty) != Some(RxQueueType::Sink))
+            .count();
+        crate::lcore::datapath_budget::set_datapath_cores(budget_cores as u64);
 
         log::info!("Launching RX cores...");
         for core_id in self.rx_cores.keys() {

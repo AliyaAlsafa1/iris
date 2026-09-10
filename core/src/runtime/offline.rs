@@ -79,6 +79,22 @@ where
         let mempool_raw = self.get_mempool_raw();
         let pcap = self.options.offline.pcap.as_str();
         let mut cap = Capture::from_file(pcap).expect("Error opening pcap. Aborting.");
+        // Same cycle budget as the online datapath, so the deterministic pcap gate and the live
+        // runs report identical fields. Two differences to keep in mind when comparing them:
+        // there is no polling here, so `poll_idle` stays zero, and `poll_busy` covers frame
+        // ingest (pcap read, mbuf alloc, flow-table lookup) rather than `rte_eth_rx_burst`.
+        //
+        // Attribution is exact here (`sample_stride = 1`): there is one core, no poll spin, and
+        // the run is short, so the instrumentation cost does not need to be traded against
+        // accuracy the way it does online.
+        let mut budget = crate::lcore::datapath_budget::DatapathBudget {
+            sample_stride: 1,
+            ..Default::default()
+        };
+        let loop_start = unsafe { dpdk::rte_rdtsc() };
+        let mut t_cursor = loop_start;
+        let mut rdtsc_reads: u64 = 1;
+
         let start = ProcessTime::try_now().expect("Getting process time failed");
         while let Ok(frame) = cap.next() {
             if frame.header.len as usize > self.options.offline.mtu {
@@ -97,7 +113,15 @@ where
                 // Consult the flow table first, as a NIC would apply rte_flow.
                 if let Some(action) = ft.lookup(&mbuf) {
                     match action {
-                        FlowAction::Drop => continue,
+                        FlowAction::Drop => {
+                            // Charge the shed frame's ingest cost and move on, so a dropped tail
+                            // still shows up as the (much smaller) cost it really is.
+                            let t = unsafe { dpdk::rte_rdtsc() };
+                            rdtsc_reads += 1;
+                            budget.poll_busy += t.wrapping_sub(t_cursor);
+                            t_cursor = t;
+                            continue;
+                        }
                         FlowAction::Queue(_) => {} // no SW steering; fall through
                     }
                 }
@@ -106,12 +130,33 @@ where
             nb_pkts += 1;
             nb_bytes += mbuf.data_len() as u64;
 
+            // Close the ingest bucket, open the pipeline bucket.
+            let t_after_ingest = unsafe { dpdk::rte_rdtsc() };
+            rdtsc_reads += 1;
+            budget.poll_busy += t_after_ingest.wrapping_sub(t_cursor);
+            t_cursor = t_after_ingest;
+            budget.bursts += 1;
+            budget.recv_pkts += 1;
+
             /* Apply the packet filter to get actions */
             let cont = self.subscription.filter_packet(&mbuf, &self.id);
             if cont {
                 self.subscription.process_packet(mbuf, &mut stream_table);
             }
+
+            let t_after_pipeline = unsafe { dpdk::rte_rdtsc() };
+            rdtsc_reads += 1;
+            budget.pipeline += t_after_pipeline.wrapping_sub(t_cursor);
+            t_cursor = t_after_pipeline;
         }
+
+        budget.wall = t_cursor.wrapping_sub(loop_start);
+        // Exact attribution: the sampled span is the whole loop, and every frame is an iteration.
+        budget.sampled_wall = budget.wall;
+        budget.sampled_iters = nb_frames;
+        budget.rdtsc_reads = rdtsc_reads;
+        crate::lcore::datapath_budget::set_datapath_cores(1);
+        crate::lcore::datapath_budget::publish_datapath_delta(&budget, &mut Default::default());
 
         // // Deliver remaining data in table
         stream_table.drain(&self.subscription);
