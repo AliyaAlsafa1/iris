@@ -473,8 +473,9 @@ fn main() {
         config.online.is_some()
     );
 
-    // Initialize split queues if needed
-    if flow_mode == FlowMode::Split {
+    // Initialize split queues if needed. Both trim paths use the same queue
+    // layout; they differ only in whether the NIC DMAs the payload segment.
+    if flow_mode.uses_split_queues() {
         // Layout per port (no sink): q0=receive  q1=split    q2=receive  q3=split    ...
         let mut split_queues: HashMap<CoreId, u16> = HashMap::new();
         if let Some(online) = &config.online {
@@ -541,7 +542,7 @@ fn main() {
                         return;
                     }
 
-                    let split_queue = if mode == FlowMode::Split {
+                    let split_queue = if mode.uses_split_queues() {
                         let queues = SPLIT_QUEUES.read().unwrap();
                         match queues.as_ref().and_then(|m| m.get(&rx_core)).copied() {
                             Some(q) => Some(q),
@@ -573,7 +574,7 @@ fn main() {
 
                         let result = match mode {
                             FlowMode::Drop => install_drop_flow(ports.clone(), &tuple),
-                            FlowMode::Split => {
+                            FlowMode::Split | FlowMode::TrimNativeDpdk => {
                                 install_split_flow(ports.clone(), &tuple, split_queue.unwrap())
                             }
                             FlowMode::Standard => return,

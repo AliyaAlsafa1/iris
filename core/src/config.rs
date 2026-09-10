@@ -290,8 +290,23 @@ pub enum FlowMode {
     Standard,
     /// Drop matched flows in hardware. Split queues are not configured.
     Drop,
-    /// Steer matched flows to per-core split queues.
+    /// Steer matched flows to per-core split queues. Buffer split puts the
+    /// first `SPLIT_HDR_SIZE` bytes in `split_header`, the payload in
+    /// `split_remainder` — the payload still crosses PCIe.
     Split,
+    /// Like [FlowMode::Split], but the payload segment has no mempool so the
+    /// NIC discards it (selective Rx). Needs DPDK >= 26.07 and a PMD
+    /// advertising `rx_seg_capa.selective_rx` (mlx5 only as of 26.07).
+    // rename_all = "lowercase" would collapse this to `trimnativedpdk`.
+    #[serde(rename = "trim-native-dpdk")]
+    TrimNativeDpdk,
+}
+
+impl FlowMode {
+    /// Whether matched flows are steered to a dedicated buffer-split queue.
+    pub fn uses_split_queues(self) -> bool {
+        matches!(self, FlowMode::Split | FlowMode::TrimNativeDpdk)
+    }
 }
 
 fn default_flow_mode() -> FlowMode {

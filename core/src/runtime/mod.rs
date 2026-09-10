@@ -21,7 +21,9 @@ use std::sync::Arc;
 
 use anyhow::{bail, Result};
 
-pub(crate) const SPLIT_HDR_SIZE: u16 = 64;
+/// Head segment kept by both trim paths; must hold L2-L4 or the packet won't
+/// parse. 64 was too small: eth 14 + IPv6 40 + TCP 20 = 74.
+pub(crate) const SPLIT_HDR_SIZE: u16 = 128;
 
 /// The Iris runtime.
 ///

@@ -13,6 +13,7 @@ promiscuous = true
 mtu = 1500
 hardware_assist = false
 dyn_hardware_assist = true
+# standard | drop | split | trim-native-dpdk (selective Rx, DPDK >= 26.07, mlx5)
 flow_mode = "standard"
 [[online.ports]]
 device = "0000:3b:00.0"

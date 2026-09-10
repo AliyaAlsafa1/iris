@@ -156,11 +156,12 @@ impl Port {
                 CoreId(*core_id),
             );
             q += 1;
-            if flow_mode == FlowMode::Split {
-                queue_map.insert(
-                    RxQueue::new(port_id, RxQueueId(q), RxQueueType::Split),
-                    CoreId(*core_id),
-                );
+            if flow_mode.uses_split_queues() {
+                let ty = match flow_mode {
+                    FlowMode::TrimNativeDpdk => RxQueueType::TrimNativeDpdk,
+                    _ => RxQueueType::Split,
+                };
+                queue_map.insert(RxQueue::new(port_id, RxQueueId(q), ty), CoreId(*core_id));
                 q += 1;
             }
         }
@@ -378,12 +379,25 @@ impl Port {
         let has_split_queues = self
             .queue_map
             .keys()
-            .any(|rxq| rxq.ty == RxQueueType::Split);
+            .any(|rxq| matches!(rxq.ty, RxQueueType::Split | RxQueueType::TrimNativeDpdk));
         if has_split_queues
             && dev_info.rx_offload_capa & dpdk::RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT as u64 != 0
         {
             port_conf.rxmode.offloads |= dpdk::RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT as u64;
             port_conf.rxmode.offloads |= dpdk::RTE_ETH_RX_OFFLOAD_SCATTER as u64;
+        }
+
+        if self
+            .queue_map
+            .keys()
+            .any(|rxq| rxq.ty == RxQueueType::TrimNativeDpdk)
+            && !selective_rx_supported(&dev_info)
+        {
+            bail!(
+                "Port {} does not support selective Rx (rx_seg_capa.selective_rx); \
+                 flow_mode = \"trim-native-dpdk\" is unavailable, use \"split\" instead",
+                self.id
+            );
         }
 
         {
@@ -446,7 +460,12 @@ impl Port {
     ) -> Result<()> {
         for rxqueue in self.queue_map.keys() {
             match rxqueue.ty {
-                RxQueueType::Split => self.setup_split_queue(rxqueue, split_mempool, nb_rxd)?,
+                RxQueueType::Split => {
+                    self.setup_split_queue(rxqueue, split_mempool, nb_rxd, false)?
+                }
+                RxQueueType::TrimNativeDpdk => {
+                    self.setup_split_queue(rxqueue, split_mempool, nb_rxd, true)?
+                }
                 _ => self.setup_standard_queue(rxqueue, standard_mempool, nb_rxd)?,
             };
         }
@@ -454,11 +473,15 @@ impl Port {
         Ok(())
     }
 
+    /// First `hdr_len` bytes to the header mempool, payload to the second
+    /// segment. With `discard_payload` that segment gets no mempool, so the NIC
+    /// drops the payload instead of DMA-ing it (selective Rx).
     fn setup_split_queue(
         &self,
         rxqueue: &RxQueue,
         split_mempool: &mut SplitMempool,
         nb_rxd: usize,
+        discard_payload: bool,
     ) -> Result<()> {
         let mut rx_segs: [dpdk::rte_eth_rxseg; 2] = unsafe { mem::zeroed() };
 
@@ -466,7 +489,11 @@ impl Port {
         rx_segs[0].split.mp = split_mempool.header.raw_mut();
 
         rx_segs[1].split.length = 0;
-        rx_segs[1].split.mp = split_mempool.remainder.raw_mut();
+        rx_segs[1].split.mp = if discard_payload {
+            ptr::null_mut()
+        } else {
+            split_mempool.remainder.raw_mut() as *mut _
+        };
 
         let mut rxq_conf: dpdk::rte_eth_rxconf = unsafe { mem::zeroed() };
         rxq_conf.offloads =
@@ -486,7 +513,7 @@ impl Port {
         };
 
         if ret < 0 {
-            bail!("Failed to setup split RX queue {}", rxqueue);
+            bail!("Failed to setup split RX queue {}: error {}", rxqueue, ret);
         }
 
         Ok(())
@@ -524,6 +551,18 @@ impl Drop for Port {
     }
 }
 
+/// Whether the device accepts an Rx segment with no mempool (selective Rx).
+/// The capability bit only exists from DPDK 26.07.
+#[cfg(dpdk_ge_2607)]
+fn selective_rx_supported(dev_info: &dpdk::rte_eth_dev_info) -> bool {
+    dev_info.rx_seg_capa.selective_rx() != 0
+}
+
+#[cfg(not(dpdk_ge_2607))]
+fn selective_rx_supported(_dev_info: &dpdk::rte_eth_dev_info) -> bool {
+    false
+}
+
 fn mtu_to_frame_len(mtu: u32) -> u32 {
     mtu + dpdk::RTE_ETHER_HDR_LEN + dpdk::RTE_ETHER_CRC_LEN
 }
@@ -545,6 +584,9 @@ pub(crate) enum RxQueueType {
     Sink,
     /// Packets backed by buffer segmentation
     Split,
+    /// Packets backed by buffer segmentation whose payload segment is discarded
+    /// by the NIC (selective Rx). Same trim as `Split`, done in hardware.
+    TrimNativeDpdk,
 }
 
 impl fmt::Display for RxQueueType {
@@ -552,6 +594,7 @@ impl fmt::Display for RxQueueType {
         match self {
             RxQueueType::Receive => write!(f, "r"),
             RxQueueType::Split => write!(f, "x"),
+            RxQueueType::TrimNativeDpdk => write!(f, "t"),
             RxQueueType::Sink => write!(f, "s"),
         }
     }
