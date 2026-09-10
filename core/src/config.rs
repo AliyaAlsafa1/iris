@@ -639,6 +639,7 @@ fn default_prometheus_ip() -> IpAddr {
 ///     throughput = true
 ///     mempool_usage = true
 ///     pcie = true
+///     dram = true
 /// ```
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct DisplayConfig {
@@ -662,6 +663,24 @@ pub struct DisplayConfig {
     #[serde(default = "default_display_pcie")]
     pub pcie: bool,
 
+    /// Display live DRAM read/write byte counts for each socket a port is attached to,
+    /// sampled once a second by Intel PCM's `pcm-memory`. Defaults to `false`.
+    ///
+    /// ## Remarks
+    /// The socket is derived from the PCI address of each port in `[[online.ports]]`, the
+    /// same way `pcie` derives its root port; ports sharing a socket are reported once,
+    /// since DRAM traffic is per socket and not attributable to one of them. `pcm-memory`
+    /// must be installed and Iris must be able to open the MSR/PCI devices it uses (i.e.
+    /// run as root); if it cannot be started, DRAM statistics are skipped and the run
+    /// continues. When logging is enabled, every sample is also written to `dram.csv` in
+    /// the log directory.
+    ///
+    /// `pcm-memory` reports MB/s, which is converted back to bytes per sample. PCM derives
+    /// that rate from CAS counts, so the conversion recovers the byte count -- but only to
+    /// the precision it prints. These are counts derived from a rate, not counter reads.
+    #[serde(default = "default_display_dram")]
+    pub dram: bool,
+
     /// List of live port statistics to display.
     ///
     /// ## Remarks
@@ -683,6 +702,10 @@ fn default_display_mempool_usage() -> bool {
 }
 
 fn default_display_pcie() -> bool {
+    false
+}
+
+fn default_display_dram() -> bool {
     false
 }
 

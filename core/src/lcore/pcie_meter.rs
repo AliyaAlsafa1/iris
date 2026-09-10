@@ -149,6 +149,19 @@ fn root_port_device_number(bdf: &str) -> Result<u32> {
     Ok(u32::from_str_radix(device, 16)?)
 }
 
+/// CPU package a PCI device is attached to, by BDF.
+pub(crate) fn socket_of_pci_device(device: &str) -> Result<u32> {
+    socket_of_pci_device_in(Path::new(SYSFS), device)
+}
+
+/// [`socket_of_pci_device`] against an arbitrary sysfs root, for the tests.
+pub(crate) fn socket_of_pci_device_in(sysfs: &Path, device: &str) -> Result<u32> {
+    let link = sysfs.join("bus/pci/devices").join(device);
+    let path = fs::canonicalize(&link)
+        .with_context(|| format!("no PCI device {} in {}", device, link.display()))?;
+    socket_of_device(&path)
+}
+
 /// CPU package of a PCI device, via the package of its local CPUs. Falls back to
 /// the NUMA node, which is the same number unless sub-NUMA clustering is on.
 fn socket_of_device(device_path: &Path) -> Result<u32> {

@@ -1,6 +1,7 @@
 use crate::config::RuntimeConfig;
 use crate::dpdk;
 use crate::lcore::datapath_budget::{self, DatapathBudget};
+use crate::lcore::dram_meter::DramMeter;
 use crate::lcore::pcie_meter::PcieMeter;
 use crate::port::{statistics::PortStats, Port, PortId, RxQueue, RxQueueType};
 
@@ -38,6 +39,8 @@ pub(crate) struct Monitor {
     prev_udp_bytes: u64,
     /// PCIe root-port bandwidth, sampled by a `pcm-iio` child process.
     pcie: Option<PcieMeter>,
+    /// Per-socket DRAM bandwidth, sampled by a `pcm-memory` child process.
+    dram: Option<DramMeter>,
 }
 
 impl Monitor {
@@ -60,6 +63,7 @@ impl Monitor {
                     return Some(Display {
                         throughput: display_cfg.throughput,
                         pcie: display_cfg.pcie,
+                        dram: display_cfg.dram,
                         keywords: display_cfg.port_stats.clone(),
                     });
                 }
@@ -122,6 +126,20 @@ impl Monitor {
                 )
             });
 
+        // Same shape as the PCIe meter above, and gated the same way — including that a
+        // log-only run with no [online.monitor.display] section gets no dram.csv either.
+        // Deliberately identical rather than fixed here alone: two meters with different
+        // gating and no way to tell from the config which is which is worse than the quirk.
+        let dram = display
+            .as_ref()
+            .filter(|display| display.dram)
+            .and_then(|_| {
+                DramMeter::spawn(
+                    &port_devices,
+                    logger.as_ref().map(|logger| logger.path.as_path()),
+                )
+            });
+
         let mut monitor_ports: BTreeMap<PortId, Vec<RxQueue>> = BTreeMap::new();
         for (port_id, port) in ports.iter() {
             monitor_ports.insert(*port_id, port.queue_map.keys().cloned().collect());
@@ -136,6 +154,7 @@ impl Monitor {
             prev_tcp_bytes: 0,
             prev_udp_bytes: 0,
             pcie,
+            dram,
         }
     }
 
@@ -223,9 +242,10 @@ impl Monitor {
                             }
                         }
 
-                        // Per-second PCIe inbound bandwidth for the NIC's root port.
+                        // Per-second PCIe inbound and DRAM bandwidth.
                         if show_throughput {
                             self.display_pcie();
+                            self.display_dram();
                         }
                     }
                     Err(error) => {
@@ -267,11 +287,44 @@ impl Monitor {
             }
         }
 
+        // Final cumulative DRAM totals, per monitored socket.
+        if let Some(dram) = &mut self.dram {
+            for stats in dram.stats() {
+                println!(
+                    "DRAM {} (cumulative): read {} bytes / write {} bytes",
+                    stats.label, stats.total_read_bytes, stats.total_write_bytes,
+                );
+            }
+        }
+
         self.display_worker_budget();
 
         if let Some(logger) = &self.logger {
             let json_fname = logger.path.join("throughputs.json");
             tputs.dump_json(json_fname).expect("Unable to dump to json");
+        }
+    }
+
+    /// Display the latest DRAM read/write sample for each monitored socket, if DRAM
+    /// monitoring is on.
+    ///
+    /// `pcm-memory` samples on its own second, which drifts against this tick, so a tick may
+    /// find no new sample; say so rather than reprinting a stale count as if it covered the
+    /// last second.
+    fn display_dram(&mut self) {
+        let dram = match &mut self.dram {
+            Some(dram) => dram,
+            None => return,
+        };
+        for stats in dram.stats() {
+            match stats.sample {
+                Some(sample) => println!(
+                    "DRAM {}: read {} bytes / write {} bytes",
+                    stats.label, sample.read_bytes, sample.write_bytes,
+                ),
+                None if stats.started => println!("DRAM {}: no new sample", stats.label),
+                None => println!("DRAM {}: waiting for first sample", stats.label),
+            }
         }
     }
 
@@ -328,6 +381,7 @@ impl Monitor {
 struct Display {
     throughput: bool,
     pcie: bool,
+    dram: bool,
     keywords: Vec<String>,
 }
 
