@@ -160,23 +160,20 @@ where
 
         let batch_size = batch.len() as u64;
 
-        dispatcher
-            .stats()
-            .actively_processing
-            .fetch_add(batch_size, Ordering::Relaxed);
+        // Guard, not a bare increment: a panicking handler must not leave the in-flight count
+        // above zero, or `wait_for_completion` never returns.
+        let _in_flight = dispatcher.stats().begin_processing(batch_size);
 
         for data in batch {
             handler(data);
         }
 
+        // `processed` is deliberately not guarded: a batch that panicked did not complete, so it
+        // should not be counted as processed.
         dispatcher
             .stats()
             .processed
             .fetch_add(batch_size, Ordering::Relaxed);
-        dispatcher
-            .stats()
-            .actively_processing
-            .fetch_sub(batch_size, Ordering::Relaxed);
     }
 
     /// Main worker loop that uses crossbeam Select to efficiently wait on multiple channels.
@@ -258,6 +255,20 @@ where
             let active_handlers = self.dispatcher.stats().get_actively_processing();
 
             if queues_empty && active_handlers == 0 {
+                break;
+            }
+
+            // Nothing is left to drain the queues, so the condition above can no longer become
+            // true and sleeping again would block forever. A panicking handler is how this
+            // happens in practice: the thread unwinds out of the loop with its queue non-empty.
+            // Checked rather than left to a timeout because it is exact -- no live worker means
+            // no further progress is possible, whatever the deadline would have been.
+            if self.handles.iter().all(|h| h.is_finished()) {
+                eprintln!(
+                    "dedicated worker: no live worker thread remains but work is still \
+                     outstanding; abandoning the wait. A handler most likely panicked -- the \
+                     join below will report it."
+                );
                 break;
             }
 

@@ -14,4 +14,4 @@ pub use channel_dispatcher::{ChannelDispatcher, ChannelMode, Channels};
 pub use dedicated_worker::{DedicatedWorkerHandle, DedicatedWorkerThreadSpawner};
 pub use pin::pin_thread_to_core;
 pub use shared_worker::SharedWorkerThreadSpawner;
-pub use subscription_stats::SubscriptionStats;
+pub use subscription_stats::{InFlight, SubscriptionStats};
