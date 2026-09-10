@@ -8,7 +8,7 @@ use iris_core::{
     CoreId, FiveTuple, L4Pdu, Runtime,
     config::{FlowMode, default_config, load_config},
     filter::flow_drop::{
-        DISCARDED_BYTES, DISCARDED_PACKETS, install_drop_flow, install_split_flow,
+        DISCARDED_BYTES, DISCARDED_PACKETS, SplitQueueMap, install_drop_flow, install_split_flow,
         query_resident_flow, uninstall_flow,
     },
     multicore::{ChannelDispatcher, ChannelMode, SharedWorkerThreadSpawner},
@@ -22,7 +22,7 @@ use iris_compiler::{callback, datatype, datatype_fn, input_files, iris_end_macro
 use iris_core::dpdk::{rte_flow, rte_flow_action_handle};
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     path::PathBuf,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::{Arc, Mutex, OnceLock, RwLock},
@@ -64,7 +64,7 @@ static TLS_BYTES: AtomicUsize = AtomicUsize::new(0);
 // Dispatching
 static FLOW_DISPATCHER: OnceLock<Arc<ChannelDispatcher<FlowEvent>>> = OnceLock::new();
 static MODE: RwLock<FlowMode> = RwLock::new(FlowMode::Standard);
-static SPLIT_QUEUES: RwLock<Option<HashMap<CoreId, u16>>> = RwLock::new(None);
+static SPLIT_QUEUES: RwLock<Option<SplitQueueMap>> = RwLock::new(None);
 
 static NUM_FLOWS: OnceLock<usize> = OnceLock::new();
 static USE_MODEL: OnceLock<bool> = OnceLock::new();
@@ -476,24 +476,12 @@ fn main() {
     // Initialize split queues if needed. Both trim paths use the same queue
     // layout; they differ only in whether the NIC DMAs the payload segment.
     if flow_mode.uses_split_queues() {
-        // Layout per port (no sink): q0=receive  q1=split    q2=receive  q3=split    ...
-        let mut split_queues: HashMap<CoreId, u16> = HashMap::new();
+        // Queue ids are per port, so the map yields one id per port for a
+        // given core: a rule goes onto every port, and a queue id taken from
+        // one port means nothing on another.
         if let Some(online) = &config.online {
-            for port_map in &online.ports {
-                for (i, core) in port_map
-                    .cores
-                    .iter()
-                    .copied()
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .enumerate()
-                {
-                    split_queues.insert(CoreId(core), (i as u16) * 2 + 1);
-                }
-            }
+            *SPLIT_QUEUES.write().unwrap() = Some(SplitQueueMap::from_config(online));
         }
-
-        *SPLIT_QUEUES.write().unwrap() = Some(split_queues);
     }
 
     // Create and publish the dispatcher
@@ -542,9 +530,10 @@ fn main() {
                         return;
                     }
 
-                    let split_queue = if mode.uses_split_queues() {
-                        let queues = SPLIT_QUEUES.read().unwrap();
-                        match queues.as_ref().and_then(|m| m.get(&rx_core)).copied() {
+                    // One split queue id per port, in the same order as PORT_IDS.
+                    let split_queues = if mode.uses_split_queues() {
+                        let map = SPLIT_QUEUES.read().unwrap();
+                        match map.as_ref().and_then(|m| m.queues_for(rx_core)) {
                             Some(q) => Some(q),
                             None => {
                                 eprintln!("No split queue mapped for core {rx_core:?}");
@@ -575,7 +564,11 @@ fn main() {
                         let result = match mode {
                             FlowMode::Drop => install_drop_flow(ports.clone(), &tuple),
                             FlowMode::Split | FlowMode::TrimNativeDpdk => {
-                                install_split_flow(ports.clone(), &tuple, split_queue.unwrap())
+                                install_split_flow(
+                                    ports.clone(),
+                                    &tuple,
+                                    split_queues.as_ref().unwrap(),
+                                )
                             }
                             FlowMode::Standard => return,
                         };

@@ -8,7 +8,7 @@ use crate::port::PortId;
 use crate::protocols::packet::tcp::TCP_PROTOCOL;
 use crate::protocols::packet::udp::UDP_PROTOCOL;
 use crate::FiveTuple;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::dpdk;
 use crate::dpdk::{
@@ -214,6 +214,38 @@ fn create_count_handle(port_id: u16) -> Result<*mut rte_flow_action_handle> {
     Ok(handle)
 }
 
+/// Destroy rules (and their counter handles) created so far by `install`,
+/// used when a later port fails and the partial set would otherwise be
+/// stranded in the PMD with no caller holding the pointers. Errors are
+/// reported but not propagated: the caller is already returning a failure.
+fn destroy_installed(
+    port_ids: &[PortId],
+    flows: &[*mut rte_flow],
+    handles: &[*mut rte_flow_action_handle],
+) {
+    let n = port_ids.len();
+    if n == 0 {
+        return;
+    }
+    // Same layout as uninstall_flow: forward rules occupy [0..n), reverse [n..2n).
+    for (idx, flow) in flows.iter().enumerate() {
+        let port = port_ids[idx % n].raw();
+        if !flow.is_null() {
+            let mut err: rte_flow_error = unsafe { mem::zeroed() };
+            if unsafe { rte_flow_destroy(port, *flow, &mut err) } != 0 {
+                let msg = unsafe { CStr::from_ptr(err.message).to_string_lossy().into_owned() };
+                eprintln!("Rollback: failed to destroy flow on port {}: {}", port, msg);
+            }
+        }
+        if let Some(handle) = handles.get(idx) {
+            if !handle.is_null() {
+                let mut derr: rte_flow_error = unsafe { mem::zeroed() };
+                unsafe { rte_flow_action_handle_destroy(port, *handle, &mut derr) };
+            }
+        }
+    }
+}
+
 /// Installs a flow rule (forward + reverse) on each port.
 fn install<F>(
     port_ids: &[PortId],
@@ -222,7 +254,7 @@ fn install<F>(
     make_actions: F,
 ) -> Result<(Vec<*mut rte_flow>, Vec<*mut rte_flow_action_handle>)>
 where
-    F: Fn(*mut rte_flow_action_handle) -> Vec<rte_flow_action>,
+    F: Fn(usize, *mut rte_flow_action_handle) -> Vec<rte_flow_action>,
 {
     let mut flows = Vec::with_capacity(port_ids.len() * 2);
     let mut handles = Vec::with_capacity(port_ids.len() * 2);
@@ -230,10 +262,15 @@ where
     let mut storage = PatternStorage::zeroed();
     let pattern = build_pattern(tuple, &mut storage)?;
 
-    // Create flow rule using pattern
-    for port_id in port_ids.iter() {
-        let handle = create_count_handle(port_id.raw())?;
-        let actions = make_actions(handle);
+    // Create flow rule using pattern. The port index is handed to
+    // make_actions because per-port actions (a QUEUE index) are only valid on
+    // the port they were computed for.
+    for (port_idx, port_id) in port_ids.iter().enumerate() {
+        let handle = create_count_handle(port_id.raw()).map_err(|e| {
+            destroy_installed(port_ids, &flows, &handles);
+            e
+        })?;
+        let actions = make_actions(port_idx, handle);
 
         let mut error: rte_flow_error = unsafe { mem::zeroed() };
 
@@ -260,6 +297,10 @@ where
             // Clean up the handle we just created since the rule failed.
             let mut derr: rte_flow_error = unsafe { mem::zeroed() };
             unsafe { rte_flow_action_handle_destroy(port_id.raw(), handle, &mut derr) };
+            // Rules already created on earlier ports are not returned to the
+            // caller, so nothing would ever destroy them: tear them down here
+            // rather than leak a rule + counter handle per failed install.
+            destroy_installed(port_ids, &flows, &handles);
             anyhow::bail!("Failed to install flow on port {}: {}", port_id.raw(), msg);
         }
 
@@ -277,9 +318,12 @@ where
     let mut rev_storage = PatternStorage::zeroed();
     let rev_pattern = build_pattern(&rev, &mut rev_storage)?;
 
-    for port_id in port_ids.iter() {
-        let handle = create_count_handle(port_id.raw())?;
-        let actions = make_actions(handle);
+    for (port_idx, port_id) in port_ids.iter().enumerate() {
+        let handle = create_count_handle(port_id.raw()).map_err(|e| {
+            destroy_installed(port_ids, &flows, &handles);
+            e
+        })?;
+        let actions = make_actions(port_idx, handle);
 
         let mut error_rev: rte_flow_error = unsafe { mem::zeroed() };
         // Read unconditionally: hw-assist-cycle-eval consumes this for its
@@ -308,6 +352,7 @@ where
             };
             let mut derr: rte_flow_error = unsafe { mem::zeroed() };
             unsafe { rte_flow_action_handle_destroy(port_id.raw(), handle, &mut derr) };
+            destroy_installed(port_ids, &flows, &handles);
             anyhow::bail!("Failed to install flow on port {}: {}", port_id.raw(), msg);
         }
 
@@ -322,35 +367,57 @@ pub fn install_drop_flow(
     port_ids: Vec<PortId>,
     tuple: &FiveTuple,
 ) -> Result<(Vec<*mut rte_flow>, Vec<*mut rte_flow_action_handle>)> {
-    install(&port_ids, tuple, &ingress_attr(1, 0), |handle| {
-        vec![
-            rte_flow_action {
-                type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_INDIRECT,
-                conf: handle as *const _,
-            },
-            rte_flow_action {
-                type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_DROP,
-                conf: ptr::null(),
-            },
-            rte_flow_action {
-                type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_END,
-                conf: ptr::null(),
-            },
-        ]
-    })
+    install(
+        &port_ids,
+        tuple,
+        &ingress_attr(1, 0),
+        |_port_idx, handle| {
+            vec![
+                rte_flow_action {
+                    type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_INDIRECT,
+                    conf: handle as *const _,
+                },
+                rte_flow_action {
+                    type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_DROP,
+                    conf: ptr::null(),
+                },
+                rte_flow_action {
+                    type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_END,
+                    conf: ptr::null(),
+                },
+            ]
+        },
+    )
 }
 
+/// Steer a flow (both directions) to a split queue on every port.
+///
+/// `queue_ids` holds ONE queue id per entry of `port_ids`, in the same order:
+/// queue ids are per-port, so a single id reused across ports steers the wrong
+/// core's queue and, on a port with fewer queues than the one the id came
+/// from, fails outright with "queue index out of range". Build the vector with
+/// `SplitQueueMap::queues_for`.
 pub fn install_split_flow(
     port_ids: Vec<PortId>,
     tuple: &FiveTuple,
-    queue_id: u16,
+    queue_ids: &[u16],
 ) -> Result<(Vec<*mut rte_flow>, Vec<*mut rte_flow_action_handle>)> {
-    // queue conf must outlive the actions array; box it so the pointer
-    // stays valid for each per-flow actions vec.
-    let queue_conf = Box::new(rte_flow_action_queue { index: queue_id });
-    let queue_ptr = &*queue_conf as *const rte_flow_action_queue;
+    if queue_ids.len() != port_ids.len() {
+        bail!(
+            "install_split_flow: {} ports but {} queue ids",
+            port_ids.len(),
+            queue_ids.len()
+        );
+    }
 
-    let result = install(&port_ids, tuple, &ingress_attr(1, 0), |handle| {
+    // The queue confs must outlive the actions arrays; they live in this vec
+    // (stable addresses, never reallocated) for the whole install call.
+    let queue_confs: Vec<rte_flow_action_queue> = queue_ids
+        .iter()
+        .map(|&index| rte_flow_action_queue { index })
+        .collect();
+
+    let result = install(&port_ids, tuple, &ingress_attr(1, 0), |port_idx, handle| {
         vec![
             rte_flow_action {
                 type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_INDIRECT,
@@ -358,7 +425,7 @@ pub fn install_split_flow(
             },
             rte_flow_action {
                 type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_QUEUE,
-                conf: queue_ptr as *const _,
+                conf: &queue_confs[port_idx] as *const rte_flow_action_queue as *const _,
             },
             rte_flow_action {
                 type_: dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_END,
@@ -367,10 +434,20 @@ pub fn install_split_flow(
         ]
     });
 
-    // queue_conf is dropped here, after all rte_flow_create calls have
+    // queue_confs are dropped here, after all rte_flow_create calls have
     // copied the pattern/actions into the PMD.
-    drop(queue_conf);
-    result
+    drop(queue_confs);
+
+    // Name the port -> queue pairing in the error: "queue index out of range"
+    // on its own does not say which index the PMD rejected, nor on which port.
+    result.with_context(|| {
+        let pairs: Vec<String> = port_ids
+            .iter()
+            .zip(queue_ids.iter())
+            .map(|(p, q)| format!("port {} -> split q{}", p.raw(), q))
+            .collect();
+        format!("steering split flow: {}", pairs.join(", "))
+    })
 }
 
 /// Uninstall flow rules previously installed, querying their indirect

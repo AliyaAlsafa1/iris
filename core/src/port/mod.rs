@@ -214,6 +214,22 @@ impl Port {
         let standard_mempool = standard_mempools.get_mut(&self.id.socket_id()).unwrap();
         let split_mempool = split_mempools.get_mut(&self.id.socket_id()).unwrap();
         self.setup_queues(standard_mempool, split_mempool, nb_rxd)?;
+
+        // Startup-only: the queue layout actually handed to
+        // rte_eth_dev_configure. rte_flow validates a QUEUE action's index
+        // against this count, so a rule rejected with "queue index out of
+        // range" is checked against the number printed here.
+        let layout: Vec<String> = self
+            .queue_map
+            .iter()
+            .map(|(rxq, core)| format!("q{}{}=core{}", rxq.qid, rxq.ty, core.raw()))
+            .collect();
+        println!(
+            "Port {} configured {} rx queues: {}",
+            self.id.raw(),
+            self.queue_map.len(),
+            layout.join(" ")
+        );
         self.display_info();
         Ok(())
     }

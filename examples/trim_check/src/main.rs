@@ -11,10 +11,12 @@
 use clap::Parser;
 use iris_compiler::*;
 use iris_core::{
-    config::load_config, filter::flow_drop::install_split_flow, port::PortId, CoreId, FiveTuple,
-    L4Pdu, Runtime,
+    CoreId, FiveTuple, L4Pdu, Runtime,
+    config::load_config,
+    filter::flow_drop::{SplitQueueMap, install_split_flow},
+    port::PortId,
 };
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
@@ -28,7 +30,7 @@ static STEERED_OK: AtomicUsize = AtomicUsize::new(0);
 static STEERED_ERR: AtomicUsize = AtomicUsize::new(0);
 
 static PORT_IDS: RwLock<Option<Vec<PortId>>> = RwLock::new(None);
-static SPLIT_QUEUES: RwLock<Option<HashMap<CoreId, u16>>> = RwLock::new(None);
+static SPLIT_QUEUES: RwLock<Option<SplitQueueMap>> = RwLock::new(None);
 static SEEN: Mutex<Option<HashSet<FiveTuple>>> = Mutex::new(None);
 
 static PRINT_FIRST: OnceLock<usize> = OnceLock::new();
@@ -73,11 +75,13 @@ fn steer(five_tuple: &FiveTuple, core_id: &CoreId) {
     }
     drop(guard);
 
-    let queue = match SPLIT_QUEUES
+    // One split queue id per port, in the same order as PORT_IDS: queue ids
+    // are per port, so the id for this core's port does not carry over.
+    let queues = match SPLIT_QUEUES
         .read()
         .unwrap()
         .as_ref()
-        .and_then(|m| m.get(core_id).copied())
+        .and_then(|m| m.queues_for(*core_id))
     {
         Some(q) => q,
         None => {
@@ -92,11 +96,11 @@ fn steer(five_tuple: &FiveTuple, core_id: &CoreId) {
         None => return,
     };
 
-    match install_split_flow(ports, five_tuple, queue) {
+    match install_split_flow(ports, five_tuple, &queues) {
         Ok(_) => {
             let n = STEERED_OK.fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 8 {
-                println!("steered flow {n} -> queue {queue} (core {core_id:?})");
+                println!("steered flow {n} -> queues {queues:?} (core {core_id:?})");
             }
         }
         Err(e) => {
@@ -143,23 +147,12 @@ fn main() {
     let _ = MAX_FLOWS.set(args.max_flows);
     let config = load_config(&args.config);
 
-    // Queue layout per port with no sinks: q0=receive q1=split q2=receive ...
+    // Queue layout per port: sink qids first, then q(2i)=receive q(2i+1)=split
+    // per core. Queue ids are per port, so this map is keyed by core AND port.
     if let Some(online) = &config.online {
-        let mut queues: HashMap<CoreId, u16> = HashMap::new();
-        for port_map in &online.ports {
-            for (i, core) in port_map
-                .cores
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .enumerate()
-            {
-                queues.insert(CoreId(core), (i as u16) * 2 + 1);
-            }
-        }
-        println!("split queue map: {queues:?}");
-        *SPLIT_QUEUES.write().unwrap() = Some(queues);
+        let map = SplitQueueMap::from_config(online);
+        println!("split queue map: {map:?}");
+        *SPLIT_QUEUES.write().unwrap() = Some(map);
     }
 
     let mut runtime: Runtime<SubscribedWrapper> = Runtime::new(config.clone(), filter).unwrap();
