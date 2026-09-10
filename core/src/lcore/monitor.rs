@@ -1,5 +1,6 @@
 use crate::config::RuntimeConfig;
 use crate::dpdk;
+use crate::lcore::datapath_budget::{self, DatapathBudget};
 use crate::lcore::pcie_meter::PcieMeter;
 use crate::port::{statistics::PortStats, Port, PortId, RxQueue, RxQueueType};
 
@@ -85,11 +86,18 @@ impl Monitor {
                         let wtr = Writer::from_path(&fname).expect("create portstat log");
                         port_wtrs.insert(*port_id, wtr);
                     }
+                    let budget_wtr = Writer::from_path(path.join("cycle_budget.csv"))
+                        .expect("create cycle budget log");
                     return Some(Logger {
                         interval: Duration::from_millis(log_cfg.interval),
                         path,
                         port_wtrs,
                         keywords: log_cfg.port_stats.clone(),
+                        budget_wtr,
+                        last_budget: Default::default(),
+                        last_ingress_pkts: 0,
+                        last_ingress_bytes: 0,
+                        warned_no_phy: false,
                     });
                 }
             }
@@ -134,6 +142,7 @@ impl Monitor {
     pub(crate) async fn run(&mut self) {
         if let Some(logger) = &mut self.logger {
             logger.init_port_wtrs().expect("port logger init");
+            logger.init_budget_wtr().expect("cycle budget logger init");
         }
         // ts of run start
         let start_ts = Instant::now();
@@ -332,6 +341,14 @@ struct Logger {
     path: PathBuf,
     port_wtrs: HashMap<PortId, Writer<std::fs::File>>,
     keywords: Vec<String>,
+    /// Per-interval datapath cycle budget, one row per logger tick.
+    budget_wtr: Writer<std::fs::File>,
+    /// Previous tick's cumulative budget, so each row can be a delta.
+    last_budget: DatapathBudget,
+    last_ingress_pkts: u64,
+    last_ingress_bytes: u64,
+    /// Whether the "no rx_phy_*" warning has been issued; once is enough.
+    warned_no_phy: bool,
 }
 
 impl Logger {
@@ -355,10 +372,33 @@ impl Logger {
 
     /// Logs per-port statistics and mempool statistics (per-socket statistics).
     fn log_stats(&mut self, elapsed: Duration) -> Result<()> {
+        // Offered load for the cycle budget, taken from the same collect as the port rows so the
+        // two describe the same instant. `ok` goes false if any port failed, in which case the
+        // budget row is skipped rather than written with a short denominator.
+        let (mut phy_pkts, mut phy_bytes, mut ok) = (0u64, 0u64, true);
+        let mut missing_phy = false;
+
         for (port_id, wtr) in self.port_wtrs.iter_mut() {
             let port_stats = PortStats::collect(*port_id);
             match port_stats {
                 Ok(port_stats) => {
+                    // Read outside the keyword filter: these are the budget's denominator, and a
+                    // `[online.monitor.log] port_stats` list that omits them must not delete it.
+                    // Not every PMD exposes rx_phy_* (ICE does not), so fall back to rx_good_*,
+                    // which undercounts whatever the NIC dropped before software saw it.
+                    let get = |k: &str| port_stats.stats.get(k).copied();
+                    match (get("rx_phy_packets"), get("rx_phy_bytes")) {
+                        (Some(pkts), Some(bytes)) => {
+                            phy_pkts += pkts;
+                            phy_bytes += bytes;
+                        }
+                        _ => {
+                            missing_phy = true;
+                            phy_pkts += get("rx_good_packets").unwrap_or(0);
+                            phy_bytes += get("rx_good_bytes").unwrap_or(0);
+                        }
+                    }
+
                     wtr.write_field(elapsed.as_millis().to_string())?;
                     for label in port_stats.stats.keys() {
                         if self.keywords.iter().any(|k| label.contains(k)) {
@@ -370,7 +410,10 @@ impl Logger {
                         }
                     }
                 }
-                Err(error) => log::error!("{}", error),
+                Err(error) => {
+                    log::error!("{}", error);
+                    ok = false;
+                }
             }
             let name = format!("mempool_standard_{}", port_id.socket_id());
             let cname = CString::new(name).expect("Invalid CString conversion");
@@ -394,6 +437,122 @@ impl Logger {
         for wtr in self.port_wtrs.values_mut() {
             wtr.flush()?;
         }
+
+        if missing_phy && !self.warned_no_phy {
+            self.warned_no_phy = true;
+            log::warn!(
+                "a port exposes no rx_phy_* counters, so cycle_budget.csv's ingress_pkts and \
+                 ingress_bytes fall back to rx_good_*, which excludes anything the NIC dropped \
+                 before software saw it"
+            );
+        }
+        if ok {
+            self.log_cycle_budget(elapsed, phy_pkts, phy_bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Write the header for `cycle_budget.csv`.
+    ///
+    /// Every column except `ts_ms`, `rx_cores_cnt`, `rdtsc_cost_cycles` and the two fractions is
+    /// a delta over the logging interval, the same way `pcie.csv`'s `ib_write_bytes` is a
+    /// per-second count rather than a running total.
+    fn init_budget_wtr(&mut self) -> Result<()> {
+        for field in [
+            "ts_ms",
+            // The four attributed buckets. Disjoint, and they sum to sampled_wall_cycles.
+            "poll_busy_cycles",
+            "poll_idle_cycles",
+            "pipeline_cycles",
+            "maint_cycles",
+            // Span the buckets were attributed over, and the exact span of the interval. Take
+            // fractions against the former and scale by the latter for absolute cycles.
+            "sampled_wall_cycles",
+            "wall_cycles",
+            // Exact counters: never sampled.
+            "bursts_cnt",
+            "idle_polls_cnt",
+            "recv_pkts",
+            // Offered load, from rx_phy_* where the PMD provides it.
+            "ingress_pkts",
+            "ingress_bytes",
+            // Constant across the run, recorded per row so a CSV is self-describing.
+            "rx_cores_cnt",
+            // Per-read rte_rdtsc cost subtracted from each closed span. Zero means attribution
+            // is off (budget_sample_stride = 0), which is why a run of zeroed cycle columns is
+            // not necessarily a broken file.
+            "rdtsc_cost_cycles",
+            "idle_fraction",
+            "busy_fraction",
+            "cycles_per_ingress_pkt",
+        ] {
+            self.budget_wtr.write_field(field)?;
+        }
+        self.budget_wtr.write_record(None::<&[u8]>)?;
+        self.budget_wtr.flush()?;
+        Ok(())
+    }
+
+    /// Write one interval's cycle budget, differenced against the previous tick.
+    fn log_cycle_budget(&mut self, elapsed: Duration, phy_pkts: u64, phy_bytes: u64) -> Result<()> {
+        let now = datapath_budget::current();
+        let prev = self.last_budget;
+        let diff = |cur: u64, old: u64| cur.saturating_sub(old);
+
+        let d_poll_busy = diff(now.poll_busy, prev.poll_busy);
+        let d_poll_idle = diff(now.poll_idle, prev.poll_idle);
+        let d_pipeline = diff(now.pipeline, prev.pipeline);
+        let d_maint = diff(now.maint, prev.maint);
+        let d_sampled_wall = diff(now.sampled_wall, prev.sampled_wall);
+        let d_wall = diff(now.wall, prev.wall);
+        let d_ingress_pkts = diff(phy_pkts, self.last_ingress_pkts);
+        let d_ingress_bytes = diff(phy_bytes, self.last_ingress_bytes);
+
+        // Fractions come from the sample, where they are unbiased; absolute cycles are the
+        // fraction scaled by the exact interval span.
+        let frac = |part: u64| {
+            if d_sampled_wall == 0 {
+                0.0
+            } else {
+                part as f64 / d_sampled_wall as f64
+            }
+        };
+        let busy_fraction = frac(d_poll_busy + d_pipeline + d_maint);
+        let work = busy_fraction * d_wall as f64;
+        let cycles_per_ingress_pkt = if d_ingress_pkts == 0 {
+            0.0
+        } else {
+            work / d_ingress_pkts as f64
+        };
+
+        let row = [
+            elapsed.as_millis().to_string(),
+            d_poll_busy.to_string(),
+            d_poll_idle.to_string(),
+            d_pipeline.to_string(),
+            d_maint.to_string(),
+            d_sampled_wall.to_string(),
+            d_wall.to_string(),
+            diff(now.bursts, prev.bursts).to_string(),
+            diff(now.idle_polls, prev.idle_polls).to_string(),
+            diff(now.recv_pkts, prev.recv_pkts).to_string(),
+            d_ingress_pkts.to_string(),
+            d_ingress_bytes.to_string(),
+            now.cores.to_string(),
+            now.rdtsc_cost.to_string(),
+            format!("{:.6}", frac(d_poll_idle)),
+            format!("{:.6}", busy_fraction),
+            format!("{:.3}", cycles_per_ingress_pkt),
+        ];
+        for field in row {
+            self.budget_wtr.write_field(field)?;
+        }
+        self.budget_wtr.write_record(None::<&[u8]>)?;
+        self.budget_wtr.flush()?;
+
+        self.last_budget = now;
+        self.last_ingress_pkts = phy_pkts;
+        self.last_ingress_bytes = phy_bytes;
         Ok(())
     }
 }
