@@ -1,6 +1,7 @@
 //! Utilities for managing and monitoring Iris cores.
 
 pub(crate) mod monitor;
+pub mod pcie_meter;
 // pub(crate) mod ring;
 pub(crate) mod rx_core;
 pub mod transport_meter;
