@@ -8,6 +8,13 @@ mod prometheus;
 /// Only non-empty rx_bursts are counted, so idle poll-spin is excluded — this is
 /// the actual per-packet processing cost, unlike `perf`'s cycles (which include
 /// the poll-mode spin and so are ~constant regardless of load).
+///
+/// Fed from [`publish_datapath_delta`](crate::lcore::datapath_budget::publish_datapath_delta).
+/// The cycles are attributed on one iteration in `[online] budget_sample_stride` and scaled back
+/// up, so they estimate the run's total rather than counting it; the ratio against the exact
+/// packet count is unbiased.
+/// [`DatapathBudget`](crate::lcore::datapath_budget::DatapathBudget) carries the same cycles
+/// unscaled, split by where they went.
 pub static DP_BUSY_CYCLES: AtomicU64 = AtomicU64::new(0);
 pub static DP_BUSY_PKTS: AtomicU64 = AtomicU64::new(0);
 
