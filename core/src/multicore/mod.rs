@@ -9,6 +9,7 @@ mod dedicated_worker;
 mod pin;
 mod shared_worker;
 mod subscription_stats;
+pub mod worker_budget;
 
 pub use channel_dispatcher::{ChannelDispatcher, ChannelMode, Channels};
 pub use dedicated_worker::{DedicatedWorkerHandle, DedicatedWorkerThreadSpawner};

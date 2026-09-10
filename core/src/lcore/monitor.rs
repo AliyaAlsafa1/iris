@@ -267,9 +267,36 @@ impl Monitor {
             }
         }
 
+        self.display_worker_budget();
+
         if let Some(logger) = &self.logger {
             let json_fname = logger.path.join("throughputs.json");
             tputs.dump_json(json_fname).expect("Unable to dump to json");
+        }
+    }
+
+    /// Report each worker pool's utilization.
+    ///
+    /// Live: pools register at spawn and their threads refresh per batch, so this reads a real
+    /// figure mid-run rather than waiting for the threads to exit.
+    fn display_worker_budget(&self) {
+        let pools = crate::multicore::worker_budget::pools();
+        if pools.is_empty() {
+            println!("Workers: not instrumented (no pool enabled measure_utilization)");
+            return;
+        }
+        let tsc_hz = unsafe { crate::dpdk::rte_get_tsc_hz() };
+        for p in pools {
+            let b = p.budget;
+            println!(
+                "Workers ({}): {:.4} cores busy over {} thread(s), {:.2}% mean utilization, \
+                 {} items",
+                p.label,
+                b.cores_busy(tsc_hz),
+                b.threads,
+                100.0 * b.busy_fraction(tsc_hz),
+                b.items,
+            );
         }
     }
 

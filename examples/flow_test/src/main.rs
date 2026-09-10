@@ -515,6 +515,7 @@ fn main() {
     let worker_handle = SharedWorkerThreadSpawner::new()
         .set_cores(worker_core_ids)
         .set_batch_size(args.batch_size)
+        .measure_utilization(true)
         .add_dispatcher(flow_dispatcher.clone(), |event: FlowEvent| {
             match event {
                 FlowEvent::FlowSeen { tuple, rx_core, kind } => {
@@ -626,6 +627,23 @@ fn main() {
 
     // Graceful shutdown
     let final_stats = worker_handle.shutdown(args.flush_channels.as_ref());
+
+    // Read after shutdown so the last batch is included; the monitor's own line, printed
+    // earlier, shows the same pools live.
+    for p in iris_core::multicore::worker_budget::pools() {
+        let w = p.budget;
+        let tsc_hz = unsafe { iris_core::rte_get_tsc_hz() };
+        println!(
+            "Rule-install workers ({}): {:.4} cores busy over {} thread(s), {:.2}% mean \
+             utilization, {} offloads handled, {:.0} offloads/s sustainable at one core",
+            p.label,
+            w.cores_busy(tsc_hz),
+            w.threads,
+            100.0 * w.busy_fraction(tsc_hz),
+            w.items,
+            w.sustainable_item_rate(),
+        );
+    }
 
     // Discard totals are accumulated at eviction time (each evicted rule's
     // indirect counter is queried in uninstall_flow). Flows still resident at

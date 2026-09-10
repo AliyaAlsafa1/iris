@@ -1,3 +1,4 @@
+use super::worker_budget::{self, WorkerProbe};
 use super::{pin_thread_to_core, ChannelDispatcher, SubscriptionStats};
 use crate::CoreId;
 use crossbeam::channel::{Receiver, Select, TryRecvError};
@@ -22,6 +23,7 @@ where
     dispatchers: Vec<Arc<ChannelDispatcher<T>>>,
     handlers: Vec<Box<dyn Fn(T) + Send + Sync>>,
     batch_size: usize,
+    measure_utilization: bool,
 }
 
 /// Handle for managing a group of shared worker threads.
@@ -47,6 +49,7 @@ where
             dispatchers: Vec::new(),
             handlers: Vec::new(),
             batch_size: 1,
+            measure_utilization: false,
         }
     }
 
@@ -59,6 +62,16 @@ where
     /// Sets the batch size for processing messages.
     pub fn set_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size.max(1);
+        self
+    }
+
+    /// Accounts for this pool's time, readable while it runs via
+    /// [`worker_budget::pools`](super::worker_budget::pools).
+    ///
+    /// Off by default: a clock read per batch is negligible against any real handler, but an
+    /// unmeasured pool should not appear in the report at all.
+    pub fn measure_utilization(mut self, measure: bool) -> Self {
+        self.measure_utilization = measure;
         self
     }
 
@@ -95,23 +108,31 @@ where
         let handlers = Arc::new(self.handlers);
         let dispatchers = Arc::new(self.dispatchers);
         let batch_size = self.batch_size;
+        let measure = self.measure_utilization;
         let worker_cores = self
             .worker_cores
             .expect("Cores must be set via set_cores()");
 
         let num_threads = worker_cores.len();
         let shutdown_signal = Arc::new(AtomicBool::new(false));
+        // Registered at spawn, not at first publish, so an empty report means "nobody measured"
+        // rather than "nobody has finished yet".
+        let pool = measure.then(|| {
+            let label: Vec<String> = worker_cores.iter().map(|c| c.raw().to_string()).collect();
+            worker_budget::register(format!("cores {}", label.join(",")), num_threads)
+        });
 
         // Barrier to ensure all threads are spawned before returning
         let startup_barrier = Arc::new(Barrier::new(num_threads + 1)); // +1 for main thread
 
         let mut handles = Vec::with_capacity(num_threads);
-        for core in worker_cores {
+        for (index, core) in worker_cores.into_iter().enumerate() {
             let tagged_receivers_ref = Arc::clone(&tagged_receivers);
             let handlers_ref = Arc::clone(&handlers);
             let dispatchers_ref = dispatchers.clone();
             let barrier_ref = Arc::clone(&startup_barrier);
             let shutdown_ref = Arc::clone(&shutdown_signal);
+            let pool_ref = pool.clone();
 
             let handle = thread::spawn(move || {
                 if let Err(e) = pin_thread_to_core(core.raw()) {
@@ -127,6 +148,7 @@ where
                     &dispatchers_ref,
                     batch_size,
                     &shutdown_ref,
+                    pool_ref.map(|p| (p, index)),
                 );
             });
 
@@ -173,17 +195,25 @@ where
 
     /// Main worker loop that uses crossbeam Select to efficiently wait on multiple channels.
     /// Routes each subscription to the appropriate handler and updates processing statistics.
+    ///
+    /// Given a `slot`, the loop records its own utilization there. Both clocks span the whole
+    /// loop, so the shutdown paths can `break` from anywhere without disturbing the measurement.
     fn run_worker_loop(
         tagged_receivers: &[(usize, Arc<Receiver<T>>)],
         handlers: &[Box<dyn Fn(T) + Send + Sync>],
         dispatchers: &[Arc<ChannelDispatcher<T>>],
         batch_size: usize,
         shutdown_signal: &Arc<AtomicBool>,
+        slot: Option<(Arc<worker_budget::PoolShared>, usize)>,
     ) {
         let mut select = Select::new();
         for (_, receiver) in tagged_receivers.iter() {
             select.recv(receiver);
         }
+
+        // Started here rather than at thread spawn: the CPU clock it reads is per-thread, and the
+        // pinning and startup barrier before this point are not the worker's own work.
+        let mut probe = slot.map(|(pool, index)| WorkerProbe::start(pool, index));
 
         loop {
             if shutdown_signal.load(Ordering::Relaxed) {
@@ -222,7 +252,11 @@ where
             }
 
             if !batch.is_empty() {
+                let handled = batch.len() as u64;
                 Self::process_batch(batch, handler.as_ref(), dispatcher);
+                if let Some(p) = probe.as_mut() {
+                    p.record_items(handled);
+                }
             }
 
             if let Some(err) = recv_error {
@@ -274,9 +308,9 @@ where
             // no further progress is possible, whatever the deadline would have been.
             if self.handles.iter().all(|h| h.is_finished()) {
                 eprintln!(
-                    "shared worker: no live worker thread remains but work is still \
-                     outstanding; abandoning the wait. A handler most likely panicked -- the \
-                     join below will report it."
+                    "shared worker: no live worker thread remains but work is still outstanding; \
+                     abandoning the wait. A handler most likely panicked -- the join below will \
+                     report it."
                 );
                 break;
             }
