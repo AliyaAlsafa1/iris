@@ -628,6 +628,10 @@ fn main() {
     // Graceful shutdown
     let final_stats = worker_handle.shutdown(args.flush_channels.as_ref());
 
+    // Offline there is no monitor, so this is the only report of where the RX cores' cycles
+    // went; online the same figures go to cycle_budget.csv every interval.
+    println!("{}", iris_core::lcore::datapath_budget::current());
+
     // Read after shutdown so the last batch is included; the monitor's own line, printed
     // earlier, shows the same pools live.
     for p in iris_core::multicore::worker_budget::pools() {

@@ -14,6 +14,7 @@
 //! Each RX core publishes into these globals periodically from its poll loop rather than only at
 //! exit, so the monitor can log a duty cycle beside each interval's ingress rate.
 
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Where every TSC tick on the RX lcores went, summed across cores.
@@ -155,6 +156,50 @@ impl DatapathBudget {
 
     fn fraction(&self, part: u64) -> f64 {
         ratio(part, self.sampled_wall)
+    }
+}
+
+/// Where the cycles went, the exact counters, and the checks on them.
+///
+/// A budget with no cycle measurements prints counters only.
+impl fmt::Display for DatapathBudget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Datapath cycle budget over {} core(s): ", self.cores)?;
+        if self.sampled_wall == 0 {
+            return write!(
+                f,
+                "attribution disabled\n  {} bursts, {} idle polls, {} pkts received",
+                self.bursts, self.idle_polls, self.recv_pkts
+            );
+        }
+        writeln!(
+            f,
+            "idle {:.2}%, poll_busy {:.2}%, pipeline {:.2}%, maint {:.2}%",
+            100.0 * self.idle_fraction(),
+            100.0 * self.poll_busy_fraction(),
+            100.0 * self.pipeline_fraction(),
+            100.0 * self.maint_fraction(),
+        )?;
+        // rdtsc_cost is only calibrated on the online path, so say "uncalibrated" rather than
+        // printing 0.0000% and implying the instrumentation was free.
+        let cost = if self.rdtsc_cost == 0 {
+            "uncalibrated".to_string()
+        } else {
+            format!(
+                "{:.4}%",
+                100.0 * self.instrumentation_fraction(self.rdtsc_cost as f64)
+            )
+        };
+        write!(
+            f,
+            "  {} bursts, {} idle polls, {} pkts received; attribution cost {} of wall, \
+             unattributed {:.4}%",
+            self.bursts,
+            self.idle_polls,
+            self.recv_pkts,
+            cost,
+            100.0 * self.residual_fraction(),
+        )
     }
 }
 
