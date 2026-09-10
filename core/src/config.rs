@@ -621,6 +621,7 @@ fn default_prometheus_ip() -> IpAddr {
 /// [online.monitor.display]
 ///     throughput = true
 ///     mempool_usage = true
+///     pcie = true
 /// ```
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct DisplayConfig {
@@ -631,6 +632,18 @@ pub struct DisplayConfig {
     /// Display live mempool usage. Defaults to `true`.
     #[serde(default = "default_display_mempool_usage")]
     pub mempool_usage: bool,
+
+    /// Display live PCIe inbound byte counts for each port's root port, sampled once a
+    /// second by Intel PCM's `pcm-iio`. Defaults to `false`.
+    ///
+    /// ## Remarks
+    /// The socket / IIO stack / part to read is derived from the PCI address of each
+    /// port in `[[online.ports]]`. `pcm-iio` must be installed and Iris must be able to
+    /// open the MSR/PCI devices it uses (i.e. run as root); if it cannot be started,
+    /// PCIe statistics are skipped and the run continues. When logging is enabled,
+    /// every sample is also written to `pcie.csv` in the log directory.
+    #[serde(default = "default_display_pcie")]
+    pub pcie: bool,
 
     /// List of live port statistics to display.
     ///
@@ -650,6 +663,10 @@ fn default_display_throughput() -> bool {
 
 fn default_display_mempool_usage() -> bool {
     true
+}
+
+fn default_display_pcie() -> bool {
+    false
 }
 
 fn default_display_port_stats() -> Vec<String> {

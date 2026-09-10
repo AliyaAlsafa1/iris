@@ -1,5 +1,6 @@
 use crate::config::RuntimeConfig;
 use crate::dpdk;
+use crate::lcore::pcie_meter::PcieMeter;
 use crate::port::{statistics::PortStats, Port, PortId, RxQueue, RxQueueType};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -34,6 +35,8 @@ pub(crate) struct Monitor {
     is_running: Arc<AtomicBool>,
     prev_tcp_bytes: u64,
     prev_udp_bytes: u64,
+    /// PCIe root-port bandwidth, sampled by a `pcm-iio` child process.
+    pcie: Option<PcieMeter>,
 }
 
 impl Monitor {
@@ -55,6 +58,7 @@ impl Monitor {
                 if let Some(display_cfg) = &monitor_cfg.display {
                     return Some(Display {
                         throughput: display_cfg.throughput,
+                        pcie: display_cfg.pcie,
                         keywords: display_cfg.port_stats.clone(),
                     });
                 }
@@ -92,6 +96,24 @@ impl Monitor {
             None
         })();
 
+        // PCIe monitoring is optional and best-effort: if `pcm-iio` will not run
+        // (not installed, not root), log and carry on without it. The root port to
+        // follow is derived from the ports' PCI addresses.
+        let port_devices: Vec<String> = online_cfg
+            .ports
+            .iter()
+            .map(|port| port.device.clone())
+            .collect();
+        let pcie = display
+            .as_ref()
+            .filter(|display| display.pcie)
+            .and_then(|_| {
+                PcieMeter::spawn(
+                    &port_devices,
+                    logger.as_ref().map(|logger| logger.path.as_path()),
+                )
+            });
+
         let mut monitor_ports: BTreeMap<PortId, Vec<RxQueue>> = BTreeMap::new();
         for (port_id, port) in ports.iter() {
             monitor_ports.insert(*port_id, port.queue_map.keys().cloned().collect());
@@ -105,6 +127,7 @@ impl Monitor {
             is_running,
             prev_tcp_bytes: 0,
             prev_udp_bytes: 0,
+            pcie,
         }
     }
 
@@ -190,6 +213,11 @@ impl Monitor {
                                 );
                             }
                         }
+
+                        // Per-second PCIe inbound bandwidth for the NIC's root port.
+                        if show_throughput {
+                            self.display_pcie();
+                        }
                     }
                     Err(error) => {
                         log::error!("Monitor display error: {}", error);
@@ -220,9 +248,42 @@ impl Monitor {
             pretty_print_unit((tcp_total + udp_total) as f64, "B"),
         );
 
+        // Final cumulative PCIe inbound totals, per monitored root port.
+        if let Some(pcie) = &mut self.pcie {
+            for stats in pcie.stats() {
+                println!(
+                    "PCIe {} (cumulative inbound): write {} bytes / read {} bytes",
+                    stats.label, stats.total_write_bytes, stats.total_read_bytes,
+                );
+            }
+        }
+
         if let Some(logger) = &self.logger {
             let json_fname = logger.path.join("throughputs.json");
             tputs.dump_json(json_fname).expect("Unable to dump to json");
+        }
+    }
+
+    /// Display the latest PCIe inbound bandwidth sample for each monitored root
+    /// port, if PCIe monitoring is on.
+    ///
+    /// `pcm-iio` samples on its own second, which drifts against this tick, so a tick
+    /// may find no new sample; say so rather than reprinting a stale count as if it
+    /// covered the last second.
+    fn display_pcie(&mut self) {
+        let pcie = match &mut self.pcie {
+            Some(pcie) => pcie,
+            None => return,
+        };
+        for stats in pcie.stats() {
+            match stats.sample {
+                Some(sample) => println!(
+                    "PCIe {}: in-write {} bytes / in-read {} bytes",
+                    stats.label, sample.write_bytes, sample.read_bytes,
+                ),
+                None if stats.started => println!("PCIe {}: no new sample", stats.label),
+                None => println!("PCIe {}: waiting for first sample", stats.label),
+            }
         }
     }
 }
@@ -230,6 +291,7 @@ impl Monitor {
 #[derive(Debug)]
 struct Display {
     throughput: bool,
+    pcie: bool,
     keywords: Vec<String>,
 }
 
