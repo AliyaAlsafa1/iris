@@ -94,16 +94,24 @@ where
         } else {
             Mempool::default_mtu()
         };
+        // The split pools are only reachable from buffer-split RX queues, which exist only
+        // under the flow modes `FlowMode::uses_split_queues` names.
+        let needs_split = config
+            .online
+            .as_ref()
+            .is_some_and(|online| online.flow_mode.uses_split_queues());
         for socket_id in socket_ids {
             log::debug!("Socket ID: {}", socket_id);
             standard_mempools.insert(
                 socket_id,
                 Mempool::new(&config.mempool, socket_id, mtu, "standard")?,
             );
-            split_mempools.insert(
-                socket_id,
-                SplitMempool::new(&config.mempool, socket_id, SPLIT_HDR_SIZE, mtu)?,
-            );
+            if needs_split {
+                split_mempools.insert(
+                    socket_id,
+                    SplitMempool::new(&config.mempool, socket_id, SPLIT_HDR_SIZE, mtu)?,
+                );
+            }
         }
 
         // Enable the software flow table iff the config provides a [flow_table]

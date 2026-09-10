@@ -305,6 +305,12 @@ impl Display {
                 let name = format!("mempool_{}_{}", prefix, socket);
                 let cname = CString::new(name.clone()).expect("Invalid CString conversion");
                 let mempool_raw = unsafe { dpdk::rte_mempool_lookup(cname.as_ptr()) };
+                // The split pools are only allocated when a port runs split queues, so under a
+                // non-split flow mode this lookup returns null. Skip rather than hand null to
+                // `rte_mempool_avail_count`, which dereferences it.
+                if mempool_raw.is_null() {
+                    continue;
+                }
                 let avail_cnt = unsafe { dpdk::rte_mempool_avail_count(mempool_raw) };
                 let inuse_cnt = unsafe { dpdk::rte_mempool_in_use_count(mempool_raw) };
 
@@ -367,10 +373,20 @@ impl Logger {
                 Err(error) => log::error!("{}", error),
             }
             let name = format!("mempool_standard_{}", port_id.socket_id());
-            let cname = CString::new(name.clone()).expect("Invalid CString conversion");
+            let cname = CString::new(name).expect("Invalid CString conversion");
             let mempool_raw = unsafe { dpdk::rte_mempool_lookup(cname.as_ptr()) };
-            let avail_cnt = unsafe { dpdk::rte_mempool_avail_count(mempool_raw) };
-            let inuse_cnt = unsafe { dpdk::rte_mempool_in_use_count(mempool_raw) };
+            // The standard pool always exists, unlike the split pools; guarded anyway so a
+            // missing one logs zeros instead of dereferencing null.
+            let (avail_cnt, inuse_cnt) = if mempool_raw.is_null() {
+                (0, 0)
+            } else {
+                unsafe {
+                    (
+                        dpdk::rte_mempool_avail_count(mempool_raw),
+                        dpdk::rte_mempool_in_use_count(mempool_raw),
+                    )
+                }
+            };
             wtr.write_field(avail_cnt.to_string())?;
             wtr.write_field(inuse_cnt.to_string())?;
             wtr.write_record(None::<&[u8]>)?;

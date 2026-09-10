@@ -17,7 +17,7 @@ use std::fmt;
 use std::mem;
 use std::ptr;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 pub(crate) const SYMMETRIC_RSS_KEY: [u8; 52] = [
     0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A,
@@ -212,7 +212,8 @@ impl Port {
         self.configure(promiscuous, mtu)?;
 
         let standard_mempool = standard_mempools.get_mut(&self.id.socket_id()).unwrap();
-        let split_mempool = split_mempools.get_mut(&self.id.socket_id()).unwrap();
+        // Absent unless some port runs split queues; see `Runtime::new`.
+        let split_mempool = split_mempools.get_mut(&self.id.socket_id());
         self.setup_queues(standard_mempool, split_mempool, nb_rxd)?;
 
         // Startup-only: the queue layout actually handed to
@@ -232,6 +233,17 @@ impl Port {
         );
         self.display_info();
         Ok(())
+    }
+
+    /// Whether any of this port's queues draws from a [`SplitMempool`], and so whether the port
+    /// needs one on its socket.
+    ///
+    /// Both buffer-split queue types do: `TrimNativeDpdk` still takes its header segment from the
+    /// split pool, it only declines a mempool for the payload segment.
+    pub(crate) fn needs_split_mempool(&self) -> bool {
+        self.queue_map
+            .keys()
+            .any(|rxq| matches!(rxq.ty, RxQueueType::Split | RxQueueType::TrimNativeDpdk))
     }
 
     /// Start port
@@ -392,11 +404,7 @@ impl Port {
         }
 
         // turns on buffer split if supported and actually used
-        let has_split_queues = self
-            .queue_map
-            .keys()
-            .any(|rxq| matches!(rxq.ty, RxQueueType::Split | RxQueueType::TrimNativeDpdk));
-        if has_split_queues
+        if self.needs_split_mempool()
             && dev_info.rx_offload_capa & dpdk::RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT as u64 != 0
         {
             port_conf.rxmode.offloads |= dpdk::RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT as u64;
@@ -468,19 +476,27 @@ impl Port {
         Ok(())
     }
 
+    /// `split_mempool` is `None` when no port uses split queues, in which case neither split arm
+    /// below can be reached — `needs_split_mempool` decides both.
     fn setup_queues(
         &self,
         standard_mempool: &mut Mempool,
-        split_mempool: &mut SplitMempool,
+        mut split_mempool: Option<&mut SplitMempool>,
         nb_rxd: usize,
     ) -> Result<()> {
         for rxqueue in self.queue_map.keys() {
             match rxqueue.ty {
                 RxQueueType::Split => {
-                    self.setup_split_queue(rxqueue, split_mempool, nb_rxd, false)?
+                    let pool = split_mempool.as_deref_mut().with_context(|| {
+                        format!("Port {} has a split queue but no split mempool", self.id)
+                    })?;
+                    self.setup_split_queue(rxqueue, pool, nb_rxd, false)?
                 }
                 RxQueueType::TrimNativeDpdk => {
-                    self.setup_split_queue(rxqueue, split_mempool, nb_rxd, true)?
+                    let pool = split_mempool.as_deref_mut().with_context(|| {
+                        format!("Port {} has a trim queue but no split mempool", self.id)
+                    })?;
+                    self.setup_split_queue(rxqueue, pool, nb_rxd, true)?
                 }
                 _ => self.setup_standard_queue(rxqueue, standard_mempool, nb_rxd)?,
             };
