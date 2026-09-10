@@ -387,6 +387,11 @@ fn maybe_quic_cb(five_tuple: &FiveTuple, rx_core: &CoreId, pkts: &PktCount) -> b
 #[input_files("$IRIS_HOME/datatypes/data.txt")]
 #[iris_end_macros]
 fn main() {
+    // Without this every log::error! in iris-core is discarded, including the PCIe monitor's
+    // "disabled" and "needs root" diagnostics — which is the only way to find out why a monitor
+    // produced no samples. Controlled by RUST_LOG, so it stays silent unless asked.
+    env_logger::init();
+
     // Parse CLI args
     let args = Args::parse();
     if args.show_args {
