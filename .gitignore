@@ -7,8 +7,9 @@ Cargo.lock
 *.jsonl
 *.DS_Store
 /hists
-
-# Python
+*.claude
+/core/.macro_eval.c
+/core/dpdk_headers-precompile.h*
 __pycache__/
 *.py[cod]
 .venv/
