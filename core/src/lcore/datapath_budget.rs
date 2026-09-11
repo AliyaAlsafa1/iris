@@ -160,18 +160,12 @@ impl DatapathBudget {
     }
 }
 
-/// Where the cycles went, the exact counters, and the checks on them.
-///
-/// A budget with no cycle measurements prints counters only.
+/// Where the cycles went, and the checks on the attribution.
 impl fmt::Display for DatapathBudget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Datapath cycle budget over {} core(s): ", self.cores)?;
         if self.sampled_wall == 0 {
-            return write!(
-                f,
-                "attribution disabled\n  {} bursts, {} idle polls, {} pkts received",
-                self.bursts, self.idle_polls, self.recv_pkts
-            );
+            return write!(f, "attribution disabled");
         }
         writeln!(
             f,
@@ -193,11 +187,7 @@ impl fmt::Display for DatapathBudget {
         };
         write!(
             f,
-            "  {} bursts, {} idle polls, {} pkts received; attribution cost {} of wall, \
-             unattributed {:.4}%",
-            self.bursts,
-            self.idle_polls,
-            self.recv_pkts,
+            "  attribution cost {} of wall, unattributed {:.4}%",
             cost,
             100.0 * self.residual_fraction(),
         )

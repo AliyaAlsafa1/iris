@@ -277,12 +277,30 @@ impl Monitor {
             pretty_print_unit((tcp_total + udp_total) as f64, "B"),
         );
 
+        // Bytes the NIC took off the wire over the run: the denominator that makes the meter
+        // totals below comparable across runs at different offered loads.
+        //
+        // The absolute counter rather than a delta against `init_rx`, because both meters start
+        // with the monitor, a tick or two before `init_rx` is captured, so their totals already
+        // cover that window too.
+        let ingress_bytes = prev_rx.ingress_bytes;
+        // "-" rather than 0.000 with no ingress: the ratio is undefined, not zero.
+        let per_ingress_byte = |bytes: u64| match ingress_bytes {
+            0 => "-".to_string(),
+            total => format!("{:.3}", bytes as f64 / total as f64),
+        };
+
         // Final cumulative PCIe inbound totals, per monitored root port.
         if let Some(pcie) = &mut self.pcie {
             for stats in pcie.stats() {
                 println!(
-                    "PCIe {} (cumulative inbound): write {} bytes / read {} bytes",
-                    stats.label, stats.total_write_bytes, stats.total_read_bytes,
+                    "PCIe {} (cumulative inbound): write {} bytes / read {} bytes; per ingress \
+                     byte: write {} / read {}",
+                    stats.label,
+                    stats.total_write_bytes,
+                    stats.total_read_bytes,
+                    per_ingress_byte(stats.total_write_bytes),
+                    per_ingress_byte(stats.total_read_bytes),
                 );
             }
         }
@@ -291,8 +309,13 @@ impl Monitor {
         if let Some(dram) = &mut self.dram {
             for stats in dram.stats() {
                 println!(
-                    "DRAM {} (cumulative): read {} bytes / write {} bytes",
-                    stats.label, stats.total_read_bytes, stats.total_write_bytes,
+                    "DRAM {} (cumulative): read {} bytes / write {} bytes; per ingress byte: \
+                     read {} / write {}",
+                    stats.label,
+                    stats.total_read_bytes,
+                    stats.total_write_bytes,
+                    per_ingress_byte(stats.total_read_bytes),
+                    per_ingress_byte(stats.total_write_bytes),
                 );
             }
         }
@@ -642,6 +665,8 @@ impl Logger {
 #[derive(Debug, Default, Clone, Copy)]
 struct AggRxStats {
     ingress_bits: u64,
+    /// Raw `rx_phy_bytes`, without the preamble/SFD/IPG padding `ingress_bits` adds.
+    ingress_bytes: u64,
     ingress_pkts: u64,
     good_bits: u64,
     good_pkts: u64,
@@ -749,6 +774,7 @@ impl AggRxStats {
         }
         Ok(AggRxStats {
             ingress_bits: (ingress_bytes + (PSFD_SIZE + IPG_SIZE) * ingress_pkts) * 8,
+            ingress_bytes,
             ingress_pkts,
             good_bits: (good_bytes + (PSFD_SIZE + IPG_SIZE + FCS_SIZE) * good_pkts) * 8,
             good_pkts,
