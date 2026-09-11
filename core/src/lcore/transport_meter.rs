@@ -68,8 +68,10 @@ fn with_local<R>(f: impl FnOnce(&CoreCounters) -> R) -> R {
 #[inline]
 pub fn add_tcp(len: usize) {
     with_local(|c| {
-        c.tcp
-            .store(c.tcp.load(Ordering::Relaxed) + len as u64, Ordering::Relaxed);
+        c.tcp.store(
+            c.tcp.load(Ordering::Relaxed) + len as u64,
+            Ordering::Relaxed,
+        );
     });
 }
 
@@ -77,8 +79,10 @@ pub fn add_tcp(len: usize) {
 #[inline]
 pub fn add_udp(len: usize) {
     with_local(|c| {
-        c.udp
-            .store(c.udp.load(Ordering::Relaxed) + len as u64, Ordering::Relaxed);
+        c.udp.store(
+            c.udp.load(Ordering::Relaxed) + len as u64,
+            Ordering::Relaxed,
+        );
     });
 }
 

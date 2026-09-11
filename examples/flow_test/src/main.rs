@@ -153,7 +153,11 @@ impl FlowKind {
 #[derive(Clone, Serialize)]
 enum FlowEvent {
     /// Minimal payload to keep cloning cheap
-    FlowSeen { tuple: FiveTuple, rx_core: CoreId, kind: FlowKind },
+    FlowSeen {
+        tuple: FiveTuple,
+        rx_core: CoreId,
+        kind: FlowKind,
+    },
 }
 
 // ===== CLI =====
@@ -518,7 +522,11 @@ fn main() {
         .measure_utilization(true)
         .add_dispatcher(flow_dispatcher.clone(), |event: FlowEvent| {
             match event {
-                FlowEvent::FlowSeen { tuple, rx_core, kind } => {
+                FlowEvent::FlowSeen {
+                    tuple,
+                    rx_core,
+                    kind,
+                } => {
                     let mode = *MODE.read().unwrap();
                     if mode == FlowMode::Standard {
                         return;
@@ -569,13 +577,11 @@ fn main() {
 
                         let result = match mode {
                             FlowMode::Drop => install_drop_flow(ports.clone(), &tuple),
-                            FlowMode::Split | FlowMode::TrimNativeDpdk => {
-                                install_split_flow(
-                                    ports.clone(),
-                                    &tuple,
-                                    split_queues.as_ref().unwrap(),
-                                )
-                            }
+                            FlowMode::Split | FlowMode::TrimNativeDpdk => install_split_flow(
+                                ports.clone(),
+                                &tuple,
+                                split_queues.as_ref().unwrap(),
+                            ),
                             FlowMode::Standard => return,
                         };
 

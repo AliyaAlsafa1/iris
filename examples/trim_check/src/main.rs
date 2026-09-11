@@ -11,10 +11,10 @@
 use clap::Parser;
 use iris_compiler::*;
 use iris_core::{
-    CoreId, FiveTuple, L4Pdu, Runtime,
     config::load_config,
-    filter::flow_drop::{SplitQueueMap, install_split_flow},
+    filter::flow_drop::{install_split_flow, SplitQueueMap},
     port::PortId,
+    CoreId, FiveTuple, L4Pdu, Runtime,
 };
 use std::collections::HashSet;
 use std::path::PathBuf;

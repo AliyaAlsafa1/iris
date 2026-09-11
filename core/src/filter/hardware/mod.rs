@@ -755,7 +755,10 @@ pub fn install_dyn_hardware_rules(port: &Port) -> Result<()> {
     // undefined queue indices.
     let rss_queues = receive_rss_queues(port);
     if rss_queues.is_empty() {
-        bail!("No Receive queues to build RSS action for on Port {}", port.id);
+        bail!(
+            "No Receive queues to build RSS action for on Port {}",
+            port.id
+        );
     }
     point_rss_action_at(port, &mut action, &rss_queues);
 
