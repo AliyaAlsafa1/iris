@@ -233,7 +233,24 @@ pub fn set_datapath_cores(n: u64) {
 
 /// The cycle budget summed over every RX core, including cores still running: each publishes
 /// periodically from its poll loop, not only at exit.
-pub fn datapath_budget() -> DatapathBudget {
+///
+/// Retried until two reads agree, because a publish landing mid-read would pair buckets from
+/// before it with a `sampled_wall` from after -- a gap [`DatapathBudget::residual_fraction`]
+/// would report as real. The counters only ever increase, so agreement proves no publish
+/// intervened. Bounded rather than looping: a skewed row beats blocking the monitor.
+pub fn current() -> DatapathBudget {
+    let mut prev = load();
+    for _ in 0..4 {
+        let next = load();
+        if prev == next {
+            return next;
+        }
+        prev = next;
+    }
+    prev
+}
+
+fn load() -> DatapathBudget {
     DatapathBudget {
         poll_busy: DP_POLL_BUSY.load(Ordering::Relaxed),
         poll_idle: DP_POLL_IDLE.load(Ordering::Relaxed),
