@@ -266,9 +266,8 @@ where
     // make_actions because per-port actions (a QUEUE index) are only valid on
     // the port they were computed for.
     for (port_idx, port_id) in port_ids.iter().enumerate() {
-        let handle = create_count_handle(port_id.raw()).map_err(|e| {
+        let handle = create_count_handle(port_id.raw()).inspect_err(|_| {
             destroy_installed(port_ids, &flows, &handles);
-            e
         })?;
         let actions = make_actions(port_idx, handle);
 
@@ -319,9 +318,8 @@ where
     let rev_pattern = build_pattern(&rev, &mut rev_storage)?;
 
     for (port_idx, port_id) in port_ids.iter().enumerate() {
-        let handle = create_count_handle(port_id.raw()).map_err(|e| {
+        let handle = create_count_handle(port_id.raw()).inspect_err(|_| {
             destroy_installed(port_ids, &flows, &handles);
-            e
         })?;
         let actions = make_actions(port_idx, handle);
 
