@@ -148,6 +148,8 @@ where
         let mut published = DatapathBudget::default();
         // Note: countdown rather than `iter % stride` to avoid u64 division.
         let mut countdown: u64 = 1;
+        // Packets received since the timer wheel was last consulted. See the gate below.
+        let mut pkts_since_maint: u64 = 0;
 
         while self.is_running.load(Ordering::Relaxed) {
             // Sample decision for this iteration.
@@ -196,6 +198,7 @@ where
                 } else {
                     budget.bursts += 1;
                     budget.recv_pkts += n_recv as u64;
+                    pkts_since_maint += n_recv as u64;
                 }
 
                 // Apply any pending flow rules pushed by the control plane.
@@ -261,9 +264,16 @@ where
                     t_cursor = t_after_pipeline;
                 }
             }
-            // Run every iteration, so the `maint` bucket below measures the whole cost. Note this
-            // means its cost per delivered packet rises as the core goes idle.
-            conn_table.check_inactive(&self.subscription, now);
+            // Quantise maintenance to a full RX burst. Run every iteration, its cost per packet
+            // scales with how idle the core is rather than with delivered work, which biases the
+            // freed-cycle comparison between arms.
+            //
+            // The wheel keeps its own `timeout_resolution` gate, so this only delays a check; the
+            // effective expiry period is the later of the two conditions.
+            if pkts_since_maint >= RX_BURST_SIZE as u64 {
+                pkts_since_maint = 0;
+                conn_table.check_inactive(&self.subscription, now);
+            }
 
             if sampled {
                 // Close the maintenance bucket (timer-wheel expiry).

@@ -42,7 +42,8 @@ pub struct DatapathBudget {
     /// Sampled cycles in the per-mbuf pipeline: packet filter, conntrack, reassembly, L7 parse,
     /// callbacks.
     pub pipeline: u64,
-    /// Sampled cycles in `ConnTracker::check_inactive` (timer-wheel maintenance).
+    /// Sampled cycles in `ConnTracker::check_inactive` (timer-wheel maintenance), amortised
+    /// over an RX burst's worth of packets rather than charged once per poll iteration.
     pub maint: u64,
     /// Total cycles spanned by the sampled iterations. The four buckets above sum to this by
     /// construction, which is what [`Self::residual_fraction`] checks.
