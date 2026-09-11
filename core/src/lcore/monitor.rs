@@ -305,19 +305,30 @@ impl Monitor {
             }
         }
 
-        // Final cumulative DRAM totals, per monitored socket.
+        // Final cumulative DRAM totals. Summed over every monitored socket, because
+        // `ingress_bytes` is summed over every port. Per-socket bytes are still printed
+        // raw, and per-second printouts are per socket.
         if let Some(dram) = &mut self.dram {
+            let mut read_total = 0u64;
+            let mut write_total = 0u64;
             for stats in dram.stats() {
                 println!(
-                    "DRAM {} (cumulative): read {} bytes / write {} bytes; per ingress byte: \
-                     read {} / write {}",
-                    stats.label,
-                    stats.total_read_bytes,
-                    stats.total_write_bytes,
-                    per_ingress_byte(stats.total_read_bytes),
-                    per_ingress_byte(stats.total_write_bytes),
+                    "DRAM {} (cumulative): read {} bytes / write {} bytes",
+                    stats.label, stats.total_read_bytes, stats.total_write_bytes,
                 );
+                read_total += stats.total_read_bytes;
+                write_total += stats.total_write_bytes;
             }
+            println!(
+                "DRAM total (cumulative, all monitored sockets): read {} bytes / write {} bytes / \
+                 total {} bytes; per ingress byte: read {} / write {} / total {}",
+                read_total,
+                write_total,
+                read_total + write_total,
+                per_ingress_byte(read_total),
+                per_ingress_byte(write_total),
+                per_ingress_byte(read_total + write_total),
+            );
         }
 
         self.display_worker_budget();
