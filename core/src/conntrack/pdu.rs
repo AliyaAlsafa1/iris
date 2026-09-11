@@ -68,6 +68,27 @@ impl L4Pdu {
         self.ctxt.length
     }
 
+    /// Payload bytes of this PDU that are actually addressable in the mbuf.
+    ///
+    /// Equal to [`L4Pdu::length`] on the normal path. Smaller (usually 0) for a
+    /// packet delivered on a buffer-split queue, where only the first
+    /// `SPLIT_HDR_SIZE` bytes reached the header segment. `length` stays the
+    /// on-wire payload size either way, so TCP sequence accounting is unaffected.
+    #[inline]
+    pub fn resident_length(&self) -> usize {
+        self.mbuf
+            .data_len()
+            .saturating_sub(self.ctxt.offset)
+            .min(self.ctxt.length)
+    }
+
+    /// Whether the mbuf is missing some of this PDU's payload, i.e. whether
+    /// reading `length` bytes at `offset` would run past the segment.
+    #[inline]
+    pub fn payload_truncated(&self) -> bool {
+        self.resident_length() < self.ctxt.length
+    }
+
     #[inline]
     pub fn seq_no(&self) -> u32 {
         self.ctxt.seq_no

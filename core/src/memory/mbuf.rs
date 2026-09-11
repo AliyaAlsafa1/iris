@@ -92,6 +92,11 @@ impl Mbuf {
     }
 
     /// Returns the length of the data in the Mbuf.
+    ///
+    /// This is the first segment only, and every read through this Mbuf is
+    /// bounded by it. On a buffer-split RX queue it stops at `SPLIT_HDR_SIZE`:
+    /// the payload sits either in a chained segment from another mempool
+    /// (`FlowMode::Split`) or nowhere at all (`FlowMode::TrimNativeDpdk`).
     pub fn data_len(&self) -> usize {
         self.raw().get_data_len() as usize
     }

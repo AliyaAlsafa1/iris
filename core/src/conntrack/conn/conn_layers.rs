@@ -301,6 +301,26 @@ impl TrackableLayer for L7Session {
     }
 
     fn process_stream(&mut self, pdu: &mut L4Pdu, registry: &ParserRegistry) -> StateTransition {
+        // The mbuf does not hold this PDU's payload -- it arrived on a
+        // buffer-split queue, so the payload went to a segment the pipeline
+        // cannot reach (`FlowMode::Split`) or was dropped by the NIC
+        // (`FlowMode::TrimNativeDpdk`). Probing or parsing it would read past
+        // the header segment; every parser reports that as a malformed packet.
+        // Skip the layer instead and leave the connection in its current state:
+        // byte/packet accounting and TCP sequence tracking still run on the
+        // headers, which is all a steered flow is delivered for.
+        //
+        // A partially resident payload is skipped too rather than parsed short:
+        // the parsers are stateful across PDUs, and feeding them a fragment of
+        // a record would desynchronize them for the rest of the connection.
+        if pdu.payload_truncated() {
+            log::debug!(
+                "Skipping L7 processing: {} of {} payload bytes resident",
+                pdu.resident_length(),
+                pdu.length()
+            );
+            return StateTransition::Packet;
+        }
         match self.linfo.state {
             LayerState::Discovery => {
                 match registry.probe_all(pdu) {
