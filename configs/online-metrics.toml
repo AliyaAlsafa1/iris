@@ -1,0 +1,65 @@
+# Every measurement facility switched on at once: RX cycle budget, worker-pool
+# utilization, PCIe inbound DMA, DRAM read/write, port xstats and throughput.
+#
+# Adapt the two marked lines to the box you are running on -- the PCI address and
+# the core list below are placeholders. Get them from:
+#     dpdk-devbind.py --status-dev net
+#     lscpu | grep -E "^NUMA node[0-9]+ CPU"
+# and choose RX cores on the NIC's own socket. Cores on the wrong socket generate
+# DRAM traffic that dram.csv attributes to a socket the NIC never touched.
+#
+# Needs `pcm-iio` and `pcm-memory` installed, and root. See the run command in
+# the runbook; RUST_LOG must be set or the meters fail silently.
+
+main_core = 0
+nb_memory_channels = 6
+
+[mempool]
+capacity = 4_000_000
+cache_size = 512
+
+[online]
+duration = 120
+nb_rxd = 16384
+promiscuous = true
+mtu = 1500
+hardware_assist = false
+dyn_hardware_assist = true
+# standard | drop | split | trim-native-dpdk (selective Rx, DPDK >= 26.07, mlx5)
+flow_mode = "standard"
+# Attribute cycles on one iteration in N. 1 = every iteration, exact but costlier;
+# 0 = attribution off, leaving the exact burst/packet counters running.
+budget_sample_stride = 64
+
+# Cores must be on same NUMA node.
+[[online.ports]]
+device = "0000:3b:00.0"                        
+cores = [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 ]  
+
+[[online.ports]]
+device = "0000:d8:00.0"
+cores = [ 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35 ]
+
+[conntrack]
+max_connections = 10000000
+max_out_of_order = 500
+timeout_resolution = 100
+udp_inactivity_timeout = 60000
+tcp_inactivity_timeout = 300000
+tcp_reassembly_timeout = 10000
+tcp_establish_timeout = 5000
+
+[online.monitor.display]
+throughput = true
+# Also gates pcie.csv / dram.csv, not just the stdout lines: a run with no display
+# section writes neither file even when logging is on.
+pcie = true
+dram = true
+port_stats = [ "rx_good_packets", "rx_good_bytes", "rx_phy_packets", "rx_phy_bytes", "rx_missed_errors", "rx_mbuf_allocation_errors",]
+
+[online.monitor.log]
+# A timestamped subdirectory is created per run, holding config.toml, port<N>.csv,
+# cycle_budget.csv, pcie.csv, dram.csv and throughputs.json.
+directory = "./log/"
+interval = 1000
+port_stats = [ "rx",]
