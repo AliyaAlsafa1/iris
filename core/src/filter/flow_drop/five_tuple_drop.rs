@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::mem;
 use std::net::IpAddr;
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use crate::port::PortId;
 use crate::protocols::packet::tcp::TCP_PROTOCOL;
@@ -27,11 +29,123 @@ const L4_LSB_MASK: u16 = 0x000F;
 const TCP: u8 = 6;
 const UDP: u8 = 17;
 
-/// Aggregate hits/bytes read from each rule's indirect counter at uninstall
-/// time (on eviction and at teardown). Incremented in `uninstall_flow`, read
-/// by the binary at shutdown to report totals instead of printing per rule.
+/// Aggregate hits/bytes read from the drop rules' indirect counters, over every
+/// rule ever installed: those still resident plus those already evicted. Kept
+/// current by `sample_drop_counters`, and by `uninstall_flow` taking a rule's
+/// final reading before it destroys the counter.
 pub static DISCARDED_PACKETS: AtomicU64 = AtomicU64::new(0);
 pub static DISCARDED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Every drop rule's counter handle, against the reading last taken from it.
+///
+/// A counter is cumulative for the life of its handle and the query does not
+/// reset it, so a repeated sample has to difference against the previous
+/// reading. Adding the raw value each time would re-add the rule's whole
+/// lifetime total on every tick.
+///
+/// Keyed by port and handle address together, and the entry is dropped when the
+/// rule is uninstalled: the PMD is free to hand the same address back for a
+/// later handle, and a stale reading would then suppress the new rule's counts
+/// until it overtook the old one.
+static DROP_COUNTERS: Mutex<BTreeMap<(u16, usize), (u64, u64)>> = Mutex::new(BTreeMap::new());
+
+/// Per-port totals, so drops can be attributed to a port the way an xstat is.
+/// Unlike the generic hardware drop counters these cover exactly the five-tuple
+/// drop rules and nothing else.
+static DROP_BY_PORT: Mutex<BTreeMap<u16, (u64, u64)>> = Mutex::new(BTreeMap::new());
+
+/// Fold one counter reading into the totals, as a delta against the previous
+/// reading of the same handle.
+///
+/// `None` for `raw` retires the handle: its last delta is taken and the entry
+/// removed, for use when the rule is about to be destroyed.
+fn fold_reading(port: u16, handle: usize, raw: Option<(u64, u64)>) {
+    let mut seen = DROP_COUNTERS.lock().unwrap();
+    let key = (port, handle);
+    let (hits, bytes) = match raw {
+        Some(v) => v,
+        None => {
+            seen.remove(&key);
+            return;
+        }
+    };
+    let (last_hits, last_bytes) = seen.get(&key).copied().unwrap_or((0, 0));
+    // A counter that went backwards means the handle was reused under us, or
+    // the PMD reset it; treat the new reading as the whole delta rather than
+    // underflowing.
+    let d_hits = hits.saturating_sub(last_hits);
+    let d_bytes = bytes.saturating_sub(last_bytes);
+    seen.insert(key, (hits, bytes));
+    drop(seen);
+
+    if d_hits == 0 && d_bytes == 0 {
+        return;
+    }
+    DISCARDED_PACKETS.fetch_add(d_hits, Ordering::Relaxed);
+    DISCARDED_BYTES.fetch_add(d_bytes, Ordering::Relaxed);
+    let mut by_port = DROP_BY_PORT.lock().unwrap();
+    let entry = by_port.entry(port).or_insert((0, 0));
+    entry.0 += d_hits;
+    entry.1 += d_bytes;
+}
+
+/// Start tracking the counter handles of a freshly installed drop rule set.
+///
+/// Only drop rules are registered. `install_split_flow` builds counters too,
+/// but those count packets steered to a split queue, which is not a discard.
+fn register_drop_handles(port_ids: &[PortId], handles: &[*mut rte_flow_action_handle]) {
+    let n = port_ids.len();
+    if n == 0 {
+        return;
+    }
+    let mut seen = DROP_COUNTERS.lock().unwrap();
+    for (idx, handle) in handles.iter().enumerate() {
+        if handle.is_null() {
+            continue;
+        }
+        seen.insert((port_ids[idx % n].raw(), *handle as usize), (0, 0));
+    }
+}
+
+/// Read every resident drop rule's counter and fold the deltas into the totals.
+///
+/// `port` limits the sweep to one port's rules; `None` sweeps every port.
+/// Statistics are collected a port at a time, so scoping the sweep keeps the
+/// work per tick proportional to the number of rules rather than to the rules
+/// times the ports.
+///
+/// Safe to call as often as wanted -- that is the point of the differencing --
+/// so the monitor can call it each tick to get a per-interval drop rate that
+/// names the rules responsible, rather than reading a device-wide discard
+/// counter that lumps every drop cause together.
+pub fn sample_drop_counters(port: Option<u16>) {
+    let tracked: Vec<(u16, usize)> = {
+        let seen = DROP_COUNTERS.lock().unwrap();
+        seen.keys()
+            .filter(|(p, _)| port.is_none_or(|want| *p == want))
+            .copied()
+            .collect()
+    };
+    for (port, handle) in tracked {
+        match query_flow_stats(port, handle as *mut rte_flow_action_handle) {
+            Ok(raw) => fold_reading(port, handle, Some(raw)),
+            // A handle destroyed between listing and querying is normal, and
+            // so is a PMD that cannot answer right now; the next tick retries
+            // and the differencing means nothing is lost meanwhile.
+            Err(_) => continue,
+        }
+    }
+}
+
+/// Packets and bytes dropped by this port's five-tuple rules since startup.
+pub fn drop_stats(port_id: u16) -> (u64, u64) {
+    DROP_BY_PORT
+        .lock()
+        .unwrap()
+        .get(&port_id)
+        .copied()
+        .unwrap_or((0, 0))
+}
 
 /// Returns a table in [2..=14] using dest port low nibble for TCP/UDP.
 /// Non-TCP/UDP fall back to BASE_GROUP.
@@ -386,6 +500,7 @@ pub fn install_drop_flow(
             ]
         },
     )
+    .inspect(|(_, handles)| register_drop_handles(&port_ids, handles))
 }
 
 /// Steer a flow (both directions) to a split queue on every port.
@@ -484,13 +599,14 @@ pub fn uninstall_flow(
         }
 
         if !handle.is_null() {
+            // Final reading, folded as a delta like any other: the rule may
+            // already have been sampled many times while it was resident.
             match query_flow_stats(port_id.raw(), handle) {
-                Ok((hits, bytes)) => {
-                    DISCARDED_PACKETS.fetch_add(hits, Ordering::Relaxed);
-                    DISCARDED_BYTES.fetch_add(bytes, Ordering::Relaxed);
-                }
+                Ok(raw) => fold_reading(port_id.raw(), handle as usize, Some(raw)),
                 Err(e) => eprintln!("Port {} flow stats unavailable: {}", port_id.raw(), e),
             }
+            // Stop tracking it before the handle address can be reissued.
+            fold_reading(port_id.raw(), handle as usize, None);
         }
 
         let mut error: rte_flow_error = unsafe { mem::zeroed() };
@@ -568,10 +684,7 @@ pub fn query_resident_flow(
         }
 
         match query_flow_stats(port_id.raw(), handle) {
-            Ok((hits, bytes)) => {
-                DISCARDED_PACKETS.fetch_add(hits, Ordering::Relaxed);
-                DISCARDED_BYTES.fetch_add(bytes, Ordering::Relaxed);
-            }
+            Ok(raw) => fold_reading(port_id.raw(), handle as usize, Some(raw)),
             Err(e) => eprintln!(
                 "Port {} resident flow stats unavailable: {}",
                 port_id.raw(),

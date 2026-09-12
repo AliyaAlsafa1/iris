@@ -60,6 +60,22 @@ impl PortStats {
             let value = xstats[i as usize].value;
             stats.insert(label.to_string_lossy().into_owned(), value);
         }
+
+        // What this port's five-tuple drop rules discarded, read from each
+        // rule's own counter and presented as two more port statistics. They
+        // are not xstats -- no PMD knows which rules are drop rules, only the
+        // code that installed them does -- but they belong beside the xstats:
+        // the device-wide discard counters lump every drop cause together, so
+        // they can only ever be a proxy for what the rules did.
+        //
+        // Carried in this map so a `port_stats` keyword selects them exactly as
+        // it selects rx_split, in both the live display and the CSV, instead of
+        // each of those having to know about them separately.
+        crate::filter::flow_drop::sample_drop_counters(Some(port_id.raw()));
+        let (drop_pkts, drop_bytes) = crate::filter::flow_drop::drop_stats(port_id.raw());
+        stats.insert("drop_rule_packets".to_owned(), drop_pkts);
+        stats.insert("drop_rule_bytes".to_owned(), drop_bytes);
+
         Ok(PortStats { stats, port_id })
     }
 
