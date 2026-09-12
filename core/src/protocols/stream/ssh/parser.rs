@@ -108,8 +108,28 @@ impl Ssh {
         }
     }
 
+    /// The identification string's fields are not guaranteed to be UTF-8: `ssh-parser`
+    /// defines `software` as "any bytes that are not a space or a line ending", so a
+    /// mis-detected banner hands us raw binary. Replace bad sequences instead of panicking.
     fn byte_to_string(&mut self, b: &[u8]) -> String {
-        String::from_utf8(b.to_vec()).unwrap()
+        String::from_utf8_lossy(b).into_owned()
+    }
+
+    /// Each side sends exactly one identification string, and it is the first thing it
+    /// sends. Once we have this direction's -- or once the handshake has visibly moved on
+    /// -- any later `SSH-` in the stream is a coincidence in binary data, not a banner.
+    fn in_identification_phase(&self, dir: bool) -> bool {
+        if self.key_exchange.is_some()
+            || self.client_new_keys.is_some()
+            || self.server_new_keys.is_some()
+        {
+            return false;
+        }
+        if dir {
+            self.client_version_exchange.is_none()
+        } else {
+            self.server_version_exchange.is_none()
+        }
     }
 
     pub(crate) fn parse_version_exchange(&mut self, data: &[u8], dir: bool) {
@@ -138,9 +158,11 @@ impl Ssh {
         }
     }
 
+    /// Name lists are length-prefixed byte strings on the wire, not validated as UTF-8,
+    /// so the same care as `byte_to_string` applies here.
     fn bytes_to_string_vec(&mut self, data: &[u8]) -> Vec<String> {
         data.split(|&b| b == b',')
-            .map(|chunk| String::from_utf8(chunk.to_vec()).unwrap())
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
             .collect()
     }
 
@@ -242,12 +264,17 @@ impl Ssh {
         let mut status = ParseResult::Continue(0);
         log::trace!("process ({} bytes)", data.len());
 
+        // Only look for a banner while this direction is still in the identification
+        // phase. Post-NewKeys payloads are ciphertext, and a ~1400B random payload holds
+        // the four bytes "SSH-" roughly once in three million packets; parsing one as an
+        // identification string used to hand arbitrary bytes to `byte_to_string`. The scan
+        // stays unanchored because a server may send extra CRLF lines before its version
+        // line (RFC 4253 4.2).
         let ssh_identifier = b"SSH-";
-        if data
-            .windows(ssh_identifier.len())
-            .position(|window| window == ssh_identifier)
-            .map(|p| &data[p..])
-            .is_some()
+        if self.in_identification_phase(dir)
+            && data
+                .windows(ssh_identifier.len())
+                .any(|window| window == ssh_identifier)
         {
             self.parse_version_exchange(data, dir);
             status = ParseResult::Continue(0);
