@@ -14,7 +14,9 @@ mtu = 1500
 hardware_assist = false
 dyn_hardware_assist = true
 # standard | drop | split | trim-native-dpdk (selective Rx, DPDK >= 26.07, mlx5)
-flow_mode = "standard"
+flow_mode = "split"
+buffer_split = true
+force_scalar_rx = false
 [[online.ports]]
 device = "0000:3b:00.0"
 cores = [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 ]
@@ -50,4 +52,4 @@ pcie = true
 # Compare against the PCIe figures above: inbound DMA versus what reached memory.
 # Needs `pcm-memory` installed and root.
 dram = true
-port_stats = [ "rx_good_packets", "rx_good_bytes", "rx_phy_packets", "rx_phy_bytes", "rx_mbuf_allocation_errors", "rx_phy_discard_packets", "rx_missed_errors"]
+port_stats = [ "rx_good_packets", "rx_good_bytes", "rx_phy_packets", "rx_phy_bytes", "rx_mbuf_allocation_errors", "rx_phy_discard_packets", "rx_missed_errors", "rx_split",]
