@@ -154,6 +154,7 @@ impl DramMeter {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .stdin(Stdio::null());
+        crate::lcore::die_with_parent(&mut cmd);
 
         let mut child = match cmd.spawn() {
             Ok(child) => child,
