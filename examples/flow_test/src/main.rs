@@ -59,7 +59,14 @@ lazy_static! {
 
 static TCP_BYTES: AtomicUsize = AtomicUsize::new(0);
 static UDP_BYTES: AtomicUsize = AtomicUsize::new(0);
-static TLS_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// On-wire bytes per encrypted protocol, indexed by `FlowKind::idx()`.
+static ENCRYPTED_BYTES: [AtomicUsize; 4] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
 
 // Dispatching
 static FLOW_DISPATCHER: OnceLock<Arc<ChannelDispatcher<FlowEvent>>> = OnceLock::new();
@@ -293,19 +300,23 @@ fn record_transport_bytes(bytes: &TransportBytes) {
     UDP_BYTES.fetch_add(bytes.udp_bytes, Ordering::Relaxed);
 }
 
+/// Per-connection on-wire byte count, headers included. The datatype itself is
+/// protocol-blind -- it counts every frame of whatever connection it is attached
+/// to; the `L4Terminated` callbacks below decide which encrypted protocol each
+/// terminated connection's total is credited to.
 #[datatype]
-struct TlsWireBytes {
+struct EncryptedWireBytes {
     bytes: usize,
 }
 
-impl TlsWireBytes {
-    #[datatype_fn("TlsWireBytes,level=InL4Conn")]
+impl EncryptedWireBytes {
+    #[datatype_fn("EncryptedWireBytes,level=InL4Conn")]
     fn update(&mut self, pdu: &L4Pdu) {
         self.bytes += pdu.mbuf.data_len();
     }
 }
 
-impl Tracked for TlsWireBytes {
+impl Tracked for EncryptedWireBytes {
     fn new(_first_pkt: &L4Pdu) -> Self {
         Self { bytes: 0 }
     }
@@ -315,11 +326,34 @@ impl Tracked for TlsWireBytes {
     }
 }
 
-#[callback("tls,level=L4Terminated")]
-fn record_tls_bytes(bytes: &TlsWireBytes) {
+/// Only Standard mode sees whole connections in software; in the other modes the
+/// offloaded remainder never reaches the datapath, so a byte total there would be
+/// counting only what was not offloaded.
+#[inline]
+fn record_encrypted_bytes(kind: FlowKind, bytes: &EncryptedWireBytes) {
     if *MODE.read().unwrap() == FlowMode::Standard {
-        TLS_BYTES.fetch_add(bytes.bytes, Ordering::Relaxed);
+        ENCRYPTED_BYTES[kind.idx()].fetch_add(bytes.bytes, Ordering::Relaxed);
     }
+}
+
+#[callback("tls,level=L4Terminated")]
+fn record_tls_bytes(bytes: &EncryptedWireBytes) {
+    record_encrypted_bytes(FlowKind::Tls, bytes);
+}
+
+#[callback("ssh,level=L4Terminated")]
+fn record_ssh_bytes(bytes: &EncryptedWireBytes) {
+    record_encrypted_bytes(FlowKind::Ssh, bytes);
+}
+
+#[callback("quic,level=L4Terminated")]
+fn record_quic_bytes(bytes: &EncryptedWireBytes) {
+    record_encrypted_bytes(FlowKind::Quic, bytes);
+}
+
+#[callback("MaybeQuic,level=L4Terminated")]
+fn record_maybe_quic_bytes(bytes: &EncryptedWireBytes) {
+    record_encrypted_bytes(FlowKind::MaybeQuic, bytes);
 }
 
 // ===== Filters =====
@@ -692,8 +726,17 @@ fn main() {
     }
 
     if *MODE.read().unwrap() == FlowMode::Standard {
-        let tls_bytes = TLS_BYTES.load(Ordering::Relaxed);
-        println!("TLS on-wire bytes seen (Standard mode): {tls_bytes} bytes");
+        // MaybeQuic vetoes itself once a parser claims the connection, so the
+        // kinds are disjoint and the total is a true sum.
+        println!("=== On-wire bytes by encrypted protocol (Standard mode) ===");
+        println!("{:<12}{:>16}", "kind", "bytes");
+        let mut total = 0;
+        for kind in FlowKind::all() {
+            let bytes = ENCRYPTED_BYTES[kind.idx()].load(Ordering::Relaxed);
+            total += bytes;
+            println!("{:<12}{:>16}", kind.label(), bytes);
+        }
+        println!("{:<12}{:>16}", "total", total);
     }
 
     if args.show_stats {
