@@ -12,6 +12,7 @@ use crate::subscription::*;
 
 use std::collections::BTreeMap;
 use std::os::raw::{c_uint, c_void};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -321,9 +322,27 @@ where
     let rx_cores = unsafe { &*rx_cores };
 
     let core_id = CoreId(unsafe { dpdk::rte_lcore_id() } as u32);
-    let rx_core = rx_cores.get(&core_id).expect("Invalid Core");
+    let Some(rx_core) = rx_cores.get(&core_id) else {
+        log::error!("No RX core assigned to Core {}", core_id);
+        return -1;
+    };
 
-    // TODO: if the hardware takes care of the whole packet filter, we can skip the packet filter.
-    rx_core.rx_loop();
+    // DPDK calls this through a C function pointer, so `extern "C"` makes it nounwind: a
+    // panic that reaches this frame aborts the whole process with "panic in a function
+    // that cannot unwind", losing the run and burying the real message. Catch it here so
+    // the panicking core is named, then signal the rest to wind down and report totals.
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        // TODO: if the hardware takes care of the whole packet filter, we can skip the packet filter.
+        rx_core.rx_loop();
+    }));
+
+    if result.is_err() {
+        log::error!(
+            "RX Core {} panicked (message above); stopping remaining cores.",
+            core_id
+        );
+        rx_core.is_running.store(false, Ordering::Relaxed);
+        return -1;
+    }
     0
 }
